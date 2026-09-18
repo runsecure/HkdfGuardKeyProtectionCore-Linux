@@ -1,0 +1,54 @@
+[package]
+name = "hkdfguard"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Linux implementation of HKDFGuard: ECDH(P-256) -> HKDF-SHA256 -> AES-256-GCM DEK wrapping with a pluggable, priority-ordered KEK provider chain (TPM2, PKCS#11, external secret, software, ephemeral)."
+repository = "https://github.com/torinblair/KeyProtectionCore-Linux"
+
+[lib]
+name = "hkdfguard"
+# cdylib: shared object for dynamic linking.
+# staticlib: archive for static linking into a host binary.
+# rlib: lets this crate also be used directly from Rust (tests, examples).
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+p256 = { version = "0.13", features = ["ecdh", "pkcs8"] }
+elliptic-curve = { version = "0.13", features = ["pkcs8"] }
+hkdf = "0.12"
+sha2 = "0.10"
+aes-gcm = "0.10"
+rand_core = { version = "0.6", features = ["std"] }
+zeroize = { version = "1", features = ["derive"] }
+log = "0.4"
+thiserror = "1"
+dirs = "5"
+libc = "0.2"
+
+# Optional hardware-backed provider dependencies. Not enabled by default
+# because they require system libraries (tpm2-tss / a PKCS#11 module) that
+# are not present on every build host. See README.md "Provider build matrix".
+tss-esapi = { version = "7", optional = true }
+cryptoki = { version = "0.6", optional = true }
+
+[dev-dependencies]
+env_logger = "0.11"
+tempfile = "3"
+serial_test = "3"
+
+[features]
+# Software, external-secret and ephemeral are pure-Rust / filesystem-only
+# and always buildable, so they ship in `default`.
+default = ["software", "external-secret", "ephemeral"]
+software = []
+external-secret = []
+ephemeral = []
+# Hardware-backed providers: opt in per-deployment.
+tpm2 = ["dep:tss-esapi"]
+pkcs11 = ["dep:cryptoki"]
+
+[profile.release]
+panic = "unwind"   # required: hkdfguard_* catches unwinds at the FFI boundary
+strip = true
+lto = true
