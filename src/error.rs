@@ -12,62 +12,69 @@
 //! failures that can occur *after* validation, inside the provider/crypto
 //! layer.
 
-use std::fmt;
+use std::fmt; // brings `fmt::Display`/`fmt::Formatter` into scope for the impl below
 
 /// Status codes returned by the public C ABI. Kept in sync with
 /// `include/hkdfguard.h` -- if you add a variant here, add it there too.
 pub mod status {
-    pub const OK: i32 = 0;
-    pub const INVALID_ARGUMENT: i32 = -1;
-    pub const BUFFER_TOO_SMALL: i32 = -2;
-    pub const PROVIDER_UNAVAILABLE: i32 = -3;
-    pub const PROVIDER_ERROR: i32 = -4;
-    pub const CRYPTO_ERROR: i32 = -5;
-    pub const INTERNAL_ERROR: i32 = -6;
-    pub const INVALID_UTF8: i32 = -7;
+    // Each constant below is one possible return value of the two exported
+    // C functions; all are plain `i32`s so nothing Rust-specific crosses
+    // the FFI boundary.
+    pub const OK: i32 = 0; // success
+    pub const INVALID_ARGUMENT: i32 = -1; // null pointer, wrong DEK length, bad service string, etc.
+    pub const BUFFER_TOO_SMALL: i32 = -2; // caller's output buffer capacity is smaller than required
+    pub const PROVIDER_UNAVAILABLE: i32 = -3; // no KEK provider could be reached at all
+    pub const PROVIDER_ERROR: i32 = -4; // a provider was reachable but failed to produce/load a key
+    pub const CRYPTO_ERROR: i32 = -5; // malformed payload or AEAD authentication failure
+    pub const INTERNAL_ERROR: i32 = -6; // an unexpected panic was caught at the FFI boundary
+    pub const INVALID_UTF8: i32 = -7; // the `service` C string was not valid UTF-8
 }
 
-#[derive(Debug)]
+#[derive(Debug)] // lets `Error` be formatted with `{:?}` in tests/logs
 pub enum Error {
     /// No KEK provider is available at all (should only happen if every
     /// optional provider feature is disabled AND ephemeral is disabled).
-    NoProviderAvailable,
+    NoProviderAvailable, // terminal failure: the provider chain produced nothing usable
     /// A provider was selected but failed to create/load/operate on a KEK
     /// (TPM error, PKCS#11 error, filesystem error, malformed key file...).
-    Provider(String),
+    Provider(String), // carries a human-readable description of what went wrong, for logs only
     /// Soft, expected condition: this provider is reachable in general but
     /// has no key provisioned for this particular service and is not
     /// allowed to create one (currently only the external-secret
     /// provider). Causes the selection chain to fall through quietly
     /// rather than logging a warning.
-    KeyNotProvisioned(&'static str),
+    KeyNotProvisioned(&'static str), // static message; no allocation needed since it's always a fixed string
     /// Wrapped payload was malformed, or AEAD authentication failed
     /// (tamper, wrong service, wrong KEK, wrong provider).
-    Crypto(&'static str),
+    Crypto(&'static str), // static message describing which crypto/parsing step failed
 }
 
 impl Error {
+    // Maps each internal error variant to the public status code the FFI
+    // layer will actually return to the C caller.
     pub fn status_code(&self) -> i32 {
         match self {
-            Error::NoProviderAvailable => status::PROVIDER_UNAVAILABLE,
-            Error::Provider(_) => status::PROVIDER_ERROR,
-            Error::KeyNotProvisioned(_) => status::PROVIDER_ERROR,
-            Error::Crypto(_) => status::CRYPTO_ERROR,
+            Error::NoProviderAvailable => status::PROVIDER_UNAVAILABLE, // no provider at all -> PROVIDER_UNAVAILABLE
+            Error::Provider(_) => status::PROVIDER_ERROR, // provider-level failure -> PROVIDER_ERROR (message is dropped, never sent over FFI)
+            Error::KeyNotProvisioned(_) => status::PROVIDER_ERROR, // treated the same as a generic provider error from the caller's perspective
+            Error::Crypto(_) => status::CRYPTO_ERROR, // decryption/parsing failure -> CRYPTO_ERROR
         }
     }
 }
 
 impl fmt::Display for Error {
+    // Human-readable rendering used only in `log::error!`/`log::warn!`
+    // calls -- never returned to the C caller.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::NoProviderAvailable => write!(f, "no KEK provider is available"),
-            Error::Provider(msg) => write!(f, "provider error: {msg}"),
-            Error::KeyNotProvisioned(msg) => write!(f, "no key provisioned: {msg}"),
-            Error::Crypto(msg) => write!(f, "cryptographic error: {msg}"),
+            Error::NoProviderAvailable => write!(f, "no KEK provider is available"), // fixed message, no data to interpolate
+            Error::Provider(msg) => write!(f, "provider error: {msg}"), // interpolate the provider's own description
+            Error::KeyNotProvisioned(msg) => write!(f, "no key provisioned: {msg}"), // interpolate the static reason string
+            Error::Crypto(msg) => write!(f, "cryptographic error: {msg}"), // interpolate the static reason string
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {} // opts `Error` into the standard error trait (needed so `{e}` formatting and `?` interop work smoothly)
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = std::result::Result<T, Error>; // shorthand alias used throughout the crate instead of spelling out `Result<T, Error>`

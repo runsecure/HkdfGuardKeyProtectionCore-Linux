@@ -14,21 +14,21 @@
 // favor of APIs only available via a `generic-array` 1.x upgrade that
 // those crates haven't taken yet. Not actionable from this crate without
 // pinning to pre-release dependency versions.
-#![allow(deprecated)]
+#![allow(deprecated)] // crate-wide, silences that specific transitive-dependency warning everywhere
 
-mod crypto;
-mod error;
-mod payload;
-mod provider;
+mod crypto; // ECDH -> HKDF -> AES-GCM protocol
+mod error; // internal error type + public status codes
+mod payload; // wrapped-payload wire format
+mod provider; // provider trait + selection chain
 
-pub use error::status;
+pub use error::status; // re-export the status-code constants as part of this crate's public (Rust-side) surface
 
-use std::ffi::CStr;
-use std::os::raw::{c_char, c_int};
-use std::ptr;
-use zeroize::Zeroize;
+use std::ffi::CStr; // for reading the caller's NUL-terminated `service` string
+use std::os::raw::{c_char, c_int}; // C-ABI-compatible integer/char types
+use std::ptr; // raw-pointer helpers (`copy_nonoverlapping`, `write_bytes`)
+use zeroize::Zeroize; // scrub sensitive stack buffers before returning
 
-const MAX_SERVICE_LEN: usize = 255;
+const MAX_SERVICE_LEN: usize = 255; // spec-mandated maximum service-name length in bytes
 
 /// Wraps a 32-byte Data Encryption Key (DEK) under the persistent
 /// Key Encryption Key (KEK) identified by `service`, using the currently
@@ -57,7 +57,7 @@ const MAX_SERVICE_LEN: usize = 255;
 /// readable and writable pointer to an `int`. `out` must be writable for
 /// at least `*out_len` bytes, unless null (in which case `*out_len` must
 /// be 0).
-#[no_mangle]
+#[no_mangle] // keeps the exported symbol name exactly `hkdfguard_wrap_dek`, not a mangled Rust name
 pub extern "C" fn hkdfguard_wrap_dek(
     service: *const c_char,
     dek: *const u8,
@@ -65,13 +65,17 @@ pub extern "C" fn hkdfguard_wrap_dek(
     out: *mut u8,
     out_len: *mut c_int,
 ) -> c_int {
+    // `catch_unwind` is what makes the "no panic ever crosses the ABI"
+    // guarantee real: if anything inside `wrap_impl` panics, it's caught
+    // here and converted into a normal error code instead of unwinding
+    // into the C caller (which would be undefined behavior).
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         wrap_impl(service, dek, dek_len, out, out_len)
     })) {
-        Ok(code) => code,
+        Ok(code) => code, // normal path: whatever status code `wrap_impl` returned
         Err(_) => {
             log::error!("hkdfguard: internal panic caught at hkdfguard_wrap_dek boundary");
-            status::INTERNAL_ERROR
+            status::INTERNAL_ERROR // a panic means a bug in this crate, not a normal failure
         }
     }
 }
@@ -119,6 +123,9 @@ pub extern "C" fn hkdfguard_unwrap_dek(
     }
 }
 
+// Validates and borrows the caller's `service` C string as a Rust `&str`,
+// or returns the appropriate status code if it's null, not UTF-8, empty,
+// or too long. Shared by both `wrap_impl` and `unwrap_impl`.
 fn cstr_to_service<'a>(ptr: *const c_char) -> Result<&'a str, c_int> {
     if ptr.is_null() {
         return Err(status::INVALID_ARGUMENT);
@@ -127,13 +134,16 @@ fn cstr_to_service<'a>(ptr: *const c_char) -> Result<&'a str, c_int> {
     // `ptr` is a valid, NUL-terminated, readable C string for the duration
     // of this call.
     let cstr = unsafe { CStr::from_ptr(ptr) };
-    let s = cstr.to_str().map_err(|_| status::INVALID_UTF8)?;
+    let s = cstr.to_str().map_err(|_| status::INVALID_UTF8)?; // reject non-UTF-8 byte sequences
     if s.is_empty() || s.len() > MAX_SERVICE_LEN {
-        return Err(status::INVALID_ARGUMENT);
+        return Err(status::INVALID_ARGUMENT); // enforce the 1..=255 byte length rule
     }
     Ok(s)
 }
 
+// The actual logic behind `hkdfguard_wrap_dek`, running inside the
+// `catch_unwind` wrapper above. Returns a plain status code; never panics
+// intentionally (validates everything before touching unsafe pointers).
 fn wrap_impl(
     service: *const c_char,
     dek: *const u8,
@@ -145,56 +155,59 @@ fn wrap_impl(
         return status::INVALID_ARGUMENT;
     }
     if dek_len != crypto::DEK_LEN as c_int {
-        return status::INVALID_ARGUMENT;
+        return status::INVALID_ARGUMENT; // DEK must be exactly 32 bytes, per spec
     }
 
     // SAFETY: out_len is non-null per check above; caller contract
     // guarantees it points at a valid, initialized `int`.
-    let capacity = unsafe { *out_len };
+    let capacity = unsafe { *out_len }; // how many bytes the caller says `out` can hold
     if capacity < 0 {
-        return status::INVALID_ARGUMENT;
+        return status::INVALID_ARGUMENT; // a negative capacity makes no sense
     }
 
     let service_str = match cstr_to_service(service) {
         Ok(s) => s,
-        Err(code) => return code,
+        Err(code) => return code, // bad service string: bail out with the specific reason
     };
 
     // SAFETY: dek is non-null and dek_len == DEK_LEN; caller contract
     // guarantees dek is readable for that many bytes.
-    let dek_slice = unsafe { std::slice::from_raw_parts(dek, crypto::DEK_LEN) };
-    let mut dek_array = [0u8; crypto::DEK_LEN];
+    let dek_slice = unsafe { std::slice::from_raw_parts(dek, crypto::DEK_LEN) }; // borrow the caller's DEK bytes as a Rust slice
+    let mut dek_array = [0u8; crypto::DEK_LEN]; // owned, fixed-size copy (the crypto layer wants `&[u8; 32]`)
     dek_array.copy_from_slice(dek_slice);
 
-    let result = crypto::wrap(service_str, &dek_array);
-    dek_array.zeroize();
+    let result = crypto::wrap(service_str, &dek_array); // do the actual ECDH -> HKDF -> AES-GCM work
+    dek_array.zeroize(); // our local copy of the plaintext DEK is no longer needed; scrub it now
 
     let wrapped = match result {
         Ok(w) => w,
         Err(e) => {
-            log::error!("hkdfguard: wrap failed for service (redacted): {e}");
+            log::error!("hkdfguard: wrap failed for service (redacted): {e}"); // logs only the error description, never key material
             return e.status_code();
         }
     };
 
     if (capacity as usize) < wrapped.len() {
+        // caller's buffer is too small: report the required size and write nothing
         // SAFETY: out_len is non-null (checked above).
         unsafe { *out_len = wrapped.len() as c_int };
         return status::BUFFER_TOO_SMALL;
     }
     if out.is_null() {
-        return status::INVALID_ARGUMENT;
+        return status::INVALID_ARGUMENT; // capacity was fine (possibly 0) but there's nowhere to actually write
     }
 
     // SAFETY: out is non-null and, per caller contract, writable for at
     // least `capacity` >= wrapped.len() bytes.
     unsafe {
-        ptr::copy_nonoverlapping(wrapped.as_ptr(), out, wrapped.len());
-        *out_len = wrapped.len() as c_int;
+        ptr::copy_nonoverlapping(wrapped.as_ptr(), out, wrapped.len()); // copy the wrapped payload into the caller's buffer
+        *out_len = wrapped.len() as c_int; // tell the caller exactly how many bytes were written
     }
     status::OK
 }
 
+// The actual logic behind `hkdfguard_unwrap_dek`, running inside the
+// `catch_unwind` wrapper above.
 fn unwrap_impl(
     service: *const c_char,
     wrapped: *const u8,
@@ -208,14 +221,16 @@ fn unwrap_impl(
 
     // SAFETY: out_len is non-null; caller contract guarantees it points
     // at a valid, initialized `int`.
-    let capacity = unsafe { *out_len };
+    let capacity = unsafe { *out_len }; // the caller's declared output buffer size, captured before we might overwrite *out_len
 
+    // Closure so every failure path below can zero the caller's buffer
+    // with one call, using the *original* capacity captured above.
     let zero_out_buffer = || {
         if !out.is_null() && capacity > 0 {
             // SAFETY: out is non-null and, per caller contract, writable
             // for at least `capacity` bytes (the original capacity the
             // caller declared before this call).
-            unsafe { ptr::write_bytes(out, 0u8, capacity as usize) };
+            unsafe { ptr::write_bytes(out, 0u8, capacity as usize) }; // overwrite the entire declared buffer with zeros
         }
     };
 
@@ -227,7 +242,7 @@ fn unwrap_impl(
     let service_str = match cstr_to_service(service) {
         Ok(s) => s,
         Err(code) => {
-            zero_out_buffer();
+            zero_out_buffer(); // even an invalid-argument failure must leave `out` zeroed, per spec
             return code;
         }
     };
@@ -235,22 +250,22 @@ fn unwrap_impl(
     // SAFETY: wrapped is non-null and wrapped_len >= 0; caller contract
     // guarantees it is readable for that many bytes.
     let wrapped_slice =
-        unsafe { std::slice::from_raw_parts(wrapped, wrapped_len as usize) };
+        unsafe { std::slice::from_raw_parts(wrapped, wrapped_len as usize) }; // borrow the caller's wrapped-payload bytes
 
     let mut dek = match crypto::unwrap(service_str, wrapped_slice) {
-        Ok(dek) => dek,
+        Ok(dek) => dek, // recovered plaintext DEK, still only in this local variable
         Err(e) => {
-            log::error!("hkdfguard: unwrap failed for service (redacted): {e}");
+            log::error!("hkdfguard: unwrap failed for service (redacted): {e}"); // log the reason, never the key material
             zero_out_buffer();
             return e.status_code();
         }
     };
 
     if (capacity as usize) < crypto::DEK_LEN {
-        dek.zeroize();
+        dek.zeroize(); // don't leave the recovered DEK sitting in a local variable longer than necessary
         zero_out_buffer();
         // SAFETY: out_len is non-null (checked above).
-        unsafe { *out_len = crypto::DEK_LEN as c_int };
+        unsafe { *out_len = crypto::DEK_LEN as c_int }; // tell the caller exactly how big a buffer they need (always 32)
         return status::BUFFER_TOO_SMALL;
     }
     if out.is_null() {
@@ -261,20 +276,22 @@ fn unwrap_impl(
     // SAFETY: out is non-null and, per caller contract, writable for at
     // least `capacity` >= DEK_LEN bytes.
     unsafe {
-        ptr::copy_nonoverlapping(dek.as_ptr(), out, crypto::DEK_LEN);
-        *out_len = crypto::DEK_LEN as c_int;
+        ptr::copy_nonoverlapping(dek.as_ptr(), out, crypto::DEK_LEN); // hand the recovered DEK to the caller
+        *out_len = crypto::DEK_LEN as c_int; // always exactly 32 on success
     }
-    dek.zeroize();
+    dek.zeroize(); // our local copy has served its purpose; scrub it now rather than waiting for scope exit
     status::OK
 }
 
 #[cfg(test)]
 mod ffi_tests {
-    use super::*;
-    use serial_test::serial;
-    use std::ffi::CString;
-    use tempfile::tempdir;
+    use super::*; // bring the exported functions + `status` into scope
+    use serial_test::serial; // these tests mutate shared env vars, so they must run one at a time
+    use std::ffi::CString; // to build NUL-terminated strings to pass across the "FFI boundary" in tests
+    use tempfile::tempdir; // throwaway directory for the software provider's storage
 
+    // Points the software provider at a fresh temp directory and disables
+    // the external-secret provider so tests are deterministic.
     fn with_isolated_software_provider<F: FnOnce()>(f: F) {
         let dir = tempdir().unwrap();
         std::env::set_var("HKDFGUARD_SOFTWARE_DIR", dir.path());
@@ -288,10 +305,10 @@ mod ffi_tests {
     #[serial]
     fn ffi_round_trip() {
         with_isolated_software_provider(|| {
-            let service = CString::new("com.company.orders").unwrap();
+            let service = CString::new("com.company.orders").unwrap(); // NUL-terminated, as the C ABI requires
             let dek = [0xABu8; 32];
-            let mut wrapped_buf = [0u8; 512];
-            let mut wrapped_len: c_int = wrapped_buf.len() as c_int;
+            let mut wrapped_buf = [0u8; 512]; // generously-sized output buffer
+            let mut wrapped_len: c_int = wrapped_buf.len() as c_int; // declare its capacity
 
             let rc = hkdfguard_wrap_dek(
                 service.as_ptr(),
@@ -302,32 +319,32 @@ mod ffi_tests {
             );
             assert_eq!(rc, status::OK);
 
-            let mut out = [0u8; 32];
+            let mut out = [0u8; 32]; // exact-size buffer for the recovered DEK
             let mut out_len: c_int = out.len() as c_int;
             let rc = hkdfguard_unwrap_dek(
                 service.as_ptr(),
                 wrapped_buf.as_ptr(),
-                wrapped_len,
+                wrapped_len, // the actual wrapped length reported by the wrap call above
                 out.as_mut_ptr(),
                 &mut out_len,
             );
             assert_eq!(rc, status::OK);
             assert_eq!(out_len, 32);
-            assert_eq!(out, dek);
+            assert_eq!(out, dek); // must recover exactly the original DEK
         });
     }
 
     #[test]
     fn rejects_wrong_dek_length() {
         let service = CString::new("com.company.orders").unwrap();
-        let dek = [0u8; 16];
+        let dek = [0u8; 16]; // deliberately wrong size (should be 32)
         let mut wrapped_buf = [0u8; 512];
         let mut wrapped_len: c_int = wrapped_buf.len() as c_int;
 
         let rc = hkdfguard_wrap_dek(
             service.as_ptr(),
             dek.as_ptr(),
-            16,
+            16, // claims 16, which must be rejected regardless of the actual buffer contents
             wrapped_buf.as_mut_ptr(),
             &mut wrapped_len,
         );
@@ -340,7 +357,7 @@ mod ffi_tests {
         with_isolated_software_provider(|| {
             let service = CString::new("com.company.orders").unwrap();
             let dek = [0x55u8; 32];
-            let mut tiny = [0xFFu8; 4];
+            let mut tiny = [0xFFu8; 4]; // way too small to hold a wrapped payload
             let mut tiny_len: c_int = tiny.len() as c_int;
 
             let rc = hkdfguard_wrap_dek(
@@ -351,8 +368,8 @@ mod ffi_tests {
                 &mut tiny_len,
             );
             assert_eq!(rc, status::BUFFER_TOO_SMALL);
-            assert!(tiny_len > 4);
-            assert_eq!(tiny, [0xFFu8; 4], "must not write on BUFFER_TOO_SMALL");
+            assert!(tiny_len > 4); // *out_len was updated to the actually-required size
+            assert_eq!(tiny, [0xFFu8; 4], "must not write on BUFFER_TOO_SMALL"); // buffer contents untouched
         });
     }
 
@@ -361,8 +378,8 @@ mod ffi_tests {
     fn unwrap_failure_zeroes_caller_buffer() {
         with_isolated_software_provider(|| {
             let service = CString::new("com.company.orders").unwrap();
-            let garbage = [0u8; 8];
-            let mut out = [0xAAu8; 32];
+            let garbage = [0u8; 8]; // not a valid wrapped payload at all
+            let mut out = [0xAAu8; 32]; // pre-filled with a recognizable non-zero pattern
             let mut out_len: c_int = out.len() as c_int;
 
             let rc = hkdfguard_unwrap_dek(
@@ -372,8 +389,8 @@ mod ffi_tests {
                 out.as_mut_ptr(),
                 &mut out_len,
             );
-            assert_ne!(rc, status::OK);
-            assert_eq!(out, [0u8; 32], "output buffer must be zeroed on failure");
+            assert_ne!(rc, status::OK); // must fail, since `garbage` isn't a valid payload
+            assert_eq!(out, [0u8; 32], "output buffer must be zeroed on failure"); // and the buffer must be scrubbed regardless
         });
     }
 
@@ -383,7 +400,7 @@ mod ffi_tests {
         let mut out = [0u8; 512];
         let mut out_len: c_int = out.len() as c_int;
         let rc = hkdfguard_wrap_dek(
-            std::ptr::null(),
+            std::ptr::null(), // deliberately null service pointer
             dek.as_ptr(),
             32,
             out.as_mut_ptr(),
