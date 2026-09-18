@@ -16,8 +16,11 @@ ECDH (P-256)  ->  HKDF-SHA256  ->  AES-256-GCM
 cargo build --release
 ```
 
-Produces `target/release/libhkdfguard.{so,dylib}` (dynamic) and
-`libhkdfguard.a` (static), plus the C header at `include/hkdfguard.h`.
+Produces `target/release/libHkdfGuardKeyProtectionLinux.{so,dylib}`
+(dynamic) and `libHkdfGuardKeyProtectionLinux.a` (static) -- the `[lib]
+name` in `Cargo.toml` controls this output name directly. The C header
+(`include/hkdfguard.h`) and exported C symbols (`hkdfguard_wrap_dek`,
+`hkdfguard_unwrap_dek`) are unaffected and keep their existing names.
 
 ```c
 #include "hkdfguard.h"
@@ -115,7 +118,7 @@ round trip all passed. See [`docker/README.md`](docker/README.md).
   derive output.
 - **Pure-Rust crypto (`p256`/`hkdf`/`aes-gcm`), not OpenSSL**, for the
   protocol itself. No system OpenSSL version skew across distros, trivial
-  static linking (`libhkdfguard.a`), and RustCrypto's P-256/HKDF-SHA256/
+  static linking (`libHkdfGuardKeyProtectionLinux.a`), and RustCrypto's P-256/HKDF-SHA256/
   AES-256-GCM implementations satisfy the mandated algorithm list exactly.
   TPM2 and PKCS#11 still, necessarily, link against their respective
   native libraries.

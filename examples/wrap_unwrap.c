@@ -2,7 +2,7 @@
  * Minimal C consumer of the HKDFGuard C ABI.
  *
  * Build (after `cargo build --release`):
- *   cc -I../include wrap_unwrap.c -L../target/release -lhkdfguard -o wrap_unwrap
+ *   cc -I../include wrap_unwrap.c -L../target/release -lHkdfGuardKeyProtectionLinux -o wrap_unwrap
  *   LD_LIBRARY_PATH=../target/release ./wrap_unwrap
  */
 

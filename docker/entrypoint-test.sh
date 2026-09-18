@@ -54,7 +54,7 @@ cargo test --features pkcs11 -- --ignored --test-threads=1
 section "C ABI round trip via examples/wrap_unwrap.c (default providers)"
 unset HKDFGUARD_PKCS11_MODULE HKDFGUARD_PKCS11_PIN TCTI TPM2TOOLS_TCTI
 cargo build --release
-cc -I include examples/wrap_unwrap.c -L target/release -lhkdfguard -o /tmp/wrap_unwrap
+cc -I include examples/wrap_unwrap.c -L target/release -lHkdfGuardKeyProtectionLinux -o /tmp/wrap_unwrap
 LD_LIBRARY_PATH=target/release /tmp/wrap_unwrap
 
 section "ALL CHECKS PASSED"

@@ -7,7 +7,7 @@ description = "Linux implementation of HKDFGuard: ECDH(P-256) -> HKDF-SHA256 -> 
 repository = "https://github.com/torinblair/KeyProtectionCore-Linux"
 
 [lib]
-name = "hkdfguard"
+name = "HkdfGuardKeyProtectionLinux"
 # cdylib: shared object for dynamic linking.
 # staticlib: archive for static linking into a host binary.
 # rlib: lets this crate also be used directly from Rust (tests, examples).

@@ -15,6 +15,10 @@
 // those crates haven't taken yet. Not actionable from this crate without
 // pinning to pre-release dependency versions.
 #![allow(deprecated)] // crate-wide, silences that specific transitive-dependency warning everywhere
+// The `[lib] name` in Cargo.toml is deliberately `HkdfGuardKeyProtectionLinux`
+// (matching the required output artifact name), not snake_case; silence
+// rustc's stylistic complaint about that specific, intentional choice.
+#![allow(non_snake_case)]
 
 mod crypto; // ECDH -> HKDF -> AES-GCM protocol
 mod error; // internal error type + public status codes

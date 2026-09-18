@@ -26,7 +26,7 @@ which:
    test against it.
 4. Initializes a `SoftHSM2` token and runs the `#[ignore]`d PKCS#11 test
    against it.
-5. Builds `libhkdfguard.so` in release mode and runs
+5. Builds `libHkdfGuardKeyProtectionLinux.so` in release mode and runs
    [`examples/wrap_unwrap.c`](../examples/wrap_unwrap.c) against it.
 
 Exits non-zero (and stops at the failing section) if anything fails.
