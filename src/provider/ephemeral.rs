@@ -14,19 +14,22 @@ use crate::provider::{KekHandle, KekProvider, ProviderType, SharedSecret}; // th
 use p256::{PublicKey, SecretKey}; // P-256 key types from RustCrypto's `p256` crate
 use rand_core::OsRng; // OS-backed cryptographically secure RNG, used to generate new keys
 use std::collections::HashMap; // in-memory service -> key table
-use std::sync::Mutex; // guards the table so concurrent calls don't race
+use std::sync::{Arc, Mutex, OnceLock}; // guards the table so concurrent calls don't race
+
+static PROCESS_KEYS: OnceLock<Arc<Mutex<HashMap<String, SecretKey>>>> = OnceLock::new();
 
 // Holds one P-256 private key per service name, entirely in process
 // memory. Nothing here is ever written to disk.
 pub struct EphemeralProvider {
-    keys: Mutex<HashMap<String, SecretKey>>, // service name -> that service's persistent-for-this-process KEK
+    keys: Arc<Mutex<HashMap<String, SecretKey>>>, // service name -> that service's persistent-for-this-process KEK
 }
 
 impl EphemeralProvider {
     pub fn new() -> Self {
-        EphemeralProvider {
-            keys: Mutex::new(HashMap::new()), // starts empty; keys are created lazily on first use
-        }
+        let keys = PROCESS_KEYS
+            .get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+            .clone();
+        EphemeralProvider { keys }
     }
 }
 
@@ -97,6 +100,25 @@ impl KekProvider for EphemeralProvider {
 #[cfg(test)]
 mod tests {
     use super::*; // bring `EphemeralProvider`, `SecretKey`, etc. into scope
+    use std::sync::Arc;
+    use std::thread;
+
+    #[test]
+    fn probe_and_provider_type() {
+        let provider = EphemeralProvider::new();
+        assert!(provider.probe());
+        assert_eq!(provider.provider_type(), ProviderType::Ephemeral);
+
+        let default_provider = EphemeralProvider::default();
+        assert!(default_provider.probe());
+    }
+
+    #[test]
+    fn key_id_format() {
+        let provider = EphemeralProvider::new();
+        let handle = provider.get_or_create_kek("com.company.orders").unwrap();
+        assert_eq!(handle.key_id(), b"ephemeral:com.company.orders");
+    }
 
     #[test]
     fn same_service_returns_same_key_within_process() {
@@ -124,5 +146,34 @@ mod tests {
         let s1 = h1.ecdh(&eph_pub).unwrap();
         let s2 = h2.ecdh(&eph_pub).unwrap();
         assert_ne!(*s1, *s2); // different services must never share a KEK, so the secrets must differ
+    }
+
+    #[test]
+    fn concurrent_access_is_thread_safe() {
+        let provider = Arc::new(EphemeralProvider::new());
+        let mut handles = Vec::new();
+
+        for i in 0..8 {
+            let p = Arc::clone(&provider);
+            handles.push(thread::spawn(move || {
+                let service = if i % 2 == 0 { "service.a" } else { "service.b" };
+                let h = p.get_or_create_kek(service).unwrap();
+                let eph = SecretKey::random(&mut OsRng);
+                h.ecdh(&eph.public_key()).unwrap()
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Verify that keys for service.a and service.b are stable
+        let ha = provider.get_or_create_kek("service.a").unwrap();
+        let hb = provider.get_or_create_kek("service.b").unwrap();
+        let eph = SecretKey::random(&mut OsRng);
+        assert_ne!(
+            *ha.ecdh(&eph.public_key()).unwrap(),
+            *hb.ecdh(&eph.public_key()).unwrap()
+        );
     }
 }

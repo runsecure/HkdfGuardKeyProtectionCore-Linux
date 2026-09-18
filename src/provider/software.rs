@@ -383,4 +383,106 @@ mod tests {
             assert_eq!(mode, 0o600);
         });
     }
+
+    #[test]
+    #[serial]
+    fn directory_permissions_are_0700() {
+        with_dir(|provider| {
+            provider.get_or_create_kek("com.company.orders").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&provider.dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn probe_and_provider_type() {
+        with_dir(|provider| {
+            assert!(provider.probe());
+            assert_eq!(provider.provider_type(), ProviderType::Software);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn key_id_format() {
+        with_dir(|provider| {
+            let handle = provider.get_or_create_kek("com.company.orders").unwrap();
+            assert_eq!(handle.key_id().len(), 64);
+            assert_eq!(handle.key_id(), service_fingerprint("com.company.orders").as_bytes());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn different_services_have_different_keys() {
+        with_dir(|provider| {
+            let h1 = provider.get_or_create_kek("com.company.orders").unwrap();
+            let h2 = provider.get_or_create_kek("com.company.billing").unwrap();
+
+            let eph = SecretKey::random(&mut OsRng);
+            let eph_pub = eph.public_key();
+
+            let s1 = h1.ecdh(&eph_pub).unwrap();
+            let s2 = h2.ecdh(&eph_pub).unwrap();
+            assert_ne!(*s1, *s2);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn reloads_across_distinct_provider_instances() {
+        let dir = tempdir().unwrap();
+        std::env::set_var("HKDFGUARD_SOFTWARE_DIR", dir.path());
+
+        let eph = SecretKey::random(&mut OsRng);
+        let eph_pub = eph.public_key();
+
+        let s1 = {
+            let provider1 = SoftwareProvider::new();
+            let h1 = provider1.get_or_create_kek("com.company.orders").unwrap();
+            *h1.ecdh(&eph_pub).unwrap()
+        };
+
+        let s2 = {
+            let provider2 = SoftwareProvider::new();
+            let h2 = provider2.get_or_create_kek("com.company.orders").unwrap();
+            *h2.ecdh(&eph_pub).unwrap()
+        };
+
+        assert_eq!(s1, s2);
+        std::env::remove_var("HKDFGUARD_SOFTWARE_DIR");
+    }
+
+    #[test]
+    #[serial]
+    fn corrupted_vault_key_fails() {
+        with_dir(|provider| {
+            // Write a vault key with wrong size (e.g. 16 bytes instead of 32)
+            ensure_private_dir(&provider.dir).unwrap();
+            fs::write(provider.vault_key_path(), [0xAAu8; 16]).unwrap();
+
+            let res = provider.get_or_create_kek("com.company.orders");
+            assert!(matches!(res, Err(Error::Provider(_))));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn corrupted_key_file_fails() {
+        with_dir(|provider| {
+            provider.get_or_create_kek("com.company.orders").unwrap();
+            let path = provider.key_path("com.company.orders");
+
+            // Tamper with the encrypted key file
+            let mut data = fs::read(&path).unwrap();
+            let last = data.len() - 1;
+            data[last] ^= 0x01;
+            fs::write(&path, data).unwrap();
+
+            let res = provider.get_or_create_kek("com.company.orders");
+            assert!(matches!(res, Err(Error::Provider(_))));
+        });
+    }
 }

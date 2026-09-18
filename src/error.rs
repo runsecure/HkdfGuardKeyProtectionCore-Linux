@@ -78,3 +78,56 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {} // opts `Error` into the standard error trait (needed so `{e}` formatting and `?` interop work smoothly)
 
 pub type Result<T> = std::result::Result<T, Error>; // shorthand alias used throughout the crate instead of spelling out `Result<T, Error>`
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_status_codes_match_contract() {
+        assert_eq!(
+            Error::NoProviderAvailable.status_code(),
+            status::PROVIDER_UNAVAILABLE
+        );
+        assert_eq!(
+            Error::Provider("device failure".into()).status_code(),
+            status::PROVIDER_ERROR
+        );
+        assert_eq!(
+            Error::KeyNotProvisioned("missing file").status_code(),
+            status::PROVIDER_ERROR
+        );
+        assert_eq!(
+            Error::Crypto("invalid tag").status_code(),
+            status::CRYPTO_ERROR
+        );
+    }
+
+    #[test]
+    fn error_display_formatting() {
+        assert_eq!(
+            Error::NoProviderAvailable.to_string(),
+            "no KEK provider is available"
+        );
+        assert_eq!(
+            Error::Provider("TPM timeout".into()).to_string(),
+            "provider error: TPM timeout"
+        );
+        assert_eq!(
+            Error::KeyNotProvisioned("not found").to_string(),
+            "no key provisioned: not found"
+        );
+        assert_eq!(
+            Error::Crypto("bad MAC").to_string(),
+            "cryptographic error: bad MAC"
+        );
+    }
+
+    #[test]
+    fn error_debug_formatting() {
+        let err = Error::Provider("io err".into());
+        let dbg = format!("{err:?}");
+        assert!(dbg.contains("Provider"));
+        assert!(dbg.contains("io err"));
+    }
+}

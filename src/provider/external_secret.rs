@@ -221,4 +221,46 @@ mod tests {
             assert_eq!(actual.as_slice(), expected.raw_secret_bytes().as_slice());
         });
     }
+
+    #[test]
+    #[serial]
+    fn probe_and_provider_type() {
+        with_dir(|provider, _dir| {
+            assert!(provider.probe());
+            assert_eq!(provider.provider_type(), ProviderType::ExternalSecret);
+        });
+
+        std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-dir-12345");
+        let provider = ExternalSecretProvider::new();
+        assert!(!provider.probe());
+        std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
+    }
+
+    #[test]
+    #[serial]
+    fn key_id_format() {
+        with_dir(|provider, dir| {
+            let secret_key = SecretKey::random(&mut OsRng);
+            std::fs::write(dir.join("com.company.orders"), secret_key.to_bytes()).unwrap();
+
+            let handle = provider.get_or_create_kek("com.company.orders").unwrap();
+            assert_eq!(handle.key_id(), b"external:com.company.orders");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn rejects_corrupted_secret_file() {
+        with_dir(|provider, dir| {
+            // Write a corrupt 32-byte scalar (e.g. all 0s or all 0xFF which is invalid for P-256 scalar)
+            std::fs::write(dir.join("com.company.orders"), [0u8; 32]).unwrap();
+            let res = provider.get_or_create_kek("com.company.orders");
+            assert!(matches!(res, Err(Error::Provider(_))));
+
+            // Write random garbage of arbitrary non-32 length (which fails PKCS8 parsing)
+            std::fs::write(dir.join("com.company.billing"), b"invalid-pkcs8-data").unwrap();
+            let res2 = provider.get_or_create_kek("com.company.billing");
+            assert!(matches!(res2, Err(Error::Provider(_))));
+        });
+    }
 }

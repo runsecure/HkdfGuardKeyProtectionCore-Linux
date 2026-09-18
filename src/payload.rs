@@ -32,6 +32,7 @@ pub const NONCE_LEN: usize = 12; // AES-GCM's standard 96-bit nonce size
 
 // Plain Rust struct mirroring the wire layout above; `to_bytes`/`from_bytes`
 // are the only places that translate between this and raw bytes.
+#[derive(Debug)]
 pub struct Payload {
     pub provider_type: ProviderType, // which provider produced (and must later reload) the KEK
     pub key_id: Vec<u8>,             // provider-specific opaque tag, variable length
@@ -157,17 +158,105 @@ mod tests {
     }
 
     #[test]
-    fn rejects_truncated_payload() {
+    fn round_trips_empty_key_id_and_empty_ciphertext() {
         let payload = Payload {
             provider_type: ProviderType::Ephemeral,
             key_id: vec![],
+            ephemeral_public_key: [0x04; UNCOMPRESSED_POINT_LEN],
+            nonce: [0x55; NONCE_LEN],
+            ciphertext: vec![],
+        };
+        let bytes = payload.to_bytes();
+        let parsed = Payload::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.provider_type, ProviderType::Ephemeral);
+        assert!(parsed.key_id.is_empty());
+        assert_eq!(parsed.ephemeral_public_key, [0x04; UNCOMPRESSED_POINT_LEN]);
+        assert_eq!(parsed.nonce, [0x55; NONCE_LEN]);
+        assert!(parsed.ciphertext.is_empty());
+    }
+
+    #[test]
+    fn round_trips_all_provider_types() {
+        for pt in [
+            ProviderType::Tpm2,
+            ProviderType::Pkcs11,
+            ProviderType::ExternalSecret,
+            ProviderType::Software,
+            ProviderType::Ephemeral,
+        ] {
+            let payload = Payload {
+                provider_type: pt,
+                key_id: vec![0x12, 0x34],
+                ephemeral_public_key: [0x42; UNCOMPRESSED_POINT_LEN],
+                nonce: [0x24; NONCE_LEN],
+                ciphertext: vec![0x99; 48],
+            };
+            let bytes = payload.to_bytes();
+            let parsed = Payload::from_bytes(&bytes).unwrap();
+            assert_eq!(parsed.provider_type, pt);
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_version() {
+        let payload = Payload {
+            provider_type: ProviderType::Software,
+            key_id: vec![1, 2],
             ephemeral_public_key: [1u8; UNCOMPRESSED_POINT_LEN],
             nonce: [2u8; NONCE_LEN],
             ciphertext: vec![3u8; 16],
         };
         let mut bytes = payload.to_bytes();
-        bytes.truncate(bytes.len() - 5); // chop off the last 5 bytes to simulate truncation/corruption
-        assert!(Payload::from_bytes(&bytes).is_err()); // parsing must fail cleanly, not panic
+        bytes[0] = 2; // version 2
+        let err = Payload::from_bytes(&bytes).unwrap_err();
+        assert!(matches!(err, Error::Crypto("unsupported wrapped payload version")));
+
+        bytes[0] = 0; // version 0
+        let err = Payload::from_bytes(&bytes).unwrap_err();
+        assert!(matches!(err, Error::Crypto("unsupported wrapped payload version")));
+    }
+
+    #[test]
+    fn rejects_unknown_provider_type() {
+        let payload = Payload {
+            provider_type: ProviderType::Software,
+            key_id: vec![1, 2],
+            ephemeral_public_key: [1u8; UNCOMPRESSED_POINT_LEN],
+            nonce: [2u8; NONCE_LEN],
+            ciphertext: vec![3u8; 16],
+        };
+        let mut bytes = payload.to_bytes();
+        bytes[1] = 0; // invalid provider 0
+        let err = Payload::from_bytes(&bytes).unwrap_err();
+        assert!(matches!(err, Error::Crypto("unknown provider type in wrapped payload")));
+
+        bytes[1] = 6; // invalid provider 6
+        let err = Payload::from_bytes(&bytes).unwrap_err();
+        assert!(matches!(err, Error::Crypto("unknown provider type in wrapped payload")));
+
+        bytes[1] = 0xFF; // invalid provider 255
+        let err = Payload::from_bytes(&bytes).unwrap_err();
+        assert!(matches!(err, Error::Crypto("unknown provider type in wrapped payload")));
+    }
+
+    #[test]
+    fn rejects_truncated_payload() {
+        let payload = Payload {
+            provider_type: ProviderType::Ephemeral,
+            key_id: vec![1, 2, 3],
+            ephemeral_public_key: [1u8; UNCOMPRESSED_POINT_LEN],
+            nonce: [2u8; NONCE_LEN],
+            ciphertext: vec![3u8; 16],
+        };
+        let bytes = payload.to_bytes();
+        // Test truncating at every single possible length up to the full length
+        for len in 0..bytes.len() {
+            let truncated = &bytes[..len];
+            assert!(
+                Payload::from_bytes(truncated).is_err(),
+                "should reject payload truncated at length {len}"
+            );
+        }
     }
 
     #[test]
@@ -181,6 +270,32 @@ mod tests {
         };
         let mut bytes = payload.to_bytes();
         bytes.push(0xFF); // append one stray byte after a complete, valid payload
-        assert!(Payload::from_bytes(&bytes).is_err()); // the trailing-bytes check must catch this
+        let err = Payload::from_bytes(&bytes).unwrap_err();
+        assert!(matches!(err, Error::Crypto("trailing bytes after wrapped payload")));
+    }
+
+    #[test]
+    fn rejects_invalid_declared_lengths() {
+        let payload = Payload {
+            provider_type: ProviderType::Software,
+            key_id: vec![1, 2, 3, 4],
+            ephemeral_public_key: [1u8; UNCOMPRESSED_POINT_LEN],
+            nonce: [2u8; NONCE_LEN],
+            ciphertext: vec![3u8; 16],
+        };
+        let mut bytes = payload.to_bytes();
+        // Modify key_id_len (bytes 2..4) to claim a huge length
+        bytes[2] = 0xFF;
+        bytes[3] = 0xFF;
+        assert!(Payload::from_bytes(&bytes).is_err());
+
+        // Restore and modify ciphertext_len (last 4 bytes before ciphertext)
+        let mut bytes2 = payload.to_bytes();
+        let ct_len_offset = 1 + 1 + 2 + 4 + UNCOMPRESSED_POINT_LEN + NONCE_LEN;
+        bytes2[ct_len_offset] = 0xFF;
+        bytes2[ct_len_offset + 1] = 0xFF;
+        bytes2[ct_len_offset + 2] = 0xFF;
+        bytes2[ct_len_offset + 3] = 0x7F;
+        assert!(Payload::from_bytes(&bytes2).is_err());
     }
 }

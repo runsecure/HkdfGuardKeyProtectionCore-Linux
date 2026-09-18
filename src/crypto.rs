@@ -224,4 +224,87 @@ mod tests {
             assert_ne!(a, b, "ephemeral ECDH + random nonce must randomize output"); // must not be deterministic
         });
     }
+
+    #[test]
+    fn derive_wrapping_key_properties() {
+        let secret1 = [0x11u8; 32];
+        let secret2 = [0x22u8; 32];
+
+        let k1 = derive_wrapping_key(&secret1, "service.a").unwrap();
+        let k1_repeat = derive_wrapping_key(&secret1, "service.a").unwrap();
+        assert_eq!(*k1, *k1_repeat, "HKDF must be deterministic for identical inputs");
+
+        let k2 = derive_wrapping_key(&secret1, "service.b").unwrap();
+        assert_ne!(*k1, *k2, "service name must provide domain separation");
+
+        let k3 = derive_wrapping_key(&secret2, "service.a").unwrap();
+        assert_ne!(*k1, *k3, "different shared secrets must yield different wrapping keys");
+    }
+
+    #[test]
+    #[serial]
+    fn round_trips_various_dek_patterns() {
+        with_isolated_software_provider(|| {
+            let patterns: [[u8; DEK_LEN]; 4] = [
+                [0x00u8; DEK_LEN],
+                [0xFFu8; DEK_LEN],
+                core::array::from_fn(|i| i as u8),
+                core::array::from_fn(|i| (255 - i) as u8),
+            ];
+
+            for dek in patterns {
+                let wrapped = wrap("com.company.orders", &dek).unwrap();
+                let recovered = unwrap("com.company.orders", &wrapped).unwrap();
+                assert_eq!(dek, recovered);
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn round_trips_through_ephemeral_provider() {
+        // Disable external secret and software provider so wrap uses Ephemeral
+        std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-dir-for-tests");
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::env::set_var("HKDFGUARD_SOFTWARE_DIR", tmp.path());
+
+        let dek = [0x88u8; DEK_LEN];
+        let wrapped = wrap("com.company.ephemeral.test", &dek).unwrap();
+        let recovered = unwrap("com.company.ephemeral.test", &wrapped).unwrap();
+        assert_eq!(dek, recovered);
+
+        std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
+        std::env::remove_var("HKDFGUARD_SOFTWARE_DIR");
+    }
+
+    #[test]
+    #[serial]
+    fn tampered_ephemeral_public_key_fails_to_unwrap() {
+        with_isolated_software_provider(|| {
+            let dek = [0x33u8; DEK_LEN];
+            let wrapped = wrap("com.company.orders", &dek).unwrap();
+            // In payload layout: offset 0=version, 1=provider, 2..4=key_id_len (N bytes key_id), then 65 bytes ephemeral pubkey
+            let mut payload = Payload::from_bytes(&wrapped).unwrap();
+            payload.ephemeral_public_key[1] ^= 0x01; // flip a bit in the X coordinate
+            let tampered_bytes = payload.to_bytes();
+
+            let err = unwrap("com.company.orders", &tampered_bytes).unwrap_err();
+            assert!(matches!(err, Error::Crypto(_)));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn tampered_nonce_fails_to_unwrap() {
+        with_isolated_software_provider(|| {
+            let dek = [0x44u8; DEK_LEN];
+            let wrapped = wrap("com.company.orders", &dek).unwrap();
+            let mut payload = Payload::from_bytes(&wrapped).unwrap();
+            payload.nonce[0] ^= 0x01; // flip a bit in nonce
+            let tampered_bytes = payload.to_bytes();
+
+            let err = unwrap("com.company.orders", &tampered_bytes).unwrap_err();
+            assert!(matches!(err, Error::Crypto(_)));
+        });
+    }
 }

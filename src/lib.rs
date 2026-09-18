@@ -407,5 +407,307 @@ mod ffi_tests {
             &mut out_len,
         );
         assert_eq!(rc, status::INVALID_ARGUMENT);
+
+        let rc = hkdfguard_unwrap_dek(
+            std::ptr::null(),
+            out.as_ptr(),
+            32,
+            out.as_mut_ptr(),
+            &mut out_len,
+        );
+        assert_eq!(rc, status::INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn wrap_null_pointers_and_negative_lengths() {
+        let service = CString::new("com.company.orders").unwrap();
+        let dek = [0u8; 32];
+        let mut out = [0u8; 512];
+        let mut out_len: c_int = 512;
+
+        // Null dek pointer
+        assert_eq!(
+            hkdfguard_wrap_dek(
+                service.as_ptr(),
+                std::ptr::null(),
+                32,
+                out.as_mut_ptr(),
+                &mut out_len
+            ),
+            status::INVALID_ARGUMENT
+        );
+
+        // Null out_len pointer
+        assert_eq!(
+            hkdfguard_wrap_dek(
+                service.as_ptr(),
+                dek.as_ptr(),
+                32,
+                out.as_mut_ptr(),
+                std::ptr::null_mut()
+            ),
+            status::INVALID_ARGUMENT
+        );
+
+        // Negative dek length
+        assert_eq!(
+            hkdfguard_wrap_dek(
+                service.as_ptr(),
+                dek.as_ptr(),
+                -1,
+                out.as_mut_ptr(),
+                &mut out_len
+            ),
+            status::INVALID_ARGUMENT
+        );
+
+        // Negative out_len capacity
+        let mut neg_len: c_int = -5;
+        assert_eq!(
+            hkdfguard_wrap_dek(
+                service.as_ptr(),
+                dek.as_ptr(),
+                32,
+                out.as_mut_ptr(),
+                &mut neg_len
+            ),
+            status::INVALID_ARGUMENT
+        );
+    }
+
+    #[test]
+    fn unwrap_null_pointers_and_negative_lengths() {
+        let service = CString::new("com.company.orders").unwrap();
+        let wrapped = [0u8; 64];
+        let mut out = [0x55u8; 32];
+        let mut out_len: c_int = 32;
+
+        // Null wrapped pointer
+        assert_eq!(
+            hkdfguard_unwrap_dek(
+                service.as_ptr(),
+                std::ptr::null(),
+                64,
+                out.as_mut_ptr(),
+                &mut out_len
+            ),
+            status::INVALID_ARGUMENT
+        );
+
+        // Null out_len pointer
+        assert_eq!(
+            hkdfguard_unwrap_dek(
+                service.as_ptr(),
+                wrapped.as_ptr(),
+                64,
+                out.as_mut_ptr(),
+                std::ptr::null_mut()
+            ),
+            status::INVALID_ARGUMENT
+        );
+
+        // Negative wrapped_len
+        assert_eq!(
+            hkdfguard_unwrap_dek(
+                service.as_ptr(),
+                wrapped.as_ptr(),
+                -1,
+                out.as_mut_ptr(),
+                &mut out_len
+            ),
+            status::INVALID_ARGUMENT
+        );
+        assert_eq!(out, [0u8; 32]);
+
+        // Negative out_len
+        let mut neg_len: c_int = -1;
+        assert_eq!(
+            hkdfguard_unwrap_dek(
+                service.as_ptr(),
+                wrapped.as_ptr(),
+                64,
+                out.as_mut_ptr(),
+                &mut neg_len
+            ),
+            status::INVALID_ARGUMENT
+        );
+    }
+
+    #[test]
+    fn service_validation_edge_cases() {
+        let dek = [0u8; 32];
+        let mut out = [0u8; 512];
+        let mut out_len: c_int = 512;
+
+        // Empty service string
+        let empty_svc = CString::new("").unwrap();
+        assert_eq!(
+            hkdfguard_wrap_dek(
+                empty_svc.as_ptr(),
+                dek.as_ptr(),
+                32,
+                out.as_mut_ptr(),
+                &mut out_len
+            ),
+            status::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            hkdfguard_unwrap_dek(
+                empty_svc.as_ptr(),
+                out.as_ptr(),
+                64,
+                out.as_mut_ptr(),
+                &mut out_len
+            ),
+            status::INVALID_ARGUMENT
+        );
+
+        // Oversized service string (> 255 bytes)
+        let long_svc_str = "a".repeat(256);
+        let long_svc = CString::new(long_svc_str).unwrap();
+        assert_eq!(
+            hkdfguard_wrap_dek(
+                long_svc.as_ptr(),
+                dek.as_ptr(),
+                32,
+                out.as_mut_ptr(),
+                &mut out_len
+            ),
+            status::INVALID_ARGUMENT
+        );
+        assert_eq!(
+            hkdfguard_unwrap_dek(
+                long_svc.as_ptr(),
+                out.as_ptr(),
+                64,
+                out.as_mut_ptr(),
+                &mut out_len
+            ),
+            status::INVALID_ARGUMENT
+        );
+
+        // Invalid UTF-8 service string (e.g. 0xFF, 0xFE)
+        let invalid_utf8 = [0xFFu8, 0xFEu8, 0x00u8];
+        assert_eq!(
+            hkdfguard_wrap_dek(
+                invalid_utf8.as_ptr() as *const c_char,
+                dek.as_ptr(),
+                32,
+                out.as_mut_ptr(),
+                &mut out_len
+            ),
+            status::INVALID_UTF8
+        );
+        assert_eq!(
+            hkdfguard_unwrap_dek(
+                invalid_utf8.as_ptr() as *const c_char,
+                out.as_ptr(),
+                64,
+                out.as_mut_ptr(),
+                &mut out_len
+            ),
+            status::INVALID_UTF8
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn unwrap_buffer_too_small_sets_required_length_and_zeroes() {
+        with_isolated_software_provider(|| {
+            let service = CString::new("com.company.orders").unwrap();
+            let dek = [0x77u8; 32];
+            let mut wrapped = [0u8; 512];
+            let mut wrapped_len: c_int = 512;
+
+            assert_eq!(
+                hkdfguard_wrap_dek(
+                    service.as_ptr(),
+                    dek.as_ptr(),
+                    32,
+                    wrapped.as_mut_ptr(),
+                    &mut wrapped_len
+                ),
+                status::OK
+            );
+
+            let mut tiny_out = [0xAAu8; 16];
+            let mut tiny_out_len: c_int = 16;
+            assert_eq!(
+                hkdfguard_unwrap_dek(
+                    service.as_ptr(),
+                    wrapped.as_ptr(),
+                    wrapped_len,
+                    tiny_out.as_mut_ptr(),
+                    &mut tiny_out_len
+                ),
+                status::BUFFER_TOO_SMALL
+            );
+            assert_eq!(tiny_out_len, 32);
+            assert_eq!(tiny_out, [0u8; 16]);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn boundary_service_lengths_round_trip() {
+        with_isolated_software_provider(|| {
+            let dek = [0x12u8; 32];
+
+            // 1-byte service name
+            let svc1 = CString::new("x").unwrap();
+            let mut wrapped = [0u8; 512];
+            let mut wrapped_len: c_int = 512;
+            assert_eq!(
+                hkdfguard_wrap_dek(
+                    svc1.as_ptr(),
+                    dek.as_ptr(),
+                    32,
+                    wrapped.as_mut_ptr(),
+                    &mut wrapped_len
+                ),
+                status::OK
+            );
+            let mut out = [0u8; 32];
+            let mut out_len: c_int = 32;
+            assert_eq!(
+                hkdfguard_unwrap_dek(
+                    svc1.as_ptr(),
+                    wrapped.as_ptr(),
+                    wrapped_len,
+                    out.as_mut_ptr(),
+                    &mut out_len
+                ),
+                status::OK
+            );
+            assert_eq!(out, dek);
+
+            // 255-byte service name
+            let svc255 = CString::new("s".repeat(255)).unwrap();
+            let mut wrapped2 = [0u8; 512];
+            let mut wrapped2_len: c_int = 512;
+            assert_eq!(
+                hkdfguard_wrap_dek(
+                    svc255.as_ptr(),
+                    dek.as_ptr(),
+                    32,
+                    wrapped2.as_mut_ptr(),
+                    &mut wrapped2_len
+                ),
+                status::OK
+            );
+            let mut out2 = [0u8; 32];
+            let mut out2_len: c_int = 32;
+            assert_eq!(
+                hkdfguard_unwrap_dek(
+                    svc255.as_ptr(),
+                    wrapped2.as_ptr(),
+                    wrapped2_len,
+                    out2.as_mut_ptr(),
+                    &mut out2_len
+                ),
+                status::OK
+            );
+            assert_eq!(out2, dek);
+        });
     }
 }

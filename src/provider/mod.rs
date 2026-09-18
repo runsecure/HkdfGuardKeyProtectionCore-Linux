@@ -235,6 +235,8 @@ pub fn get_by_type(provider_type: ProviderType) -> Result<Arc<dyn KekProvider>> 
 #[cfg(test)]
 mod tests {
     use super::*; // bring `ProviderType` etc. into scope
+    use serial_test::serial;
+    use tempfile::tempdir;
 
     #[test]
     fn provider_type_round_trips_through_u8() {
@@ -251,5 +253,87 @@ mod tests {
         // 0 and 6 are outside the valid 1..=5 range and must be rejected
         assert_eq!(ProviderType::from_u8(0), None);
         assert_eq!(ProviderType::from_u8(6), None);
+        assert_eq!(ProviderType::from_u8(255), None);
+    }
+
+    #[test]
+    fn provider_type_as_str() {
+        assert_eq!(ProviderType::Tpm2.as_str(), "TPM2");
+        assert_eq!(ProviderType::Pkcs11.as_str(), "PKCS11");
+        assert_eq!(ProviderType::ExternalSecret.as_str(), "EXTERNAL_SECRET");
+        assert_eq!(ProviderType::Software.as_str(), "SOFTWARE");
+        assert_eq!(ProviderType::Ephemeral.as_str(), "EPHEMERAL");
+    }
+
+    #[test]
+    #[serial]
+    fn get_by_type_finds_compiled_providers() {
+        #[cfg(feature = "ephemeral")]
+        {
+            let p = get_by_type(ProviderType::Ephemeral).unwrap();
+            assert_eq!(p.provider_type(), ProviderType::Ephemeral);
+        }
+        #[cfg(feature = "software")]
+        {
+            let p = get_by_type(ProviderType::Software).unwrap();
+            assert_eq!(p.provider_type(), ProviderType::Software);
+        }
+        #[cfg(feature = "external-secret")]
+        {
+            let p = get_by_type(ProviderType::ExternalSecret).unwrap();
+            assert_eq!(p.provider_type(), ProviderType::ExternalSecret);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn select_for_wrap_prefers_external_secret_when_provisioned() {
+        #[cfg(all(feature = "external-secret", feature = "software"))]
+        {
+            use p256::SecretKey;
+            use rand_core::OsRng;
+
+            let ext_dir = tempdir().unwrap();
+            let soft_dir = tempdir().unwrap();
+
+            std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", ext_dir.path());
+            std::env::set_var("HKDFGUARD_SOFTWARE_DIR", soft_dir.path());
+
+            // Write an external secret for "com.company.orders"
+            let secret_key = SecretKey::random(&mut OsRng);
+            std::fs::write(ext_dir.path().join("com.company.orders"), secret_key.to_bytes()).unwrap();
+
+            let (provider, handle) = select_for_wrap("com.company.orders").unwrap();
+            assert_eq!(provider.provider_type(), ProviderType::ExternalSecret);
+            assert_eq!(handle.key_id(), b"external:com.company.orders");
+
+            // For unprovisioned service, it falls through to Software
+            let (provider2, handle2) = select_for_wrap("com.company.billing").unwrap();
+            assert_eq!(provider2.provider_type(), ProviderType::Software);
+            assert_eq!(handle2.key_id().len(), 64);
+
+            std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
+            std::env::remove_var("HKDFGUARD_SOFTWARE_DIR");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn select_for_wrap_falls_back_to_ephemeral_when_software_fails() {
+        #[cfg(all(feature = "ephemeral", feature = "software"))]
+        {
+            // Point external secret to nonexistent dir
+            std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-dir-for-tests");
+            // Point software to a file rather than a directory, causing directory creation/read to fail
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            std::env::set_var("HKDFGUARD_SOFTWARE_DIR", tmp.path());
+
+            let (provider, handle) = select_for_wrap("com.company.orders").unwrap();
+            assert_eq!(provider.provider_type(), ProviderType::Ephemeral);
+            assert_eq!(handle.key_id(), b"ephemeral:com.company.orders");
+
+            std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
+            std::env::remove_var("HKDFGUARD_SOFTWARE_DIR");
+        }
     }
 }
