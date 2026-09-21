@@ -33,6 +33,7 @@ extern "C" {
 #define HKDFGUARD_ERR_CRYPTO_ERROR     (-5)
 #define HKDFGUARD_ERR_INTERNAL_ERROR   (-6)
 #define HKDFGUARD_ERR_INVALID_UTF8     (-7)
+#define HKDFGUARD_ERR_MISSING_SERVICE_NAME (-8)
 
 /*
  * Wraps a 32-byte DEK under the persistent KEK identified by `service`.
@@ -40,6 +41,8 @@ extern "C" {
  * service:  NUL-terminated UTF-8 string, 1..=255 bytes. The logical,
  *           cross-platform identity of the KEK (e.g. "com.company.orders").
  *           Different service strings always resolve to different KEKs.
+ *           NULL or an empty string returns
+ *           HKDFGUARD_ERR_MISSING_SERVICE_NAME.
  * dek:      pointer to exactly `dek_len` bytes to wrap.
  * dek_len:  must be exactly HKDFGUARD_DEK_LEN (32); any other value
  *           returns HKDFGUARD_ERR_INVALID_ARGUMENT.
@@ -67,7 +70,8 @@ int hkdfguard_wrap_dek(
  *
  * service:      must match the value used when the payload was wrapped;
  *                any mismatch is indistinguishable from tampering and
- *                returns HKDFGUARD_ERR_CRYPTO_ERROR.
+ *                returns HKDFGUARD_ERR_CRYPTO_ERROR. NULL or an empty
+ *                string returns HKDFGUARD_ERR_MISSING_SERVICE_NAME.
  * wrapped:       pointer to the wrapped payload bytes.
  * wrapped_len:   length of `wrapped` in bytes.
  * out:           buffer to receive the recovered 32-byte DEK.

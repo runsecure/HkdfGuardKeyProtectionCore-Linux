@@ -41,7 +41,8 @@ const MAX_SERVICE_LEN: usize = 255; // spec-mandated maximum service-name length
 /// # Parameters
 /// - `service`: NUL-terminated UTF-8 string, 1..=255 bytes, identifying
 ///   the KEK. The caller retains ownership; it is only read during the
-///   call.
+///   call. A null pointer or an empty string yields
+///   [`status::MISSING_SERVICE_NAME`].
 /// - `dek` / `dek_len`: the 32-byte DEK to wrap. `dek_len` must be exactly
 ///   32.
 /// - `out` / `out_len`: on input, `*out_len` is the capacity of `out` in
@@ -90,7 +91,8 @@ pub extern "C" fn hkdfguard_wrap_dek(
 /// # Parameters
 /// - `service`: must match the value passed to `hkdfguard_wrap_dek` when
 ///   this payload was produced; any mismatch is indistinguishable from
-///   tampering and yields [`status::CRYPTO_ERROR`].
+///   tampering and yields [`status::CRYPTO_ERROR`]. A null pointer or an
+///   empty string yields [`status::MISSING_SERVICE_NAME`].
 /// - `wrapped` / `wrapped_len`: the wrapped payload bytes.
 /// - `out` / `out_len`: on input, `*out_len` is the capacity of `out`. On
 ///   success, the 32-byte DEK is written to `out` and `*out_len` is set to
@@ -132,15 +134,18 @@ pub extern "C" fn hkdfguard_unwrap_dek(
 // or too long. Shared by both `wrap_impl` and `unwrap_impl`.
 fn cstr_to_service<'a>(ptr: *const c_char) -> Result<&'a str, c_int> {
     if ptr.is_null() {
-        return Err(status::INVALID_ARGUMENT);
+        return Err(status::MISSING_SERVICE_NAME); // no service string supplied at all
     }
     // SAFETY: caller contract (see function-level Safety docs) guarantees
     // `ptr` is a valid, NUL-terminated, readable C string for the duration
     // of this call.
     let cstr = unsafe { CStr::from_ptr(ptr) };
     let s = cstr.to_str().map_err(|_| status::INVALID_UTF8)?; // reject non-UTF-8 byte sequences
-    if s.is_empty() || s.len() > MAX_SERVICE_LEN {
-        return Err(status::INVALID_ARGUMENT); // enforce the 1..=255 byte length rule
+    if s.is_empty() {
+        return Err(status::MISSING_SERVICE_NAME); // a service string was supplied, but it's empty
+    }
+    if s.len() > MAX_SERVICE_LEN {
+        return Err(status::INVALID_ARGUMENT); // enforce the <=255 byte length rule
     }
     Ok(s)
 }
@@ -297,12 +302,14 @@ mod ffi_tests {
     // Points the software provider at a fresh temp directory and disables
     // the external-secret provider so tests are deterministic.
     fn with_isolated_software_provider<F: FnOnce()>(f: F) {
+        provider::reset_selected_provider_for_tests(); // don't let an earlier test's cached provider choice leak in
         let dir = tempdir().unwrap();
         std::env::set_var("HKDFGUARD_SOFTWARE_DIR", dir.path());
         std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-for-tests");
         f();
         std::env::remove_var("HKDFGUARD_SOFTWARE_DIR");
         std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
+        provider::reset_selected_provider_for_tests(); // don't leak this test's cached choice into whatever runs next
     }
 
     #[test]
@@ -399,7 +406,7 @@ mod ffi_tests {
     }
 
     #[test]
-    fn null_service_is_invalid_argument() {
+    fn null_service_is_missing_service_name() {
         let dek = [0u8; 32];
         let mut out = [0u8; 512];
         let mut out_len: c_int = out.len() as c_int;
@@ -410,7 +417,7 @@ mod ffi_tests {
             out.as_mut_ptr(),
             &mut out_len,
         );
-        assert_eq!(rc, status::INVALID_ARGUMENT);
+        assert_eq!(rc, status::MISSING_SERVICE_NAME);
 
         let rc = hkdfguard_unwrap_dek(
             std::ptr::null(),
@@ -419,7 +426,7 @@ mod ffi_tests {
             out.as_mut_ptr(),
             &mut out_len,
         );
-        assert_eq!(rc, status::INVALID_ARGUMENT);
+        assert_eq!(rc, status::MISSING_SERVICE_NAME);
     }
 
     #[test]
@@ -553,7 +560,7 @@ mod ffi_tests {
                 out.as_mut_ptr(),
                 &mut out_len
             ),
-            status::INVALID_ARGUMENT
+            status::MISSING_SERVICE_NAME
         );
         assert_eq!(
             hkdfguard_unwrap_dek(
@@ -563,7 +570,7 @@ mod ffi_tests {
                 out.as_mut_ptr(),
                 &mut out_len
             ),
-            status::INVALID_ARGUMENT
+            status::MISSING_SERVICE_NAME
         );
 
         // Oversized service string (> 255 bytes)

@@ -171,12 +171,14 @@ mod tests {
     // the external-secret provider, so every test in this module
     // deterministically exercises the software provider.
     fn with_isolated_software_provider<F: FnOnce()>(f: F) {
+        crate::provider::reset_selected_provider_for_tests(); // don't let an earlier test's cached provider choice leak in
         let dir = tempdir().unwrap();
         std::env::set_var("HKDFGUARD_SOFTWARE_DIR", dir.path());
         std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-for-tests"); // guarantee this provider is unavailable
         f();
         std::env::remove_var("HKDFGUARD_SOFTWARE_DIR");
         std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
+        crate::provider::reset_selected_provider_for_tests(); // don't leak this test's cached choice into whatever runs next
     }
 
     #[test]
@@ -275,6 +277,7 @@ mod tests {
     #[test]
     #[serial]
     fn round_trips_through_ephemeral_provider() {
+        crate::provider::reset_selected_provider_for_tests(); // don't let an earlier test's cached (persistent) provider short-circuit this one
         // Disable external secret and software provider so wrap uses Ephemeral
         std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-dir-for-tests");
         let tmp = tempfile::NamedTempFile::new().unwrap();

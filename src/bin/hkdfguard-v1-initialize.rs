@@ -149,6 +149,7 @@ fn describe_status(code: c_int) -> String {
         status::CRYPTO_ERROR => "a cryptographic operation failed".to_string(),
         status::INTERNAL_ERROR => "an internal error occurred in the hkdfguard library".to_string(),
         status::INVALID_UTF8 => "the service name is not valid UTF-8".to_string(),
+        status::MISSING_SERVICE_NAME => "the service name is missing or empty".to_string(),
         other => format!("unknown status code {other}"),
     }
 }
