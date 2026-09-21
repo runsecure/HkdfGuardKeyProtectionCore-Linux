@@ -29,7 +29,7 @@
 //! token-persistent EC P-256 key pair labelled `hkdfguard:<service>`
 //! (`CKA_TOKEN=true`, `CKA_SENSITIVE=true`, `CKA_EXTRACTABLE=false`,
 //! `CKA_DERIVE=true`). ECDH is performed on-token via `CKM_ECDH1_DERIVE`
-//! (`CKD_NULL` -- no token-side KDF; this crate does its own HKDF-SHA256
+//! (`CKD_NULL` -- no token-side KDF; this crate does its own HKDF-SHA512
 //! outside, per the shared protocol), which derives a session-local,
 //! extractable generic-secret object holding the raw shared X-coordinate.
 //! That value is read out, the temporary derived object is destroyed

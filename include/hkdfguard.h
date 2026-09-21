@@ -5,7 +5,7 @@
  * per-service Key Encryption Key (KEK), using the strongest available
  * provider on the host (TPM2 > PKCS#11 > external secret > software >
  * ephemeral). See the crate's provider/ module docs for the protocol
- * (ECDH P-256 -> HKDF-SHA256 -> AES-256-GCM) and provider details.
+ * (ECDH P-256 -> HKDF-SHA512 -> AES-256-GCM) and provider details.
  *
  * No Rust type, TPM handle, OpenSSL structure, or PKCS#11 object ever
  * crosses this boundary. No exception/panic ever crosses this boundary --

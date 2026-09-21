@@ -1,5 +1,5 @@
 //! The provider-agnostic wrap/unwrap protocol:
-//! `ECDH(P-256) -> HKDF-SHA256 -> AES-256-GCM`.
+//! `ECDH(P-256) -> HKDF-SHA512 -> AES-256-GCM`.
 //!
 //! Every provider (TPM2, PKCS#11, external secret, software, ephemeral)
 //! implements the same [`crate::provider::KekHandle::ecdh`] contract, so
@@ -20,14 +20,13 @@ use crate::payload::{Payload, NONCE_LEN, UNCOMPRESSED_POINT_LEN}; // wire-format
 use crate::provider; // provider selection functions (`select_for_wrap`, `get_by_type`)
 use aes_gcm::{AeadInPlace, Aes256Gcm, Key, KeyInit, Nonce, Tag}; // in-place AEAD trait, concrete cipher, and its key/nonce/tag types (all fixed-size, stack-resident)
 use elliptic_curve::sec1::ToEncodedPoint; // lets us serialize the ephemeral public key to SEC1 bytes
-use hkdf::Hkdf; // HKDF-SHA256 key derivation
+use hkdf::Hkdf; // HKDF-SHA512 key derivation
 use p256::{PublicKey, SecretKey}; // P-256 key types
 use rand_core::{OsRng, RngCore}; // OS RNG + the trait providing `fill_bytes`
-use sha2::Sha256; // hash algorithm used inside HKDF
+use sha2::Sha512; // hash algorithm used inside HKDF
 use zeroize::{Zeroize, Zeroizing}; // `Zeroize` for explicit scrubbing of stack arrays, `Zeroizing` for auto-scrubbing owned buffers
 
 const HKDF_INFO_PREFIX: &[u8] = b"hkdfguard-wrap-v1:"; // domain-separation prefix; concatenated with the service name as HKDF's "info"
-const AAD: &[u8] = b"hkdfguard-dek-v1"; // additional authenticated data binding ciphertext to this protocol/version
 const TAG_LEN: usize = 16; // AES-GCM's standard 128-bit authentication tag size
 
 pub const DEK_LEN: usize = 32; // the mandated, fixed DEK size in bytes
@@ -41,7 +40,7 @@ pub fn wrap(service: &str, dek: &[u8; DEK_LEN]) -> Result<Vec<u8>> {
     let ephemeral_public = ephemeral_secret.public_key();
 
     let mut shared_secret = handle.ecdh(&ephemeral_public)?; // ECDH between our ephemeral key and the persistent KEK (already stack-only: see `provider::SharedSecret`)
-    let mut wrapping_key = derive_wrapping_key(&shared_secret, service)?; // HKDF-SHA256 turns the shared secret into a 32-byte AES key (also stack-only)
+    let mut wrapping_key = derive_wrapping_key(&shared_secret, service)?; // HKDF-SHA512 turns the shared secret into a 32-byte AES key (also stack-only)
     shared_secret.zeroize(); // the raw ECDH shared secret is no longer needed; scrub it now rather than waiting for scope exit
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
@@ -53,8 +52,15 @@ pub fn wrap(service: &str, dek: &[u8; DEK_LEN]) -> Result<Vec<u8>> {
     // involved) and encrypt it in place: `ct_buf` starts as plaintext and
     // ends as ciphertext, entirely within this stack frame.
     let mut ct_buf: [u8; DEK_LEN] = *dek;
-    let tag_result =
-        cipher.encrypt_in_place_detached(Nonce::from_slice(&nonce_bytes), AAD, &mut ct_buf);
+    // AAD is the service name itself: binds this ciphertext to the exact
+    // service it was wrapped for, so tampering with which service a
+    // payload is presented under (independent of which KEK is used to
+    // decrypt it) is caught by AES-GCM authentication.
+    let tag_result = cipher.encrypt_in_place_detached(
+        Nonce::from_slice(&nonce_bytes),
+        service.as_bytes(),
+        &mut ct_buf,
+    );
     wrapping_key.zeroize(); // the derived AES key is no longer needed either way; scrub it immediately
 
     let tag: Tag = tag_result.map_err(|_| Error::Crypto("AES-256-GCM encryption failed"))?; // propagate any encryption error only after cleanup above
@@ -112,8 +118,14 @@ pub fn unwrap(service: &str, wrapped: &[u8]) -> Result<[u8; DEK_LEN]> {
     let tag = Tag::from_slice(tag_part);
 
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*wrapping_key));
-    let auth_result =
-        cipher.decrypt_in_place_detached(Nonce::from_slice(&payload.nonce), AAD, &mut dek, tag); // decrypts `dek` in place; on success it now holds the real plaintext DEK
+    // Must match the AAD used in `wrap`: the same `service` string passed
+    // into this call.
+    let auth_result = cipher.decrypt_in_place_detached(
+        Nonce::from_slice(&payload.nonce),
+        service.as_bytes(),
+        &mut dek,
+        tag,
+    ); // decrypts `dek` in place; on success it now holds the real plaintext DEK
     wrapping_key.zeroize(); // the AES key is no longer needed regardless of whether decryption succeeded
 
     if auth_result.is_err() {
@@ -131,21 +143,21 @@ pub fn unwrap(service: &str, wrapped: &[u8]) -> Result<[u8; DEK_LEN]> {
 }
 
 // Turns a raw ECDH shared secret into a 32-byte AES-256 key via
-// HKDF-SHA256, using the service name as domain-separating "info" so the
+// HKDF-SHA512, using the service name as domain-separating "info" so the
 // same shared secret would never accidentally produce the same wrapping
 // key for a different service.
 fn derive_wrapping_key(
     shared_secret: &[u8; 32],
     service: &str,
 ) -> Result<Zeroizing<[u8; 32]>> {
-    let hk = Hkdf::<Sha256>::new(None, shared_secret); // HKDF-Extract with no explicit salt (the ECDH secret is already high-entropy)
+    let hk = Hkdf::<Sha512>::new(None, shared_secret); // HKDF-Extract with no explicit salt (the ECDH secret is already high-entropy)
     let mut info = Vec::with_capacity(HKDF_INFO_PREFIX.len() + service.len()); // `info` is a public label, not a secret, so a heap Vec here is fine
     info.extend_from_slice(HKDF_INFO_PREFIX); // fixed prefix for domain separation from any other use of HKDF in this protocol
     info.extend_from_slice(service.as_bytes()); // then the service name itself
 
     let mut out = Zeroizing::new([0u8; 32]); // 32 bytes = AES-256 key size; stack-backed array wrapped for auto-scrub on drop
-    hk.expand(&info, &mut *out) // HKDF-Expand into the output buffer using `info` as context
-        .map_err(|_| Error::Crypto("HKDF-SHA256 expand failed"))?; // only fails if the requested output length were invalid (never true here)
+    hk.expand(&info, &mut *out) // HKDF-Expand into the output buffer using `info` as context (truncated to 32 bytes; SHA-512's 64-byte native output is larger than the requested AES-256 key length, which RFC 5869 allows)
+        .map_err(|_| Error::Crypto("HKDF-SHA512 expand failed"))?; // only fails if the requested output length were invalid (never true here)
     Ok(out)
 }
 

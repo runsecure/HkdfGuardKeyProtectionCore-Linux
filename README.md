@@ -7,7 +7,7 @@ host. Same cryptographic protocol and `service`-based key identity as the
 macOS Secure Enclave and Windows TPM/CNG implementations of HKDFGuard.
 
 ```
-ECDH (P-256)  ->  HKDF-SHA256  ->  AES-256-GCM
+ECDH (P-256)  ->  HKDF-SHA512  ->  AES-256-GCM
 ```
 
 ## Quick start
@@ -56,7 +56,7 @@ originally wrapped the payload (recorded in the payload itself, never in
 | 5 | Ephemeral | [`src/provider/ephemeral.rs`](src/provider/ephemeral.rs) | `ephemeral` | yes |
 
 Callers never see which provider is active. Every provider implements the
-identical `ECDH -> HKDF-SHA256 -> AES-256-GCM` protocol
+identical `ECDH -> HKDF-SHA512 -> AES-256-GCM` protocol
 ([`src/crypto.rs`](src/crypto.rs)); the only difference is where the
 persistent P-256 KEK's private key lives and who performs the ECDH.
 
@@ -118,7 +118,7 @@ round trip all passed. See [`docker/README.md`](docker/README.md).
   derive output.
 - **Pure-Rust crypto (`p256`/`hkdf`/`aes-gcm`), not OpenSSL**, for the
   protocol itself. No system OpenSSL version skew across distros, trivial
-  static linking (`libHkdfGuardKeyProtectionLinux.a`), and RustCrypto's P-256/HKDF-SHA256/
+  static linking (`libHkdfGuardKeyProtectionLinux.a`), and RustCrypto's P-256/HKDF-SHA512/
   AES-256-GCM implementations satisfy the mandated algorithm list exactly.
   TPM2 and PKCS#11 still, necessarily, link against their respective
   native libraries.
@@ -196,7 +196,7 @@ src/
   lib.rs                    C ABI: hkdfguard_wrap_dek / hkdfguard_unwrap_dek
   error.rs                  Internal error type <-> C status codes
   payload.rs                Wrapped-payload wire format
-  crypto.rs                 ECDH -> HKDF-SHA256 -> AES-256-GCM protocol
+  crypto.rs                 ECDH -> HKDF-SHA512 -> AES-256-GCM protocol
   provider/
     mod.rs                  KekProvider/KekHandle traits, selection chain
     tpm2.rs                 Provider 1 (feature `tpm2`)

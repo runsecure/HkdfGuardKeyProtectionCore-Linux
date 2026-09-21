@@ -10,6 +10,3 @@ cd "$(dirname "$0")/.."
 
 docker build -t hkdfguard-test -f docker/Dockerfile .
 docker run --rm hkdfguard-test
-
-docker stop hkdfguard-test
-docker rm hkdfguard-test

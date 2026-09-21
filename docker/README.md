@@ -18,7 +18,9 @@ This builds the image and runs [`entrypoint-test.sh`](entrypoint-test.sh),
 which:
 
 1. `cargo build` / `cargo test` with the default features (software,
-   external-secret, ephemeral) -- 21 unit/integration tests.
+   external-secret, ephemeral) -- unit tests plus the CLI integration tests
+   in [`tests/cli_initialize_round_trip.rs`](../tests/cli_initialize_round_trip.rs),
+   which drive the `hkdfguard-v1-initialize` binary as a real subprocess.
 2. `cargo build --features tpm2,pkcs11` -- confirms this crate actually
    *links* against real `libtss2-esys` and the PKCS#11 loader (only
    type-checking, not linking, could be verified outside Docker).
@@ -28,6 +30,13 @@ which:
    against it.
 5. Builds `libHkdfGuardKeyProtectionLinux.so` in release mode and runs
    [`examples/wrap_unwrap.c`](../examples/wrap_unwrap.c) against it.
+6. Runs `hkdfguard-v1-initialize` (release build) to wrap a fresh random
+   DEK to a file, then runs
+   [`examples/cli_unwrap_check.c`](../examples/cli_unwrap_check.c), which
+   loads `libHkdfGuardKeyProtectionLinux.so` dynamically and confirms it
+   unwraps that file back to the exact same DEK -- proving the CLI's
+   output isn't tied to being read back by the same (statically-linked)
+   binary that wrote it.
 
 Exits non-zero (and stops at the failing section) if anything fails.
 

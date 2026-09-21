@@ -3,7 +3,7 @@ name = "hkdfguard"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Linux implementation of HKDFGuard: ECDH(P-256) -> HKDF-SHA256 -> AES-256-GCM DEK wrapping with a pluggable, priority-ordered KEK provider chain (TPM2, PKCS#11, external secret, software, ephemeral)."
+description = "Linux implementation of HKDFGuard: ECDH(P-256) -> HKDF-SHA512 -> AES-256-GCM DEK wrapping with a pluggable, priority-ordered KEK provider chain (TPM2, PKCS#11, external secret, software, ephemeral)."
 repository = "https://github.com/torinblair/KeyProtectionCore-Linux"
 
 [lib]
@@ -25,6 +25,10 @@ log = "0.4"
 thiserror = "1"
 dirs = "5"
 libc = "0.2"
+# Used only by the src/bin/hkdfguard-v1-initialize CLI tool, to decode its
+# --dek argument; already pulled in transitively by other dependencies, so
+# this adds no new compiled code to the dependency graph.
+base64 = "0.22"
 
 # Optional hardware-backed provider dependencies. Not enabled by default
 # because they require system libraries (tpm2-tss / a PKCS#11 module) that

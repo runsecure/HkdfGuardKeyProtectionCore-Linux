@@ -1,4 +1,4 @@
-//! HKDFGuard (Linux): `ECDH(P-256) -> HKDF-SHA256 -> AES-256-GCM` DEK
+//! HKDFGuard (Linux): `ECDH(P-256) -> HKDF-SHA512 -> AES-256-GCM` DEK
 //! wrapping backed by a priority-ordered chain of KEK providers (TPM2,
 //! PKCS#11, external secret, software, ephemeral).
 //!

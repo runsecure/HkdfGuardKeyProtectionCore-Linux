@@ -1,6 +1,6 @@
 //! Provider abstraction and the priority-ordered selection chain.
 //!
-//! Every provider implements the identical ECDH -> HKDF-SHA256 -> AES-256-GCM
+//! Every provider implements the identical ECDH -> HKDF-SHA512 -> AES-256-GCM
 //! protocol (see `crypto.rs`); the only thing that differs between providers
 //! is *where the persistent P-256 KEK private key lives* and *who performs
 //! the ECDH operation*. Software and PKCS#11/TPM2 providers never hand the
