@@ -93,6 +93,33 @@ int hkdfguard_unwrap_dek(
     uint8_t* out,
     int* out_len);
 
+/*
+ * Generates a fresh, cryptographically random 32-byte DEK and immediately
+ * wraps it under the persistent KEK identified by `service`, in one call --
+ * for callers that want a brand new Ephemeral Data Protection Key without
+ * having to source their own randomness.
+ *
+ * The newly generated plaintext DEK never crosses this ABI boundary: it is
+ * zeroed internally the instant it has been wrapped, before this function
+ * returns. To recover it later, unwrap the resulting payload via
+ * hkdfguard_unwrap_dek, passing the same `service`.
+ *
+ * service:  see hkdfguard_wrap_dek.
+ * out:      buffer to receive the wrapped payload. May be NULL only if
+ *           *out_len is 0 (to probe the required size).
+ * out_len:  in: capacity of `out` in bytes.
+ *           out: on HKDFGUARD_OK, the number of bytes written to `out`.
+ *                on HKDFGUARD_ERR_BUFFER_TOO_SMALL, the required capacity;
+ *                `out` is left untouched and the call should be retried
+ *                with a larger buffer.
+ *
+ * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
+ */
+int hkdfguard_generate_and_wrap_dek(
+    const char* service,
+    uint8_t* out,
+    int* out_len);
+
 #ifdef __cplusplus
 }
 #endif

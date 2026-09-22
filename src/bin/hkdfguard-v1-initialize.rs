@@ -206,15 +206,27 @@ fn validate_service_charset(service: &str) -> Result<(), String> {
 // rounds -- each round first an all-zero-bit pass, then a pass of fresh
 // random bits, fsync'd after every pass -- before unlinking it. Called only
 // when `--force` is about to replace a file that already exists.
+//
+// If the file can't be opened for writing (EACCES/EPERM -- this tool
+// doesn't own it), the overwrite passes are skipped entirely and this falls
+// back to a plain `remove_file`, per explicit product direction: destroying
+// the old bytes first is worth attempting, but not worth failing the whole
+// command over when this process isn't even allowed to write to the file
+// it's about to replace -- matches this project's macOS/Windows tools.
 fn secure_delete(path: &Path) -> Result<(), String> {
     let len = fs::metadata(path)
         .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
         .len() as usize;
 
-    let mut file = OpenOptions::new()
-        .write(true)
-        .open(path)
-        .map_err(|e| format!("failed to open {} for secure delete: {e}", path.display()))?;
+    let mut file = match OpenOptions::new().write(true).open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return fs::remove_file(path).map_err(|e| {
+                format!("failed to remove {} after permission-denied secure delete: {e}", path.display())
+            });
+        }
+        Err(e) => return Err(format!("failed to open {} for secure delete: {e}", path.display())),
+    };
 
     let mut buf = vec![0u8; len];
     for _ in 0..SECURE_DELETE_ROUNDS {
@@ -241,7 +253,12 @@ fn overwrite_pass(file: &mut File, path: &Path, buf: &[u8]) -> Result<(), String
         .map_err(|e| format!("secure delete: failed to sync {}: {e}", path.display()))
 }
 
-fn run(args: &Args) -> Result<(), String> {
+fn run(args: &mut Args) -> Result<(), String> {
+    // Fast, friendly pre-check: fail before ever touching the KEK provider
+    // if the output path obviously already exists and --force wasn't
+    // passed. The final `create_new` open below is the actual correctness
+    // guarantee against the exists-then-create race; this is purely a
+    // fail-fast convenience on top of it.
     let path = Path::new(&args.key_file_path);
     if path.exists() {
         if !args.force {
@@ -253,37 +270,82 @@ fn run(args: &Args) -> Result<(), String> {
         secure_delete(path)?;
     }
 
-    let dek = Zeroizing::new(
-        STANDARD
-            .decode(&args.dek_base64)
-            .map_err(|e| format!("--dek is not valid base64: {e}"))?,
-    );
-    if dek.len() != DEK_LEN {
-        return Err(format!(
-            "--dek must decode to exactly {DEK_LEN} bytes, got {}",
-            dek.len()
-        ));
-    }
-
+    // `service` is not secret -- it's a logical identifier, not key
+    // material -- so it's computed and validated before the DEK's own
+    // tightly-scoped block, so that block can end the instant the DEK is no
+    // longer needed without `service` needing to be reconstructed
+    // afterward.
     let service = format!("{}.{}", args.service_name, args.material_identifier);
     validate_service_charset(&service)?;
     let service_c = CString::new(service.clone())
         .map_err(|_| "the combined service name must not contain a NUL byte".to_string())?;
 
-    let wrapped = wrap_dek(&service_c, &dek)?;
+    let wrapped = {
+        // Both the base64 *text* (`args.dek_base64`) and the decoded
+        // plaintext DEK *bytes* (`dek`) are secret, and both are scoped as
+        // tightly as possible around exactly the statements that need
+        // them: decode, clear the text immediately (it has now served its
+        // one purpose), validate the byte length, wrap, then `dek` is
+        // zeroed by `Zeroizing`'s `Drop` the instant this block ends --
+        // immediately after wrap_dek is done with it, not at the end of
+        // run() (which would otherwise leave it sitting in memory, unused
+        // but unwiped, through the final file write below).
+        let dek = Zeroizing::new(
+            STANDARD
+                .decode(&args.dek_base64)
+                .map_err(|e| format!("--dek is not valid base64: {e}"))?,
+        );
 
-    // `.mode(KEY_FILE_MODE)` sets the permissions a newly-created file is
-    // opened with; `set_permissions` below additionally fixes them up when
-    // `--force` overwrote a pre-existing file (which keeps its own
-    // permissions on open) and guards against the requested mode being
-    // narrowed by the process umask.
+        // The base64 text has now served its only purpose: clear this
+        // process's one owned copy of it right here, rather than leaving
+        // it sitting in `args` for the rest of this function. `String`'s
+        // `clear` drops its heap buffer's contents via dealloc, not a
+        // guaranteed zero-fill; a `Zeroizing<String>` would offer that
+        // guarantee but isn't used for `args.dek_base64` itself since
+        // `parse_args` populates it as a plain `String` (a user-facing CLI
+        // argument, not a library-internal secret buffer) -- this does not
+        // erase the original command-line argument the OS still holds
+        // elsewhere -- see this file's header comment on that inherent,
+        // unavoidable argv-visibility limitation.
+        args.dek_base64.clear();
+        args.dek_base64.shrink_to_fit();
+
+        if dek.len() != DEK_LEN {
+            return Err(format!(
+                "--dek must decode to exactly {DEK_LEN} bytes, got {}",
+                dek.len()
+            ));
+        }
+
+        wrap_dek(&service_c, &dek)?
+        // `dek`'s `Zeroizing` wrapper zeroes it here, as this block ends --
+        // immediately after wrap_dek returns the wrapped (encrypted, no
+        // longer secret) form, which is the only thing that survives past
+        // this point.
+    };
+
+    // `create_new` makes "does this file already exist" and "create it"
+    // one indivisible kernel operation (the actual correctness guarantee
+    // against the exists-then-create race -- the `path.exists()` check
+    // above is purely a fail-fast convenience, not this guarantee), and
+    // `.mode(KEY_FILE_MODE)` sets the permissions at the moment of
+    // creation so there's no window where the file briefly exists with
+    // broader (umask-derived) permissions before being locked down after
+    // the fact. By the time this runs, `path` is always either brand new
+    // or was just deleted by `secure_delete` above, so `set_permissions`
+    // below is defense-in-depth against the umask, not strictly required.
     let mut file = OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(KEY_FILE_MODE)
         .open(&args.key_file_path)
-        .map_err(|e| format!("failed to open {}: {e}", args.key_file_path))?;
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("{} already exists; pass --force|-f to overwrite", args.key_file_path)
+            } else {
+                format!("failed to open {}: {e}", args.key_file_path)
+            }
+        })?;
     file.write_all(&wrapped)
         .map_err(|e| format!("failed to write {}: {e}", args.key_file_path))?;
     file.set_permissions(fs::Permissions::from_mode(KEY_FILE_MODE))
@@ -303,7 +365,7 @@ fn main() -> ExitCode {
             print_usage();
             ExitCode::SUCCESS
         }
-        Ok(ParseOutcome::Run(args)) => match run(&args) {
+        Ok(ParseOutcome::Run(mut args)) => match run(&mut args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");

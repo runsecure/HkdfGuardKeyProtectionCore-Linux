@@ -40,6 +40,6 @@ RUN mkdir -p /var/lib/softhsm/tokens
 WORKDIR /work
 COPY . /work
 
-RUN chmod +x docker/entrypoint-test.sh
+RUN chmod +x docker/entrypoint-test.sh docker/entrypoint-build.sh
 
 ENTRYPOINT ["docker/entrypoint-test.sh"]
