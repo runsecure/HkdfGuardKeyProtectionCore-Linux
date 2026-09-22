@@ -7,8 +7,7 @@
  *
  * Usage: cli_unwrap_check <wrapped-file> <service> <expected-dek-file>
  *   <wrapped-file>       output of `hkdfguard-v1-initialize`
- *   <service>            the exact "<service-name>.<material-identifier>"
- *                         string the CLI wrapped it under
+ *   <service>            the exact --service-name the CLI wrapped it under
  *   <expected-dek-file>  the original 32 raw DEK bytes given to the CLI
  *                         (before base64-encoding for --dek)
  *

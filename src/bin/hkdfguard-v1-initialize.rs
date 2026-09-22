@@ -6,15 +6,12 @@
 //! uses -- this tool takes no shortcut through the library's internal
 //! Rust types.
 //!
-//! The KEK's `service` identity is `<service-name>.<material-identifier>`:
-//! the material identifier lets one logical service own up to 256 distinct
-//! KEKs (e.g. for key rotation), each addressed by its own `service` string
-//! under the hood.
+//! The KEK's `service` identity is exactly the caller-supplied
+//! `--service-name`; there is no further structure to it.
 //!
 //! Usage:
 //! ```text
 //! hkdfguard-v1-initialize <key-file-path> \
-//!     --material-identifier|-mi <1-256> \
 //!     --service-name|-sn <name> \
 //!     --dek|-d <base64> \
 //!     [--force|-f]
@@ -55,8 +52,6 @@ const KEY_FILE_MODE: u32 = 0o640;
 const SECURE_DELETE_ROUNDS: usize = 4;
 
 const PROGRAM_NAME: &str = "hkdfguard-v1-initialize";
-const MATERIAL_IDENTIFIER_MIN: u32 = 1;
-const MATERIAL_IDENTIFIER_MAX: u32 = 256;
 const DEK_LEN: usize = 32;
 // Generous starting capacity for the wrapped payload -- see
 // hkdfguard_wrap_dek's own doc comment ("at most a few hundred bytes").
@@ -66,7 +61,6 @@ const INITIAL_WRAPPED_CAPACITY: usize = 512;
 
 struct Args {
     key_file_path: String,
-    material_identifier: u32,
     service_name: String,
     dek_base64: String,
     force: bool,
@@ -79,13 +73,12 @@ enum ParseOutcome {
 
 fn print_usage() {
     eprintln!(
-        "Usage: {PROGRAM_NAME} <key-file-path> --material-identifier|-mi <{MATERIAL_IDENTIFIER_MIN}-{MATERIAL_IDENTIFIER_MAX}> --service-name|-sn <name> --dek|-d <base64> [--force|-f]"
+        "Usage: {PROGRAM_NAME} <key-file-path> --service-name|-sn <name> --dek|-d <base64> [--force|-f]"
     );
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<ParseOutcome, String> {
     let mut key_file_path: Option<String> = None;
-    let mut material_identifier: Option<u32> = None;
     let mut service_name: Option<String> = None;
     let mut dek_base64: Option<String> = None;
     let mut force = false;
@@ -95,18 +88,6 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParseOutcome, String
         match arg.as_str() {
             "--help" | "-h" => return Ok(ParseOutcome::Help),
             "--force" | "-f" => force = true,
-            "--material-identifier" | "-mi" => {
-                let value = args.next().ok_or_else(|| format!("{arg} requires a value"))?;
-                let parsed: u32 = value
-                    .parse()
-                    .map_err(|_| format!("--material-identifier must be an integer, got \"{value}\""))?;
-                if !(MATERIAL_IDENTIFIER_MIN..=MATERIAL_IDENTIFIER_MAX).contains(&parsed) {
-                    return Err(format!(
-                        "--material-identifier must be between {MATERIAL_IDENTIFIER_MIN} and {MATERIAL_IDENTIFIER_MAX}, got {parsed}"
-                    ));
-                }
-                material_identifier = Some(parsed);
-            }
             "--service-name" | "-sn" => {
                 let value = args.next().ok_or_else(|| format!("{arg} requires a value"))?;
                 if value.is_empty() {
@@ -125,14 +106,11 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParseOutcome, String
     }
 
     let key_file_path = key_file_path.ok_or("missing required <key-file-path>")?;
-    let material_identifier =
-        material_identifier.ok_or("missing required --material-identifier|-mi")?;
     let service_name = service_name.ok_or("missing required --service-name|-sn")?;
     let dek_base64 = dek_base64.ok_or("missing required --dek|-d")?;
 
     Ok(ParseOutcome::Run(Args {
         key_file_path,
-        material_identifier,
         service_name,
         dek_base64,
         force,
@@ -186,18 +164,14 @@ fn wrap_dek(service: &CString, dek: &[u8]) -> Result<Vec<u8>, String> {
     Ok(wrapped)
 }
 
-// Enforces that `<service-name>.<material-identifier>` -- the string
-// actually used as the KEK's identity -- contains only ASCII alphanumeric
-// characters or '.'. The material identifier is already digits-only (see
-// its parse in `parse_args`), so in practice this only constrains
-// `--service-name`, but it's checked on the combined string to match
-// exactly what gets passed to `hkdfguard_wrap_dek`.
+// Enforces that `--service-name` -- the string actually used as the KEK's
+// identity -- contains only ASCII alphanumeric characters or '.'.
 fn validate_service_charset(service: &str) -> Result<(), String> {
     if service.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
         Ok(())
     } else {
         Err(format!(
-            "combined service name \"{service}\" must contain only alphanumeric characters or '.'"
+            "service name \"{service}\" must contain only alphanumeric characters or '.'"
         ))
     }
 }
@@ -270,15 +244,12 @@ fn run(args: &mut Args) -> Result<(), String> {
         secure_delete(path)?;
     }
 
-    // `service` is not secret -- it's a logical identifier, not key
-    // material -- so it's computed and validated before the DEK's own
-    // tightly-scoped block, so that block can end the instant the DEK is no
-    // longer needed without `service` needing to be reconstructed
-    // afterward.
-    let service = format!("{}.{}", args.service_name, args.material_identifier);
-    validate_service_charset(&service)?;
-    let service_c = CString::new(service.clone())
-        .map_err(|_| "the combined service name must not contain a NUL byte".to_string())?;
+    // `args.service_name` is not secret -- it's a logical identifier, not
+    // key material -- so no special scoping is needed for it. Validated
+    // before the DEK's own tightly-scoped block below.
+    validate_service_charset(&args.service_name)?;
+    let service_c = CString::new(args.service_name.clone())
+        .map_err(|_| "the service name must not contain a NUL byte".to_string())?;
 
     let wrapped = {
         // Both the base64 *text* (`args.dek_base64`) and the decoded
@@ -352,9 +323,10 @@ fn run(args: &mut Args) -> Result<(), String> {
         .map_err(|e| format!("failed to set permissions on {}: {e}", args.key_file_path))?;
 
     println!(
-        "wrapped key written to {} ({} bytes, service \"{service}\")",
+        "wrapped key written to {} ({} bytes, service \"{}\")",
         args.key_file_path,
-        wrapped.len()
+        wrapped.len(),
+        args.service_name
     );
     Ok(())
 }
@@ -421,37 +393,28 @@ mod tests {
 
     #[test]
     fn validate_service_charset_accepts_alphanumerics_and_dots() {
-        assert!(validate_service_charset("com.example.orders.5").is_ok());
+        assert!(validate_service_charset("com.example.orders").is_ok());
         assert!(validate_service_charset("Service123.42").is_ok());
     }
 
     #[test]
     fn validate_service_charset_rejects_other_characters() {
-        for bad in ["com_example.5", "com example.5", "com-example.5", "com/example.5"] {
+        for bad in ["com_example", "com example", "com-example", "com/example"] {
             assert!(validate_service_charset(bad).is_err(), "should reject \"{bad}\"");
         }
     }
 
     #[test]
-    fn parse_args_rejects_material_identifier_out_of_range() {
-        let argv = ["prog", "key.bin", "-mi", "0", "-sn", "svc", "-d", "AAAA"]
-            .into_iter()
-            .map(String::from);
-        assert!(parse_args(argv).is_err());
-
-        let argv = ["prog", "key.bin", "-mi", "257", "-sn", "svc", "-d", "AAAA"]
-            .into_iter()
-            .map(String::from);
+    fn parse_args_requires_service_name() {
+        let argv = ["prog", "key.bin", "-d", "AAAA"].into_iter().map(String::from);
         assert!(parse_args(argv).is_err());
     }
 
     #[test]
-    fn parse_args_accepts_boundary_material_identifiers() {
-        for value in ["1", "256"] {
-            let argv = ["prog", "key.bin", "-mi", value, "-sn", "svc", "-d", "AAAA"]
-                .into_iter()
-                .map(String::from);
-            assert!(matches!(parse_args(argv), Ok(ParseOutcome::Run(_))), "should accept {value}");
-        }
+    fn parse_args_accepts_a_valid_invocation() {
+        let argv = ["prog", "key.bin", "-sn", "svc", "-d", "AAAA"]
+            .into_iter()
+            .map(String::from);
+        assert!(matches!(parse_args(argv), Ok(ParseOutcome::Run(_))));
     }
 }

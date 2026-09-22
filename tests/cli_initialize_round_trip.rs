@@ -45,7 +45,6 @@ fn cli_wrapped_dek_unwraps_to_original_input() {
 
         let output = Command::new(env!("CARGO_BIN_EXE_hkdfguard-v1-initialize"))
             .arg(&key_path)
-            .args(["--material-identifier", "5"])
             .args(["--service-name", "com.example.orders"])
             .args(["--dek", &dek_b64])
             .output()
@@ -68,9 +67,7 @@ fn cli_wrapped_dek_unwraps_to_original_input() {
             assert_eq!(mode, 0o640, "wrapped key file must be written with mode 0640");
         }
 
-        // Exactly the composition rule the CLI applies internally:
-        // <service-name>.<material-identifier>.
-        let service = CString::new("com.example.orders.5").unwrap();
+        let service = CString::new("com.example.orders").unwrap();
         let mut recovered = [0u8; 32];
         let mut recovered_len: c_int = recovered.len() as c_int;
         let rc = hkdfguard_unwrap_dek(
@@ -99,7 +96,6 @@ fn cli_force_overwrite_secure_deletes_then_rewraps() {
             let dek_b64 = STANDARD.encode(dek);
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_hkdfguard-v1-initialize"));
             cmd.arg(&key_path)
-                .args(["--material-identifier", "9"])
                 .args(["--service-name", "com.example.rotation"])
                 .args(["--dek", &dek_b64])
                 .args(extra_args);
@@ -124,7 +120,7 @@ fn cli_force_overwrite_secure_deletes_then_rewraps() {
         // inode number isn't a reliable signal for that here, since some
         // filesystems immediately reuse a just-freed inode for a new file.)
         let wrapped = fs::read(&key_path).unwrap();
-        let service = CString::new("com.example.rotation.9").unwrap();
+        let service = CString::new("com.example.rotation").unwrap();
         let mut recovered = [0u8; 32];
         let mut recovered_len: c_int = recovered.len() as c_int;
         let rc = hkdfguard_unwrap_dek(
@@ -150,7 +146,6 @@ fn cli_rejects_pre_existing_file_without_force() {
 
         let output = Command::new(env!("CARGO_BIN_EXE_hkdfguard-v1-initialize"))
             .arg(&key_path)
-            .args(["--material-identifier", "1"])
             .args(["--service-name", "com.example.billing"])
             .args(["--dek", &dek_b64])
             .output()

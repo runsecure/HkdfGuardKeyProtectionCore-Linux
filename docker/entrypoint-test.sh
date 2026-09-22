@@ -67,12 +67,11 @@ head -c 32 /dev/urandom > "$DEK_FILE"
 DEK_B64=$(base64 -w0 < "$DEK_FILE")
 WRAPPED_FILE=$(mktemp)
 target/release/hkdfguard-v1-initialize "$WRAPPED_FILE" \
-    --material-identifier 1 \
     --service-name com.hkdfguard.dockertest.cliso \
     --dek "$DEK_B64" \
     --force
 cc -I include examples/cli_unwrap_check.c -L target/release -lHkdfGuardKeyProtectionLinux -o /tmp/cli_unwrap_check
-LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$WRAPPED_FILE" "com.hkdfguard.dockertest.cliso.1" "$DEK_FILE"
+LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$WRAPPED_FILE" "com.hkdfguard.dockertest.cliso" "$DEK_FILE"
 rm -f "$DEK_FILE" "$WRAPPED_FILE"
 
 section "ALL CHECKS PASSED"
