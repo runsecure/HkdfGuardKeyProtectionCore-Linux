@@ -1,6 +1,6 @@
 //! Provider abstraction and the priority-ordered selection chain.
 //!
-//! Every provider implements the identical ECDH -> HKDF-SHA256 -> AES-256-GCM
+//! Every provider implements the identical ECDH -> HKDF-SHA512 -> AES-256-GCM
 //! protocol (see `crypto.rs`); the only thing that differs between providers
 //! is *where the persistent P-256 KEK private key lives* and *who performs
 //! the ECDH operation*. Software and PKCS#11/TPM2 providers never hand the
@@ -22,7 +22,7 @@ pub mod tpm2;
 
 use crate::error::Result; // this crate's `Result<T, Error>` alias
 use p256::PublicKey; // the caller's ephemeral P-256 public key type used in `ecdh`
-use std::sync::{Arc, OnceLock}; // `Arc` for shared provider ownership, `OnceLock` for the one-time warning flag
+use std::sync::{Arc, OnceLock, RwLock}; // `Arc` for shared provider ownership, `OnceLock` for the one-time warning flag, `RwLock` for the resettable provider cache
 use zeroize::Zeroizing; // wrapper that scrubs its contents from memory when dropped
 
 /// 32-byte X9.63 ECDH shared secret (the raw shared point's X-coordinate),
@@ -127,6 +127,30 @@ fn all_providers() -> Vec<Arc<dyn KekProvider>> {
 /// warning is logged once per process rather than on every wrap call.
 static EPHEMERAL_WARNED: OnceLock<()> = OnceLock::new(); // `set()` succeeds exactly once per process; later calls fail harmlessly
 
+/// Once a persistent (non-Ephemeral) provider has produced a usable KEK for
+/// any service, it's cached here and reused for the remaining lifetime of
+/// this process by [`select_for_wrap`] and [`get_by_type`] -- skipping the
+/// provider-discovery walk (which reconstructs every compiled-in provider,
+/// including expensive TPM2/PKCS#11 session setup -- see e.g.
+/// `pkcs11::Pkcs11Provider::new`) on every subsequent wrap/unwrap.
+///
+/// Deliberately left unset while only Ephemeral succeeds (see
+/// `select_for_wrap`), so a provider that becomes available later (TPM
+/// enrolled, secret mounted) is still picked up without a process restart.
+/// An `RwLock` rather than a `OnceLock` only so tests -- which construct
+/// many independent provider configurations via env vars within one
+/// process -- can reset it between runs; production code only ever writes
+/// to it once.
+static SELECTED_PROVIDER: RwLock<Option<Arc<dyn KekProvider>>> = RwLock::new(None);
+
+/// Test-only: clears the cached provider selection so the next
+/// `select_for_wrap`/`get_by_type` call re-runs full discovery instead of
+/// reusing whatever a previous, unrelated test settled on.
+#[cfg(test)]
+pub(crate) fn reset_selected_provider_for_tests() {
+    *SELECTED_PROVIDER.write().unwrap() = None;
+}
+
 /// Walks the mandated priority chain (TPM2 -> PKCS#11 -> External Secret ->
 /// Software -> Ephemeral) for `service`, probing each provider's gross
 /// availability and then asking it for a KEK. A provider can decline a
@@ -137,12 +161,32 @@ static EPHEMERAL_WARNED: OnceLock<()> = OnceLock::new(); // `set()` succeeds exa
 /// chain always terminates successfully because Ephemeral never declines
 /// and never errors.
 ///
-/// Note: availability is re-checked on every call (no caching) so that a
-/// provider that becomes available later (TPM enrolled, secret mounted) is
-/// picked up without a process restart. If probing cost matters in your
-/// deployment, cache calls to this crate's `wrap`/`unwrap` at a layer that
-/// knows your traffic pattern.
+/// Once a persistent provider has been used successfully, it's cached in
+/// [`SELECTED_PROVIDER`] and every later call tries it directly first,
+/// skipping the full discovery walk. If the cached provider declines or
+/// fails for one particular service (e.g. External Secret opts services in
+/// individually), that single call falls through to full discovery without
+/// disturbing the cache -- the cached provider may still be correct for
+/// every other service.
 pub fn select_for_wrap(service: &str) -> Result<(Arc<dyn KekProvider>, Box<dyn KekHandle>)> {
+    if let Some(cached) = SELECTED_PROVIDER.read().unwrap().clone() {
+        match cached.get_or_create_kek(service) {
+            Ok(handle) => return Ok((cached, handle)),
+            Err(crate::error::Error::KeyNotProvisioned(msg)) => {
+                log::debug!(
+                    "hkdfguard: cached provider {} has no key for this service ({msg}); running full discovery for this call",
+                    cached.provider_type().as_str()
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "hkdfguard: cached provider {} failed ({e}); running full discovery for this call",
+                    cached.provider_type().as_str()
+                );
+            }
+        }
+    }
+
     let mut last_err = crate::error::Error::NoProviderAvailable; // returned only if every single provider fails (should never happen: Ephemeral always succeeds)
 
     for provider in all_providers() {
@@ -163,14 +207,21 @@ pub fn select_for_wrap(service: &str) -> Result<(Arc<dyn KekProvider>, Box<dyn K
                     "hkdfguard: using provider {} for this service",
                     provider.provider_type().as_str()
                 );
-                if matches!(provider.provider_type(), ProviderType::Ephemeral)
-                    && EPHEMERAL_WARNED.set(()).is_ok()
-                    // `.set()` only returns Ok the first time; subsequent calls see it already set
-                {
-                    log::warn!(
-                        "hkdfguard: no persistent KEK provider is available; falling back to \
-                         an EPHEMERAL in-memory KEK. DEKs wrapped in this process cannot be \
-                         unwrapped after a process restart."
+                if matches!(provider.provider_type(), ProviderType::Ephemeral) {
+                    // Deliberately not cached -- see SELECTED_PROVIDER's doc comment.
+                    if EPHEMERAL_WARNED.set(()).is_ok() {
+                        // `.set()` only returns Ok the first time; subsequent calls see it already set
+                        log::warn!(
+                            "hkdfguard: no persistent KEK provider is available; falling back to \
+                             an EPHEMERAL in-memory KEK. DEKs wrapped in this process cannot be \
+                             unwrapped after a process restart."
+                        );
+                    }
+                } else {
+                    *SELECTED_PROVIDER.write().unwrap() = Some(Arc::clone(&provider));
+                    log::info!(
+                        "hkdfguard: settled on provider {} for the remaining lifetime of this process",
+                        provider.provider_type().as_str()
                     );
                 }
                 return Ok((provider, handle)); // stop the chain walk; this is the provider+handle to use
@@ -199,8 +250,12 @@ pub fn select_for_wrap(service: &str) -> Result<(Arc<dyn KekProvider>, Box<dyn K
 
 /// Reports the provider that `select_for_wrap` would currently pick,
 /// without touching any specific service's key (used only to log migration
-/// hints from `get_by_type`).
+/// hints from `get_by_type`). Consults the cache first, same as
+/// `select_for_wrap`.
 fn current_best_provider_type() -> Option<ProviderType> {
+    if let Some(cached) = SELECTED_PROVIDER.read().unwrap().as_ref() {
+        return Some(cached.provider_type());
+    }
     all_providers()
         .into_iter() // consume the Vec, we don't need it afterwards
         .find(|p| p.probe()) // first provider (in priority order) that's currently reachable
@@ -213,6 +268,12 @@ fn current_best_provider_type() -> Option<ProviderType> {
 /// hint if `provider_type` differs from what `select_for_wrap` would
 /// currently pick, so operators can see when it's time to re-wrap DEKs
 /// onto a stronger provider.
+///
+/// Reuses the cached provider from [`SELECTED_PROVIDER`] when its type
+/// matches -- the common case, unwrapping a DEK wrapped under whatever's
+/// currently preferred. A mismatch (an older DEK wrapped under a provider
+/// that's since been superseded) falls back to constructing that specific
+/// provider fresh, since only the currently-preferred provider is cached.
 pub fn get_by_type(provider_type: ProviderType) -> Result<Arc<dyn KekProvider>> {
     if let Some(best) = current_best_provider_type() {
         if best != provider_type {
@@ -223,6 +284,12 @@ pub fn get_by_type(provider_type: ProviderType) -> Result<Arc<dyn KekProvider>> 
                 provider_type.as_str(),
                 best.as_str()
             );
+        }
+    }
+
+    if let Some(cached) = SELECTED_PROVIDER.read().unwrap().clone() {
+        if cached.provider_type() == provider_type {
+            return Ok(cached);
         }
     }
 
@@ -293,6 +360,8 @@ mod tests {
             use p256::SecretKey;
             use rand_core::OsRng;
 
+            reset_selected_provider_for_tests(); // don't let an earlier test's cached choice short-circuit this one
+
             let ext_dir = tempdir().unwrap();
             let soft_dir = tempdir().unwrap();
 
@@ -314,6 +383,7 @@ mod tests {
 
             std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
             std::env::remove_var("HKDFGUARD_SOFTWARE_DIR");
+            reset_selected_provider_for_tests(); // don't leak this test's cached choice into whatever runs next
         }
     }
 
@@ -322,6 +392,8 @@ mod tests {
     fn select_for_wrap_falls_back_to_ephemeral_when_software_fails() {
         #[cfg(all(feature = "ephemeral", feature = "software"))]
         {
+            reset_selected_provider_for_tests(); // don't let an earlier test's cached choice short-circuit this one
+
             // Point external secret to nonexistent dir
             std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-dir-for-tests");
             // Point software to a file rather than a directory, causing directory creation/read to fail
@@ -331,6 +403,56 @@ mod tests {
             let (provider, handle) = select_for_wrap("com.company.orders").unwrap();
             assert_eq!(provider.provider_type(), ProviderType::Ephemeral);
             assert_eq!(handle.key_id(), b"ephemeral:com.company.orders");
+
+            std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
+            std::env::remove_var("HKDFGUARD_SOFTWARE_DIR");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn select_for_wrap_reuses_cached_provider_instance_across_calls() {
+        #[cfg(all(feature = "software", feature = "external-secret"))]
+        {
+            reset_selected_provider_for_tests();
+            std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-dir-for-tests");
+            let dir = tempdir().unwrap();
+            std::env::set_var("HKDFGUARD_SOFTWARE_DIR", dir.path());
+
+            let (provider1, _handle1) = select_for_wrap("com.company.a").unwrap();
+            assert_eq!(provider1.provider_type(), ProviderType::Software);
+
+            let (provider2, _handle2) = select_for_wrap("com.company.b").unwrap();
+            // Same underlying provider *instance*, not merely the same type --
+            // proves the second call skipped full discovery and reused the
+            // cached one, rather than constructing a fresh Software provider.
+            assert!(
+                Arc::ptr_eq(&provider1, &provider2),
+                "second call must reuse the exact cached provider instance"
+            );
+
+            std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
+            std::env::remove_var("HKDFGUARD_SOFTWARE_DIR");
+            reset_selected_provider_for_tests();
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn select_for_wrap_does_not_cache_ephemeral() {
+        #[cfg(all(feature = "ephemeral", feature = "software"))]
+        {
+            reset_selected_provider_for_tests();
+            std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-dir-for-tests");
+            let tmp = tempfile::NamedTempFile::new().unwrap(); // a file, not a dir: makes Software fail so only Ephemeral succeeds
+            std::env::set_var("HKDFGUARD_SOFTWARE_DIR", tmp.path());
+
+            let (provider, _handle) = select_for_wrap("com.company.orders").unwrap();
+            assert_eq!(provider.provider_type(), ProviderType::Ephemeral);
+            assert!(
+                SELECTED_PROVIDER.read().unwrap().is_none(),
+                "an Ephemeral-only resolution must not populate the cache"
+            );
 
             std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
             std::env::remove_var("HKDFGUARD_SOFTWARE_DIR");

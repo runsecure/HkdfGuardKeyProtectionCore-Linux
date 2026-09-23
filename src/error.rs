@@ -28,6 +28,7 @@ pub mod status {
     pub const CRYPTO_ERROR: i32 = -5; // malformed payload or AEAD authentication failure
     pub const INTERNAL_ERROR: i32 = -6; // an unexpected panic was caught at the FFI boundary
     pub const INVALID_UTF8: i32 = -7; // the `service` C string was not valid UTF-8
+    pub const MISSING_SERVICE_NAME: i32 = -8; // the `service` pointer was null, or pointed at an empty string
 }
 
 #[derive(Debug)] // lets `Error` be formatted with `{:?}` in tests/logs

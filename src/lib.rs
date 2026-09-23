@@ -1,12 +1,12 @@
-//! HKDFGuard (Linux): `ECDH(P-256) -> HKDF-SHA256 -> AES-256-GCM` DEK
+//! HKDFGuard (Linux): `ECDH(P-256) -> HKDF-SHA512 -> AES-256-GCM` DEK
 //! wrapping backed by a priority-ordered chain of KEK providers (TPM2,
 //! PKCS#11, external secret, software, ephemeral).
 //!
 //! This crate's only public interface is the stable C ABI below. No
 //! Rust-specific type crosses that boundary, no provider handle (TPM,
 //! OpenSSL, PKCS#11 object) is ever exposed, and no panic is allowed to
-//! unwind across it -- see [`hkdfguard_wrap_dek`] and
-//! [`hkdfguard_unwrap_dek`].
+//! unwind across it -- see [`hkdfguard_wrap_dek`], [`hkdfguard_unwrap_dek`],
+//! and [`hkdfguard_generate_and_wrap_dek`].
 
 // `aes-gcm` 0.10 / `elliptic-curve` 0.13 (the latest versions compatible
 // with each other at the time of writing) still depend on `generic-array`
@@ -27,6 +27,7 @@ mod provider; // provider trait + selection chain
 
 pub use error::status; // re-export the status-code constants as part of this crate's public (Rust-side) surface
 
+use rand_core::{OsRng, RngCore}; // the OS CSPRNG, used by hkdfguard_generate_and_wrap_dek below
 use std::ffi::CStr; // for reading the caller's NUL-terminated `service` string
 use std::os::raw::{c_char, c_int}; // C-ABI-compatible integer/char types
 use std::ptr; // raw-pointer helpers (`copy_nonoverlapping`, `write_bytes`)
@@ -41,7 +42,8 @@ const MAX_SERVICE_LEN: usize = 255; // spec-mandated maximum service-name length
 /// # Parameters
 /// - `service`: NUL-terminated UTF-8 string, 1..=255 bytes, identifying
 ///   the KEK. The caller retains ownership; it is only read during the
-///   call.
+///   call. A null pointer or an empty string yields
+///   [`status::MISSING_SERVICE_NAME`].
 /// - `dek` / `dek_len`: the 32-byte DEK to wrap. `dek_len` must be exactly
 ///   32.
 /// - `out` / `out_len`: on input, `*out_len` is the capacity of `out` in
@@ -90,7 +92,8 @@ pub extern "C" fn hkdfguard_wrap_dek(
 /// # Parameters
 /// - `service`: must match the value passed to `hkdfguard_wrap_dek` when
 ///   this payload was produced; any mismatch is indistinguishable from
-///   tampering and yields [`status::CRYPTO_ERROR`].
+///   tampering and yields [`status::CRYPTO_ERROR`]. A null pointer or an
+///   empty string yields [`status::MISSING_SERVICE_NAME`].
 /// - `wrapped` / `wrapped_len`: the wrapped payload bytes.
 /// - `out` / `out_len`: on input, `*out_len` is the capacity of `out`. On
 ///   success, the 32-byte DEK is written to `out` and `*out_len` is set to
@@ -127,20 +130,83 @@ pub extern "C" fn hkdfguard_unwrap_dek(
     }
 }
 
+/// Generates a fresh, cryptographically random 32-byte DEK and immediately
+/// wraps it under the persistent KEK identified by `service`, in one call --
+/// for callers that want a brand new Ephemeral Data Protection Key without
+/// having to source their own randomness.
+///
+/// The newly generated plaintext DEK never crosses this ABI boundary: it is
+/// zeroed internally the instant it has been wrapped, before this function
+/// returns. To recover it later, unwrap the resulting payload via
+/// [`hkdfguard_unwrap_dek`], passing the same `service`.
+///
+/// # Parameters
+/// Same as [`hkdfguard_wrap_dek`], minus `dek`/`dek_len`.
+///
+/// # Returns
+/// One of the status codes in [`status`]. Never throws/unwinds.
+///
+/// # Safety
+/// Same pointer/length obligations as [`hkdfguard_wrap_dek`]'s `service`,
+/// `out`, and `out_len` parameters.
+#[no_mangle]
+pub extern "C" fn hkdfguard_generate_and_wrap_dek(
+    service: *const c_char,
+    out: *mut u8,
+    out_len: *mut c_int,
+) -> c_int {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        generate_and_wrap_impl(service, out, out_len)
+    })) {
+        Ok(code) => code,
+        Err(_) => {
+            log::error!("hkdfguard: internal panic caught at hkdfguard_generate_and_wrap_dek boundary");
+            status::INTERNAL_ERROR
+        }
+    }
+}
+
+// The actual logic behind `hkdfguard_generate_and_wrap_dek`, running inside
+// the `catch_unwind` wrapper above. Generates the DEK, then delegates to
+// `wrap_impl` (the exact same validation/wrap/copy-out logic
+// `hkdfguard_wrap_dek` uses) so that crypto sequence exists in exactly one
+// place rather than being duplicated between the two ABI entry points.
+fn generate_and_wrap_impl(
+    service: *const c_char,
+    out: *mut u8,
+    out_len: *mut c_int,
+) -> c_int {
+    // Cryptographically random 32-byte DEK, sourced from the OS CSPRNG --
+    // the same `OsRng` this crate's own CLI tool
+    // (`hkdfguard-v1-initialize`) uses for its secure-overwrite passes, and
+    // the Linux analog of Windows' `BCryptGenRandom` / macOS's
+    // `SecRandomCopyBytes` used for the equivalent purpose elsewhere in
+    // this project.
+    let mut dek = [0u8; crypto::DEK_LEN];
+    OsRng.fill_bytes(&mut dek);
+
+    let code = wrap_impl(service, dek.as_ptr(), crypto::DEK_LEN as c_int, out, out_len);
+    dek.zeroize(); // our local copy of the freshly generated DEK is no longer needed; scrub it now
+    code
+}
+
 // Validates and borrows the caller's `service` C string as a Rust `&str`,
 // or returns the appropriate status code if it's null, not UTF-8, empty,
 // or too long. Shared by both `wrap_impl` and `unwrap_impl`.
 fn cstr_to_service<'a>(ptr: *const c_char) -> Result<&'a str, c_int> {
     if ptr.is_null() {
-        return Err(status::INVALID_ARGUMENT);
+        return Err(status::MISSING_SERVICE_NAME); // no service string supplied at all
     }
     // SAFETY: caller contract (see function-level Safety docs) guarantees
     // `ptr` is a valid, NUL-terminated, readable C string for the duration
     // of this call.
     let cstr = unsafe { CStr::from_ptr(ptr) };
     let s = cstr.to_str().map_err(|_| status::INVALID_UTF8)?; // reject non-UTF-8 byte sequences
-    if s.is_empty() || s.len() > MAX_SERVICE_LEN {
-        return Err(status::INVALID_ARGUMENT); // enforce the 1..=255 byte length rule
+    if s.is_empty() {
+        return Err(status::MISSING_SERVICE_NAME); // a service string was supplied, but it's empty
+    }
+    if s.len() > MAX_SERVICE_LEN {
+        return Err(status::INVALID_ARGUMENT); // enforce the <=255 byte length rule
     }
     Ok(s)
 }
@@ -297,12 +363,14 @@ mod ffi_tests {
     // Points the software provider at a fresh temp directory and disables
     // the external-secret provider so tests are deterministic.
     fn with_isolated_software_provider<F: FnOnce()>(f: F) {
+        provider::reset_selected_provider_for_tests(); // don't let an earlier test's cached provider choice leak in
         let dir = tempdir().unwrap();
         std::env::set_var("HKDFGUARD_SOFTWARE_DIR", dir.path());
         std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-for-tests");
         f();
         std::env::remove_var("HKDFGUARD_SOFTWARE_DIR");
         std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
+        provider::reset_selected_provider_for_tests(); // don't leak this test's cached choice into whatever runs next
     }
 
     #[test]
@@ -336,6 +404,110 @@ mod ffi_tests {
             assert_eq!(out_len, 32);
             assert_eq!(out, dek); // must recover exactly the original DEK
         });
+    }
+
+    #[test]
+    #[serial]
+    fn generate_and_wrap_round_trip() {
+        with_isolated_software_provider(|| {
+            let service = CString::new("com.company.orders").unwrap();
+            let mut wrapped_buf = [0u8; 512]; // generously-sized output buffer
+            let mut wrapped_len: c_int = wrapped_buf.len() as c_int;
+
+            let rc = hkdfguard_generate_and_wrap_dek(
+                service.as_ptr(),
+                wrapped_buf.as_mut_ptr(),
+                &mut wrapped_len,
+            );
+            assert_eq!(rc, status::OK);
+
+            // Unwrapping it recovers a real 32-byte DEK -- proving the
+            // payload generate_and_wrap_dek produced is a genuine,
+            // independently unwrappable wrapped payload, not just a
+            // plausible-looking buffer.
+            let mut out = [0u8; 32];
+            let mut out_len: c_int = out.len() as c_int;
+            let rc = hkdfguard_unwrap_dek(
+                service.as_ptr(),
+                wrapped_buf.as_ptr(),
+                wrapped_len,
+                out.as_mut_ptr(),
+                &mut out_len,
+            );
+            assert_eq!(rc, status::OK);
+            assert_eq!(out_len, 32);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn generate_and_wrap_produces_independent_deks() {
+        // Each call sources its own fresh CSPRNG randomness for the DEK
+        // itself, not just a fresh nonce/ephemeral key -- this is the
+        // check that actually distinguishes "generates a new DEK" from
+        // "wraps a fixed/reused buffer."
+        with_isolated_software_provider(|| {
+            let service = CString::new("com.company.orders").unwrap();
+
+            let mut wrapped1 = [0u8; 512];
+            let mut wrapped1_len: c_int = wrapped1.len() as c_int;
+            assert_eq!(
+                hkdfguard_generate_and_wrap_dek(service.as_ptr(), wrapped1.as_mut_ptr(), &mut wrapped1_len),
+                status::OK
+            );
+            let mut dek1 = [0u8; 32];
+            let mut dek1_len: c_int = dek1.len() as c_int;
+            assert_eq!(
+                hkdfguard_unwrap_dek(service.as_ptr(), wrapped1.as_ptr(), wrapped1_len, dek1.as_mut_ptr(), &mut dek1_len),
+                status::OK
+            );
+
+            let mut wrapped2 = [0u8; 512];
+            let mut wrapped2_len: c_int = wrapped2.len() as c_int;
+            assert_eq!(
+                hkdfguard_generate_and_wrap_dek(service.as_ptr(), wrapped2.as_mut_ptr(), &mut wrapped2_len),
+                status::OK
+            );
+            let mut dek2 = [0u8; 32];
+            let mut dek2_len: c_int = dek2.len() as c_int;
+            assert_eq!(
+                hkdfguard_unwrap_dek(service.as_ptr(), wrapped2.as_ptr(), wrapped2_len, dek2.as_mut_ptr(), &mut dek2_len),
+                status::OK
+            );
+
+            assert_ne!(dek1, dek2, "two generate_and_wrap_dek calls must produce different DEKs");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn generate_and_wrap_buffer_too_small_reports_required_size_without_writing() {
+        with_isolated_software_provider(|| {
+            let service = CString::new("com.company.orders").unwrap();
+            let mut tiny = [0xFFu8; 4]; // way too small to hold a wrapped payload
+            let mut tiny_len: c_int = tiny.len() as c_int;
+
+            let rc = hkdfguard_generate_and_wrap_dek(service.as_ptr(), tiny.as_mut_ptr(), &mut tiny_len);
+            assert_eq!(rc, status::BUFFER_TOO_SMALL);
+            assert!(tiny_len > 4); // *out_len was updated to the actually-required size
+            assert_eq!(tiny, [0xFFu8; 4], "must not write on BUFFER_TOO_SMALL"); // buffer contents untouched
+        });
+    }
+
+    #[test]
+    fn generate_and_wrap_null_service_is_missing_service_name() {
+        let mut out = [0u8; 512];
+        let mut out_len: c_int = out.len() as c_int;
+        let rc = hkdfguard_generate_and_wrap_dek(std::ptr::null(), out.as_mut_ptr(), &mut out_len);
+        assert_eq!(rc, status::MISSING_SERVICE_NAME);
+    }
+
+    #[test]
+    fn generate_and_wrap_null_out_len_is_invalid_argument() {
+        let service = CString::new("com.company.orders").unwrap();
+        let mut out = [0u8; 512];
+        let rc = hkdfguard_generate_and_wrap_dek(service.as_ptr(), out.as_mut_ptr(), std::ptr::null_mut());
+        assert_eq!(rc, status::INVALID_ARGUMENT);
     }
 
     #[test]
@@ -399,7 +571,7 @@ mod ffi_tests {
     }
 
     #[test]
-    fn null_service_is_invalid_argument() {
+    fn null_service_is_missing_service_name() {
         let dek = [0u8; 32];
         let mut out = [0u8; 512];
         let mut out_len: c_int = out.len() as c_int;
@@ -410,7 +582,7 @@ mod ffi_tests {
             out.as_mut_ptr(),
             &mut out_len,
         );
-        assert_eq!(rc, status::INVALID_ARGUMENT);
+        assert_eq!(rc, status::MISSING_SERVICE_NAME);
 
         let rc = hkdfguard_unwrap_dek(
             std::ptr::null(),
@@ -419,7 +591,7 @@ mod ffi_tests {
             out.as_mut_ptr(),
             &mut out_len,
         );
-        assert_eq!(rc, status::INVALID_ARGUMENT);
+        assert_eq!(rc, status::MISSING_SERVICE_NAME);
     }
 
     #[test]
@@ -553,7 +725,7 @@ mod ffi_tests {
                 out.as_mut_ptr(),
                 &mut out_len
             ),
-            status::INVALID_ARGUMENT
+            status::MISSING_SERVICE_NAME
         );
         assert_eq!(
             hkdfguard_unwrap_dek(
@@ -563,7 +735,7 @@ mod ffi_tests {
                 out.as_mut_ptr(),
                 &mut out_len
             ),
-            status::INVALID_ARGUMENT
+            status::MISSING_SERVICE_NAME
         );
 
         // Oversized service string (> 255 bytes)

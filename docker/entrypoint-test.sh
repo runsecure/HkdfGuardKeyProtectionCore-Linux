@@ -57,4 +57,21 @@ cargo build --release
 cc -I include examples/wrap_unwrap.c -L target/release -lHkdfGuardKeyProtectionLinux -o /tmp/wrap_unwrap
 LD_LIBRARY_PATH=target/release /tmp/wrap_unwrap
 
+section "hkdfguard-v1-initialize CLI output unwraps via libHkdfGuardKeyProtectionLinux.so"
+# The CLI links this crate's Rust code statically (an rlib), so this proves
+# the wrapped payload it writes is genuinely consumer-independent -- a
+# *different*, dynamically-linked consumer (this C program, against the
+# release .so) can unwrap it too, not just the CLI's own process image.
+DEK_FILE=$(mktemp)
+head -c 32 /dev/urandom > "$DEK_FILE"
+DEK_B64=$(base64 -w0 < "$DEK_FILE")
+WRAPPED_FILE=$(mktemp)
+target/release/hkdfguard-v1-initialize "$WRAPPED_FILE" \
+    --service-name com.hkdfguard.dockertest.cliso \
+    --dek "$DEK_B64" \
+    --force
+cc -I include examples/cli_unwrap_check.c -L target/release -lHkdfGuardKeyProtectionLinux -o /tmp/cli_unwrap_check
+LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$WRAPPED_FILE" "com.hkdfguard.dockertest.cliso" "$DEK_FILE"
+rm -f "$DEK_FILE" "$WRAPPED_FILE"
+
 section "ALL CHECKS PASSED"

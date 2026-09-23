@@ -5,7 +5,7 @@
  * per-service Key Encryption Key (KEK), using the strongest available
  * provider on the host (TPM2 > PKCS#11 > external secret > software >
  * ephemeral). See the crate's provider/ module docs for the protocol
- * (ECDH P-256 -> HKDF-SHA256 -> AES-256-GCM) and provider details.
+ * (ECDH P-256 -> HKDF-SHA512 -> AES-256-GCM) and provider details.
  *
  * No Rust type, TPM handle, OpenSSL structure, or PKCS#11 object ever
  * crosses this boundary. No exception/panic ever crosses this boundary --
@@ -33,6 +33,7 @@ extern "C" {
 #define HKDFGUARD_ERR_CRYPTO_ERROR     (-5)
 #define HKDFGUARD_ERR_INTERNAL_ERROR   (-6)
 #define HKDFGUARD_ERR_INVALID_UTF8     (-7)
+#define HKDFGUARD_ERR_MISSING_SERVICE_NAME (-8)
 
 /*
  * Wraps a 32-byte DEK under the persistent KEK identified by `service`.
@@ -40,6 +41,8 @@ extern "C" {
  * service:  NUL-terminated UTF-8 string, 1..=255 bytes. The logical,
  *           cross-platform identity of the KEK (e.g. "com.company.orders").
  *           Different service strings always resolve to different KEKs.
+ *           NULL or an empty string returns
+ *           HKDFGUARD_ERR_MISSING_SERVICE_NAME.
  * dek:      pointer to exactly `dek_len` bytes to wrap.
  * dek_len:  must be exactly HKDFGUARD_DEK_LEN (32); any other value
  *           returns HKDFGUARD_ERR_INVALID_ARGUMENT.
@@ -67,7 +70,8 @@ int hkdfguard_wrap_dek(
  *
  * service:      must match the value used when the payload was wrapped;
  *                any mismatch is indistinguishable from tampering and
- *                returns HKDFGUARD_ERR_CRYPTO_ERROR.
+ *                returns HKDFGUARD_ERR_CRYPTO_ERROR. NULL or an empty
+ *                string returns HKDFGUARD_ERR_MISSING_SERVICE_NAME.
  * wrapped:       pointer to the wrapped payload bytes.
  * wrapped_len:   length of `wrapped` in bytes.
  * out:           buffer to receive the recovered 32-byte DEK.
@@ -86,6 +90,33 @@ int hkdfguard_unwrap_dek(
     const char* service,
     const uint8_t* wrapped,
     int wrapped_len,
+    uint8_t* out,
+    int* out_len);
+
+/*
+ * Generates a fresh, cryptographically random 32-byte DEK and immediately
+ * wraps it under the persistent KEK identified by `service`, in one call --
+ * for callers that want a brand new Ephemeral Data Protection Key without
+ * having to source their own randomness.
+ *
+ * The newly generated plaintext DEK never crosses this ABI boundary: it is
+ * zeroed internally the instant it has been wrapped, before this function
+ * returns. To recover it later, unwrap the resulting payload via
+ * hkdfguard_unwrap_dek, passing the same `service`.
+ *
+ * service:  see hkdfguard_wrap_dek.
+ * out:      buffer to receive the wrapped payload. May be NULL only if
+ *           *out_len is 0 (to probe the required size).
+ * out_len:  in: capacity of `out` in bytes.
+ *           out: on HKDFGUARD_OK, the number of bytes written to `out`.
+ *                on HKDFGUARD_ERR_BUFFER_TOO_SMALL, the required capacity;
+ *                `out` is left untouched and the call should be retried
+ *                with a larger buffer.
+ *
+ * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
+ */
+int hkdfguard_generate_and_wrap_dek(
+    const char* service,
     uint8_t* out,
     int* out_len);
 

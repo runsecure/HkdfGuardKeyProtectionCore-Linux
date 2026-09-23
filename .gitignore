@@ -1,6 +1,9 @@
 # Rust build output
 /target/
 
+# docker/build-dist.sh output
+/dist/
+
 # Prerequisites
 *.d
 

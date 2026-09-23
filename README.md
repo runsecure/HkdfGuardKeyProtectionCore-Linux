@@ -7,20 +7,29 @@ host. Same cryptographic protocol and `service`-based key identity as the
 macOS Secure Enclave and Windows TPM/CNG implementations of HKDFGuard.
 
 ```
-ECDH (P-256)  ->  HKDF-SHA256  ->  AES-256-GCM
+ECDH (P-256)  ->  HKDF-SHA512  ->  AES-256-GCM
 ```
 
 ## Quick start
 
 ```sh
-cargo build --release
+scripts/build-release.sh
 ```
 
-Produces `target/release/libHkdfGuardKeyProtectionLinux.{so,dylib}`
-(dynamic) and `libHkdfGuardKeyProtectionLinux.a` (static) -- the `[lib]
-name` in `Cargo.toml` controls this output name directly. The C header
+Runs `cargo build --release`, which produces
+`target/release/libHkdfGuardKeyProtectionLinux.{so,dylib}` (dynamic) and
+`libHkdfGuardKeyProtectionLinux.a` (static) -- the `[lib] name` in
+`Cargo.toml` controls that output name directly, and Cargo has no way to
+produce a name containing dots. The script's one additional step copies the
+dynamic library to `target/release/HkdfGuard.Kms.Linux.v1.{so,dylib}` --
+this project's actual release artifact name, matching the
+`HkdfGuard.Kms.<platform>.v1` convention its Windows (CMake `OUTPUT_NAME`)
+and macOS (Xcode `PRODUCT_NAME`) builds apply natively. A plain
+`cargo build --release` still works for local iteration; just link against
+`libHkdfGuardKeyProtectionLinux` directly in that case. The C header
 (`include/hkdfguard.h`) and exported C symbols (`hkdfguard_wrap_dek`,
-`hkdfguard_unwrap_dek`) are unaffected and keep their existing names.
+`hkdfguard_unwrap_dek`, `hkdfguard_generate_and_wrap_dek`) are unaffected
+either way and keep their existing names.
 
 ```c
 #include "hkdfguard.h"
@@ -33,6 +42,19 @@ hkdfguard_wrap_dek("com.company.orders", dek, 32, wrapped, &wrapped_len);
 uint8_t recovered[32];
 int recovered_len = sizeof(recovered);
 hkdfguard_unwrap_dek("com.company.orders", wrapped, wrapped_len, recovered, &recovered_len);
+```
+
+`hkdfguard_generate_and_wrap_dek` generates its own cryptographically random
+32-byte DEK (via the OS CSPRNG) and wraps it in one call, for callers minting
+a brand new Ephemeral Data Protection Key -- the plaintext DEK never crosses
+back out to the caller; it's zeroed internally the moment it's wrapped.
+Recover it later via `hkdfguard_unwrap_dek` on the resulting payload, with
+the same `service`:
+
+```c
+uint8_t wrapped[512];
+int wrapped_len = sizeof(wrapped);
+hkdfguard_generate_and_wrap_dek("com.company.orders", wrapped, &wrapped_len);
 ```
 
 See [`examples/wrap_unwrap.c`](examples/wrap_unwrap.c) for a complete,
@@ -56,7 +78,7 @@ originally wrapped the payload (recorded in the payload itself, never in
 | 5 | Ephemeral | [`src/provider/ephemeral.rs`](src/provider/ephemeral.rs) | `ephemeral` | yes |
 
 Callers never see which provider is active. Every provider implements the
-identical `ECDH -> HKDF-SHA256 -> AES-256-GCM` protocol
+identical `ECDH -> HKDF-SHA512 -> AES-256-GCM` protocol
 ([`src/crypto.rs`](src/crypto.rs)); the only difference is where the
 persistent P-256 KEK's private key lives and who performs the ECDH.
 
@@ -118,7 +140,7 @@ round trip all passed. See [`docker/README.md`](docker/README.md).
   derive output.
 - **Pure-Rust crypto (`p256`/`hkdf`/`aes-gcm`), not OpenSSL**, for the
   protocol itself. No system OpenSSL version skew across distros, trivial
-  static linking (`libHkdfGuardKeyProtectionLinux.a`), and RustCrypto's P-256/HKDF-SHA256/
+  static linking (`libHkdfGuardKeyProtectionLinux.a`), and RustCrypto's P-256/HKDF-SHA512/
   AES-256-GCM implementations satisfy the mandated algorithm list exactly.
   TPM2 and PKCS#11 still, necessarily, link against their respective
   native libraries.
@@ -193,10 +215,11 @@ round trip all passed. See [`docker/README.md`](docker/README.md).
 
 ```
 src/
-  lib.rs                    C ABI: hkdfguard_wrap_dek / hkdfguard_unwrap_dek
+  lib.rs                    C ABI: hkdfguard_wrap_dek / hkdfguard_unwrap_dek /
+                             hkdfguard_generate_and_wrap_dek
   error.rs                  Internal error type <-> C status codes
   payload.rs                Wrapped-payload wire format
-  crypto.rs                 ECDH -> HKDF-SHA256 -> AES-256-GCM protocol
+  crypto.rs                 ECDH -> HKDF-SHA512 -> AES-256-GCM protocol
   provider/
     mod.rs                  KekProvider/KekHandle traits, selection chain
     tpm2.rs                 Provider 1 (feature `tpm2`)
@@ -206,4 +229,6 @@ src/
     ephemeral.rs             Provider 5 (feature `ephemeral`, default)
 include/hkdfguard.h          C header
 examples/wrap_unwrap.c       Minimal C consumer
+scripts/build-release.sh     cargo build --release, then renames the output
+                              to HkdfGuard.Kms.Linux.v1.{so,dylib}
 ```
