@@ -40,7 +40,9 @@ fn with_provisioned_external_secret<F: FnOnce()>(service: &str, f: F) {
     let dir = tempdir().unwrap();
     std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", dir.path());
     let secret_key = SecretKey::random(&mut OsRng);
-    fs::write(dir.path().join(service), secret_key.to_bytes()).unwrap();
+    let secret_path = dir.path().join(service);
+    fs::write(&secret_path, secret_key.to_bytes()).unwrap();
+    fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600)).unwrap(); // owner-only, as the provider requires of a KEK file
     f();
     std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
 }

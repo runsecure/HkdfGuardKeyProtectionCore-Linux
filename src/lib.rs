@@ -1473,6 +1473,9 @@ mod ffi_tests {
 
         let key_a = p256::SecretKey::random(&mut rand_core::OsRng);
         std::fs::write(&secret_path, key_a.to_bytes()).unwrap();
+        // Owner-only, as the provider requires of a KEK file. The rotation
+        // rewrite below preserves this mode, so it's set once.
+        std::fs::set_permissions(&secret_path, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600)).unwrap();
         create_kek_for_test(&service); // finds the pre-provisioned key; external-secret never creates one itself
 
         let dek = [0x33u8; 32];

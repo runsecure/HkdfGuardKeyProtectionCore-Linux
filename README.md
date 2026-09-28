@@ -24,7 +24,7 @@ mint a payload that unwraps to a DEK of their choosing. See
 consequence: a build server **cannot** pre-wrap a DEK for a host. DEKs
 are delivered to the host and wrapped there.
 
-Wire format version 3. Every byte of a payload except the ciphertext is
+Wire format version 1. Every byte of a payload except the ciphertext is
 bound into both the AEAD's associated data and the HKDF `info`, so the
 `provider_type` tag and the KEK fingerprint are authenticated rather
 than merely present.
@@ -289,6 +289,42 @@ all 21 default-feature tests, a real link against `tpm2,pkcs11`, the
 swtpm-backed TPM2 test, the SoftHSM2-backed PKCS#11 test, and the C ABI
 round trip all passed. See [`docker/README.md`](docker/README.md).
 
+## External-secret file requirements
+
+For the external-secret provider the mounted file *is* the KEK private
+key, so it is held to the same standard as the PKCS#11 PIN and the TPM
+derivation secret. `<mount>/<service>` must:
+
+- be **owned by root or by the process's user**, with **no group or other
+  access** — `0400` or `0600`;
+- be a **regular file** (not a directory, device, or FIFO);
+- **resolve to a path inside the mount.** Symlinks are followed —
+  Kubernetes Secret volumes present every key as a symlink into `..data/`,
+  and refusing that would refuse the most common delivery mechanism — but
+  only while the resolution stays within the mount directory. A link
+  leading anywhere else is refused.
+
+A file that is present but fails a check is reported as an **error**,
+never as "not provisioned": a misconfigured mount must not silently fall
+through to a weaker provider. `hkdfguard_kek_exists` surfaces it the same
+way.
+
+Every common mechanism meets the mode requirement with one setting:
+
+| Mechanism | Setting |
+|---|---|
+| Kubernetes `Secret` volume | `defaultMode: 0400` on the volume (files are root-owned) |
+| Vault Agent template/sink | `perms = "0400"` |
+| Docker Swarm secret | `mode: 0400` (the default `0444` is refused) |
+| CSI Secrets Store | `defaultMode`/file permission in the `SecretProviderClass` |
+| systemd `LoadCredential=` | already `0400`, root-owned — works as-is |
+
+> **Kubernetes `fsGroup` caveat:** setting `fsGroup` on the pod can add
+> group-read to secret files even with `defaultMode: 0400`, which the
+> provider refuses. Either leave `fsGroup` unset for the secret volume,
+> or use `fsGroupChangePolicy: OnRootMismatch` with an owner that matches
+> the process's user.
+
 ## Initializing a wrapped key (`hkdfguard-v1-initialize`)
 
 Because a wrapped payload can only be produced on the host that holds the
@@ -326,7 +362,7 @@ before removal).
 
 | Env var | Used by | Purpose |
 |---|---|---|
-| `HKDFGUARD_EXTERNAL_SECRET_DIR` | External Secret | Override the mount directory searched for `<dir>/<service>` secret files (default: first of `/var/run/secrets/hkdfguard`, `/run/secrets/hkdfguard`, `/vault/secrets/hkdfguard`, `/mnt/secrets-store/hkdfguard` that exists) |
+| `HKDFGUARD_EXTERNAL_SECRET_DIR` | External Secret | Override the mount directory searched for `<dir>/<service>` secret files (default: first of `/var/run/secrets/hkdfguard`, `/run/secrets/hkdfguard`, `/vault/secrets/hkdfguard`, `/mnt/secrets-store/hkdfguard` that exists). Each file must be owner-only (`0400`/`0600`), owned by root or the process's user, and resolve to a path inside the mount — see "External-secret file requirements". |
 | `HKDFGUARD_PKCS11_MODULE` | PKCS#11 | Absolute path to the PKCS#11 module `.so` (default: common SoftHSM2 install paths). The resolved file and its directory must be root-owned and not group/other-writable, or the module is refused. |
 | `HKDFGUARD_PKCS11_SLOT` | PKCS#11 | Slot index (default: first slot with a token present) |
 | `HKDFGUARD_PKCS11_PIN_FILE` | PKCS#11 | Path to a file holding the user PIN (default: `/etc/hkdfguard/pkcs11.pin`). Must be owned by root or the process's user with no group/other access (e.g. `0600`). The former `HKDFGUARD_PKCS11_PIN` env var is no longer read. |

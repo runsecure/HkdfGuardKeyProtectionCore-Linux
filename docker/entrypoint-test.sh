@@ -70,7 +70,7 @@ rm -rf "$PIN_DIR"
 # real KEK: provision an external secret for its service, as a
 # deployment platform would.
 EXAMPLE_SECRET_DIR=$(mktemp -d)
-head -c 32 /dev/urandom > "$EXAMPLE_SECRET_DIR/com.company.orders"
+( umask 077; head -c 32 /dev/urandom > "$EXAMPLE_SECRET_DIR/com.company.orders" ) # owner-only, as the provider now requires of a KEK file
 export HKDFGUARD_EXTERNAL_SECRET_DIR="$EXAMPLE_SECRET_DIR"
 cargo build --release
 cc -I include examples/wrap_unwrap.c -L target/release -lHkdfGuardKeyProtectionLinux -o /tmp/wrap_unwrap
@@ -90,7 +90,7 @@ section "hkdfguard-v1-initialize CLI output unwraps via libHkdfGuardKeyProtectio
 CLISO_SERVICE=com.hkdfguard.dockertest.cliso
 EXT_SECRET_DIR=$(mktemp -d)
 export HKDFGUARD_EXTERNAL_SECRET_DIR="$EXT_SECRET_DIR"
-head -c 32 /dev/urandom > "$EXT_SECRET_DIR/$CLISO_SERVICE"
+( umask 077; head -c 32 /dev/urandom > "$EXT_SECRET_DIR/$CLISO_SERVICE" ) # owner-only, as the provider now requires of a KEK file
 
 DEK_FILE=$(mktemp)
 head -c 32 /dev/urandom > "$DEK_FILE"

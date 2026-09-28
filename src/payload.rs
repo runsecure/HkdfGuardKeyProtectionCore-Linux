@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! offset  size  field
-//! 0       1     version            (currently 3)
+//! 0       1     version            (currently 1)
 //! 1       1     provider_type      (1=TPM2 2=PKCS11 3=EXTERNAL_SECRET 5=EPHEMERAL;
 //!                                   4 was SOFTWARE, retired -- see `ProviderType`)
 //! 2       2     key_id_len (u16)
@@ -28,21 +28,12 @@
 //! is supplied out-of-band on every wrap/unwrap call. It is nonetheless
 //! bound into the key derivation; see [`crate::crypto`].
 //!
-//! Version 2 added the trailing `fingerprint` field; a version-1 payload
-//! (produced before that field existed) is rejected outright by
-//! `from_bytes` rather than misparsed, since a fixed-size trailing field
-//! can't be distinguished from "shorter ciphertext" any other way.
-//!
-//! Version 3 replaced the 65-byte `ephemeral_public_key` with a 32-byte
-//! `salt`. The protocol no longer uses an ephemeral ECDH key, because
-//! anyone holding the KEK's (non-secret) public key could reproduce the
-//! shared secret it produced and therefore mint a payload that unwrapped
-//! to a DEK of their choosing. The wrapping key is now derived from an
-//! ECDH only the key's holder can perform, with this `salt` providing the
-//! per-payload key separation the ephemeral key used to -- see
-//! [`crate::crypto`] for the full rationale. A version-2 payload is
-//! rejected rather than misparsed: the two layouts differ in length and
-//! meaning, and a v2 payload's wrapping key is not derivable under v3.
+//! The leading version byte exists so the layout can evolve without a
+//! future parser ever misreading an old blob as a new one; `from_bytes`
+//! rejects any value other than [`VERSION`] outright. Note the `salt`
+//! field is deliberately a random HKDF salt and *not* an ephemeral ECDH
+//! public key -- see [`crate::crypto`] for why the protocol derives the
+//! wrapping key from a fixed point rather than an ephemeral one.
 //!
 //! Every field here except the ciphertext is authenticated, both as the
 //! AEAD's associated data and as part of the HKDF `info` -- see
@@ -51,7 +42,7 @@
 use crate::error::{Error, Result}; // this module's own error type + `Result<T, Error>` alias
 use crate::provider::ProviderType; // the 1..=5 provider tag stored in the payload
 
-pub const VERSION: u8 = 3; // current wire-format version; bump and branch in `from_bytes` if the layout ever changes
+pub const VERSION: u8 = 1; // current wire-format version; bump and branch in `from_bytes` if the layout ever changes
 pub const SALT_LEN: usize = 32; // per-payload HKDF salt; 32 bytes matches SHA-256's output size, HKDF's natural salt width
 pub const NONCE_LEN: usize = 12; // AES-GCM's standard 96-bit nonce size
 pub const FINGERPRINT_LEN: usize = 32; // SHA-256 digest size
@@ -266,26 +257,20 @@ mod tests {
             fingerprint: [0xEE; FINGERPRINT_LEN],
         };
         let mut bytes = payload.to_bytes();
-        bytes[0] = 1; // version 1: predates the trailing fingerprint field, must be rejected outright
-        let err = Payload::from_bytes(&bytes).unwrap_err();
-        assert!(matches!(err, Error::Crypto("unsupported wrapped payload version")));
+        assert_eq!(bytes[0], VERSION, "byte 0 is the version");
+        Payload::from_bytes(&bytes).expect("the current version must parse");
 
-        // Version 2: the ephemeral-ECDH format. Rejected rather than
-        // misparsed -- its layout differs (65-byte point where v3 has a
-        // 32-byte salt) and its wrapping key is not derivable under v3's
-        // static-point derivation, so there is nothing useful to do with
-        // one beyond refusing it clearly.
-        bytes[0] = 2;
-        let err = Payload::from_bytes(&bytes).unwrap_err();
-        assert!(matches!(err, Error::Crypto("unsupported wrapped payload version")));
-
-        bytes[0] = 4; // version 4: doesn't exist yet
-        let err = Payload::from_bytes(&bytes).unwrap_err();
-        assert!(matches!(err, Error::Crypto("unsupported wrapped payload version")));
-
-        bytes[0] = 0; // version 0
-        let err = Payload::from_bytes(&bytes).unwrap_err();
-        assert!(matches!(err, Error::Crypto("unsupported wrapped payload version")));
+        // Every other value -- below, above, or far above -- is refused
+        // rather than misparsed, so a future layout change can never be
+        // read through this parser by accident.
+        for other in [0u8, 2, 3, 255] {
+            bytes[0] = other;
+            let err = Payload::from_bytes(&bytes).unwrap_err();
+            assert!(
+                matches!(err, Error::Crypto("unsupported wrapped payload version")),
+                "version byte {other} must be rejected"
+            );
+        }
     }
 
     #[test]

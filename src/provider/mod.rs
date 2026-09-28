@@ -493,9 +493,12 @@ mod tests {
             let ext_dir = tempdir().unwrap();
             std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", ext_dir.path());
 
-            // Write an external secret for "com.company.orders"
+            // Write an external secret for "com.company.orders", owner-only
+            // as the provider requires of a KEK file.
             let secret_key = SecretKey::random(&mut OsRng);
-            std::fs::write(ext_dir.path().join("com.company.orders"), secret_key.to_bytes()).unwrap();
+            let secret_path = ext_dir.path().join("com.company.orders");
+            std::fs::write(&secret_path, secret_key.to_bytes()).unwrap();
+            std::fs::set_permissions(&secret_path, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600)).unwrap();
 
             let (provider, handle) = create_kek("com.company.orders").unwrap();
             assert_eq!(provider.provider_type(), ProviderType::ExternalSecret);
@@ -573,8 +576,11 @@ mod tests {
             // services need to be pre-provisioned.
             let key_a = SecretKey::random(&mut OsRng);
             let key_b = SecretKey::random(&mut OsRng);
-            std::fs::write(ext_dir.path().join("com.company.a"), key_a.to_bytes()).unwrap();
-            std::fs::write(ext_dir.path().join("com.company.b"), key_b.to_bytes()).unwrap();
+            for (name, key) in [("com.company.a", &key_a), ("com.company.b", &key_b)] {
+                let path = ext_dir.path().join(name);
+                std::fs::write(&path, key.to_bytes()).unwrap();
+                std::fs::set_permissions(&path, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600)).unwrap(); // owner-only, as the provider requires
+            }
 
             let (provider1, _handle1) = create_kek("com.company.a").unwrap();
             assert_eq!(provider1.provider_type(), ProviderType::ExternalSecret);
@@ -689,7 +695,9 @@ mod tests {
             // once the chain reaches it (this provider never creates one
             // itself).
             let secret_key = p256::SecretKey::random(&mut rand_core::OsRng);
-            std::fs::write(ext_dir.path().join("com.company.orders"), secret_key.to_bytes()).unwrap();
+            let secret_path = ext_dir.path().join("com.company.orders");
+            std::fs::write(&secret_path, secret_key.to_bytes()).unwrap();
+            std::fs::set_permissions(&secret_path, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600)).unwrap(); // owner-only, as the provider requires
 
             // PKCS#11 (no PIN configured) is unreachable; policy must
             // fall through to external-secret.

@@ -814,6 +814,9 @@ mod tests {
 
             let key_a = SecretKey::random(&mut OsRng);
             std::fs::write(&secret_path, key_a.to_bytes()).unwrap();
+            // Owner-only, as the provider requires of a KEK file. The rotation
+            // rewrite below preserves this mode, so it's set once.
+            std::fs::set_permissions(&secret_path, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600)).unwrap();
 
             let dek = [0x77u8; DEK_LEN];
             let wrapped = wrap(service, &dek).unwrap();
@@ -840,7 +843,7 @@ mod tests {
     #[test]
     #[serial]
     fn tampered_salt_fails_to_unwrap() {
-        // The salt replaced the ephemeral public key in v3. Tampering
+        // The salt is the per-payload input to the key derivation. Tampering
         // with it changes the HKDF salt *and* the authenticated bytes, so
         // the re-derived key is wrong and the AEAD rejects the payload.
         with_isolated_ephemeral_provider(|| {
