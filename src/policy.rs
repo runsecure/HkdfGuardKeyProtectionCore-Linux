@@ -165,11 +165,60 @@ struct TpmPolicy {
     /// self-consistency check, is the part that resists substitution.
     #[serde(default)]
     pinned_names: BTreeMap<String, String>,
+    /// Whether `TPM2_ECDH_ZGen` runs inside a salted, parameter-encrypted
+    /// HMAC session, so the shared secret does not cross the TPM bus in
+    /// cleartext. See [`SessionEncryption`].
+    #[serde(default)]
+    session_encryption: SessionEncryption,
+    /// Expected TPM Name of the key that salts encrypted sessions, as
+    /// lowercase hex. Without it, a bus-resident attacker can substitute
+    /// their own salt key at `TPM2_ReadPublic` and decrypt the session
+    /// (a full man-in-the-middle), so `session_encryption: required`
+    /// refuses to load without one. Under `auto` it is optional and its
+    /// absence is logged once: passive sniffing is still defeated.
+    pinned_session_salt_key_name: Option<String>,
+}
+
+/// Policy for TPM session parameter encryption (`tpm.session_encryption`).
+///
+/// The threat this addresses is an interposer on a *discrete* TPM's LPC or
+/// SPI bus reading `TPM2_ECDH_ZGen`'s response -- the shared secret -- in
+/// cleartext. A firmware TPM (Intel PTT, AMD fTPM) or a virtual TPM has no
+/// external bus, so encryption there is pure overhead with no security
+/// return; the residual fTPM threats are inside the TPM's own trust
+/// boundary, where transport encryption cannot help.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionEncryption {
+    /// Always encrypt, and refuse the TPM unless the salt key's Name is
+    /// pinned. For fleets with discrete TPMs, or when the manufacturer
+    /// string can't be trusted.
+    Required,
+    /// Encrypt unless the TPM reports a manufacturer known to have no
+    /// external bus (fTPM/vTPM vendors). Unknown vendors are encrypted --
+    /// the decision only ever *skips* encryption for a known-internal TPM.
+    #[default]
+    Auto,
+    /// Never encrypt. For test harnesses; not for production.
+    Off,
 }
 
 /// Length of a SHA-256 TPM Name: the two-byte `TPM_ALG_SHA256` prefix
 /// followed by the 32-byte digest of the marshalled public area.
 const SHA256_TPM_NAME_LEN: usize = 2 + 32;
+
+// Decodes a policy-supplied TPM Name and checks it is a SHA-256 Name.
+fn parse_tpm_name(field: &str, hex: &str) -> Result<Vec<u8>> {
+    let bytes = parse_hex(hex)
+        .ok_or_else(|| Error::Provider(format!("hkdfguard policy: {field} is not valid hex")))?;
+    if bytes.len() != SHA256_TPM_NAME_LEN {
+        return Err(Error::Provider(format!(
+            "hkdfguard policy: {field} is {} bytes, expected {SHA256_TPM_NAME_LEN} (a SHA-256 TPM Name)",
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
+}
 
 // Decodes an even-length hex string. Returns `None` on any non-hex
 // character or odd length.
@@ -303,6 +352,8 @@ pub struct Policy {
     require_tpm_derivation_secret: bool,
     /// Normalized service name -> expected TPM Name bytes.
     pinned_tpm_names: BTreeMap<String, Vec<u8>>,
+    tpm_session_encryption: SessionEncryption,
+    pinned_session_salt_key_name: Option<Vec<u8>>,
 }
 
 impl Policy {
@@ -411,17 +462,7 @@ impl Policy {
         // policy written with a differently-cased name still matches.
         let mut pinned_tpm_names = BTreeMap::new();
         for (service, hex) in &raw.tpm.pinned_names {
-            let bytes = parse_hex(hex).ok_or_else(|| {
-                Error::Provider(format!(
-                    "hkdfguard policy: tpm.pinned_names[\"{service}\"] is not valid hex"
-                ))
-            })?;
-            if bytes.len() != SHA256_TPM_NAME_LEN {
-                return Err(Error::Provider(format!(
-                    "hkdfguard policy: tpm.pinned_names[\"{service}\"] is {} bytes, expected {SHA256_TPM_NAME_LEN} (a SHA-256 TPM Name)",
-                    bytes.len()
-                )));
-            }
+            let bytes = parse_tpm_name(&format!("tpm.pinned_names[\"{service}\"]"), hex)?;
             if pinned_tpm_names
                 .insert(crate::normalize_service(service), bytes)
                 .is_some()
@@ -432,6 +473,25 @@ impl Policy {
             }
         }
 
+        let pinned_session_salt_key_name = raw
+            .tpm
+            .pinned_session_salt_key_name
+            .as_deref()
+            .map(|hex| parse_tpm_name("tpm.pinned_session_salt_key_name", hex))
+            .transpose()?;
+        // `required` without a pin is a false sense of security: the
+        // session would be encrypted, but to a salt key an interposer can
+        // substitute. Refuse the policy rather than honor half of it.
+        if raw.tpm.session_encryption == SessionEncryption::Required
+            && pinned_session_salt_key_name.is_none()
+        {
+            return Err(Error::Provider(
+                "hkdfguard policy: tpm.session_encryption \"required\" needs tpm.pinned_session_salt_key_name; \
+                 without a pinned salt key the encrypted session can be man-in-the-middled on the bus"
+                    .to_string(),
+            ));
+        }
+
         Ok(Policy {
             selection,
             minimum_protection,
@@ -439,7 +499,19 @@ impl Policy {
             setup_min_delay: Duration::from_millis(setup_min_delay_ms),
             require_tpm_derivation_secret: raw.tpm.require_derivation_secret,
             pinned_tpm_names,
+            tpm_session_encryption: raw.tpm.session_encryption,
+            pinned_session_salt_key_name,
         })
+    }
+
+    /// TPM session parameter-encryption mode (`tpm.session_encryption`).
+    pub fn tpm_session_encryption(&self) -> SessionEncryption {
+        self.tpm_session_encryption
+    }
+
+    /// The administrator-pinned Name of the session salt key, if any.
+    pub fn pinned_session_salt_key_name(&self) -> Option<&[u8]> {
+        self.pinned_session_salt_key_name.as_deref()
     }
 
     /// The floor on how long each setup call (`hkdfguard_create_kek`,
@@ -650,6 +722,29 @@ pub(crate) fn require_tpm_derivation_secret() -> bool {
 pub(crate) fn pinned_tpm_name(service: &str) -> Result<Option<Vec<u8>>> {
     match load() {
         Some(Ok(policy)) => Ok(policy.pinned_tpm_name(service).map(|n| n.to_vec())),
+        Some(Err(e)) => Err(e),
+        None => Ok(None),
+    }
+}
+
+/// TPM session parameter-encryption mode. No policy file → `Auto`. A
+/// policy file that exists but is invalid → `Required` (fail closed: a
+/// broken policy must never be what turns bus protection off).
+#[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
+pub(crate) fn tpm_session_encryption() -> SessionEncryption {
+    match load() {
+        Some(Ok(policy)) => policy.tpm_session_encryption(),
+        Some(Err(_)) => SessionEncryption::Required,
+        None => SessionEncryption::Auto,
+    }
+}
+
+/// The pinned session-salt-key Name, if policy sets one. `Err` on a
+/// policy file that exists but can't be trusted -- pinning fails closed.
+#[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
+pub(crate) fn pinned_session_salt_key_name() -> Result<Option<Vec<u8>>> {
+    match load() {
+        Some(Ok(policy)) => Ok(policy.pinned_session_salt_key_name().map(|n| n.to_vec())),
         Some(Err(e)) => Err(e),
         None => Ok(None),
     }
@@ -1201,6 +1296,77 @@ mod tests {
         assert!(parse_hex("0").is_none());
         assert!(parse_hex("0g").is_none());
         assert!(parse_hex("00 ff").is_none(), "interior whitespace is not hex");
+    }
+
+    // ---- tpm.session_encryption / tpm.pinned_session_salt_key_name ----
+
+    #[test]
+    fn session_encryption_defaults_to_auto_with_no_pin() {
+        let policy = Policy::from_yaml_str("selection:\n  mode: require\n  provider: tpm2\n").unwrap();
+        assert_eq!(policy.tpm_session_encryption(), SessionEncryption::Auto);
+        assert_eq!(policy.pinned_session_salt_key_name(), None);
+    }
+
+    #[test]
+    fn session_encryption_modes_parse() {
+        for (text, expected) in [
+            ("auto", SessionEncryption::Auto),
+            ("off", SessionEncryption::Off),
+        ] {
+            let yaml = format!("selection:\n  mode: require\n  provider: tpm2\ntpm:\n  session_encryption: {text}\n");
+            assert_eq!(Policy::from_yaml_str(&yaml).unwrap().tpm_session_encryption(), expected, "{text}");
+        }
+        let yaml = "selection:\n  mode: require\n  provider: tpm2\ntpm:\n  session_encryption: sometimes\n";
+        assert!(Policy::from_yaml_str(yaml).is_err(), "unknown mode must be rejected");
+    }
+
+    #[test]
+    fn required_session_encryption_needs_a_pinned_salt_key() {
+        let without_pin = "selection:\n  mode: require\n  provider: tpm2\ntpm:\n  session_encryption: required\n";
+        assert!(
+            Policy::from_yaml_str(without_pin).is_err(),
+            "required without a pinned salt key is a MITM-able session and must be refused"
+        );
+
+        let with_pin = format!(
+            "selection:\n  mode: require\n  provider: tpm2\ntpm:\n  session_encryption: required\n  pinned_session_salt_key_name: \"{A_NAME}\"\n"
+        );
+        let policy = Policy::from_yaml_str(&with_pin).unwrap();
+        assert_eq!(policy.tpm_session_encryption(), SessionEncryption::Required);
+        assert_eq!(policy.pinned_session_salt_key_name().unwrap().len(), SHA256_TPM_NAME_LEN);
+    }
+
+    #[test]
+    fn pinned_salt_key_name_is_validated_like_other_names() {
+        for bad in ["nothex", "000b01"] {
+            let yaml = format!(
+                "selection:\n  mode: require\n  provider: tpm2\ntpm:\n  pinned_session_salt_key_name: \"{bad}\"\n"
+            );
+            assert!(Policy::from_yaml_str(&yaml).is_err(), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn session_encryption_helpers_fail_closed() {
+        // No policy: auto, nothing pinned.
+        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
+        let mode = tpm_session_encryption();
+        let pin = pinned_session_salt_key_name();
+        std::env::remove_var("HKDFGUARD_POLICY_FILE");
+        assert_eq!(mode, SessionEncryption::Auto);
+        assert_eq!(pin.unwrap(), None);
+
+        // Broken policy: required (never "off"), and pinning errors.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.yaml");
+        std::fs::write(&path, "selection:\n  mode: require\ntpm:\n  session_encryption: off\n").unwrap();
+        std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
+        let mode = tpm_session_encryption();
+        let pin = pinned_session_salt_key_name();
+        std::env::remove_var("HKDFGUARD_POLICY_FILE");
+        assert_eq!(mode, SessionEncryption::Required, "a broken policy must not turn bus protection off");
+        assert!(pin.is_err());
     }
 
     // ---- load() / file-path behavior ----

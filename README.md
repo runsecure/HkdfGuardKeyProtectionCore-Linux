@@ -207,10 +207,45 @@ one. Both settings fail closed: a policy file that exists but can't be
 parsed is treated as requiring the secret, and pinning errors rather than
 reporting "nothing pinned".
 
-Neither control addresses TPM *bus* exposure (an interposer on a discrete
-TPM's LPC/SPI bus can still read the ECDH result in cleartext); that
-needs salted, parameter-encrypted sessions, which this provider does not
-yet use.
+**3. Session parameter encryption (bus protection).** On a *discrete*
+TPM — a separate chip on the LPC/SPI bus — an interposer can read
+`TPM2_ECDH_ZGen`'s response, the shared secret, in cleartext; and since
+the wrapping key is derived from a per-service constant, one capture is
+every payload for that service. The provider can run that command inside
+a salted HMAC session with parameter encryption (TPM 2.0 Part 1 §19.6;
+the cryptography is tpm2-tss's ESAPI, not this crate's), so the secret
+crosses the bus AES-128-CFB encrypted.
+
+```yaml
+tpm:
+  session_encryption: auto            # auto (default) | required | off
+  pinned_session_salt_key_name: "000b<64 hex chars>"
+```
+
+`auto` reads `TPM_PT_MANUFACTURER` and skips encryption only for TPMs
+positively known to have no external bus (Intel PTT, AMD fTPM, Qualcomm,
+Hyper-V/VMware/Google vTPMs, swtpm) — there is nothing to sniff inside an
+SoC or a hypervisor, and the residual fTPM threats sit inside the TPM's
+own trust boundary where transport encryption can't help. Unknown
+vendors are encrypted. `required` always encrypts and **refuses to load
+without a pinned salt-key Name**: an unsalted session's key is derivable
+from bus-visible nonces, and even a salted one can be man-in-the-middled
+if the attacker substitutes their own salt key at `TPM2_ReadPublic`, so
+the pin is what makes `required` mean something. Under `auto` the pin is
+optional (passive sniffing is still defeated) and its absence is logged
+once. The salt key is a deterministic primary with a fixed label, so its
+Name is stable and pinnable; it carries no derivation secret and protects
+nothing by itself.
+
+> **Known limitation on discrete TPMs:** parameter encryption covers only
+> a command's *first* parameter, and `TPM2_CreatePrimary`'s first
+> parameter is `inSensitive`, not `inPublic`. The derivation-secret-derived
+> `unique` label therefore still crosses the bus in cleartext when the
+> service key is re-created, and an interposer that captures it can
+> re-derive the key. On a discrete TPM the derivation secret protects
+> against software attackers only. Closing that needs a persisted,
+> parent-encrypted key blob (`TPM2_Create` + `TPM2_Load`) instead of a
+> derived primary.
 
 Callers never see which provider is active. Every provider implements the
 identical `ECDH -> HKDF-SHA512 -> AES-256-GCM` protocol

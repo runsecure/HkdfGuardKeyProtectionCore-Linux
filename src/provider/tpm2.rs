@@ -56,15 +56,17 @@ use std::str::FromStr; // brings `TctiNameConf::from_str` into scope
 use std::sync::{Arc, Mutex, OnceLock}; // shared, lock-protected TPM context; `OnceLock` for the per-process conformance verdict
 use zeroize::{Zeroize, Zeroizing}; // scrubs the derivation secret and its digest once they're no longer needed
 
-use tss_esapi::attributes::ObjectAttributesBuilder; // builds the TPM object-attribute bitfield
-use tss_esapi::handles::KeyHandle; // opaque TPM-side handle to a loaded key
+use tss_esapi::attributes::{ObjectAttributesBuilder, SessionAttributesBuilder}; // TPM object-attribute and session-attribute bitfields
+use tss_esapi::constants::{PropertyTag, SessionType}; // TPM_PT_MANUFACTURER lookup, and the HMAC session type
+use tss_esapi::handles::{KeyHandle, SessionHandle}; // opaque TPM-side handles to a loaded key / a started session
 use tss_esapi::interface_types::algorithm::{HashingAlgorithm, PublicAlgorithm}; // enum constants for "SHA-256" and "ECC"
 use tss_esapi::interface_types::ecc::EccCurve; // enum constant for "NIST P-256"
 use tss_esapi::interface_types::resource_handles::Hierarchy; // selects the Owner hierarchy for CreatePrimary
+use tss_esapi::interface_types::session_handles::AuthSession; // a started session, as passed to execute_with_session
 use tss_esapi::structures::{
     EccParameter, EccPoint, EccScheme, KeyDerivationFunctionScheme, Name, Public, PublicBuilder,
-    PublicEccParametersBuilder,
-}; // the TPM public-template types this module builds, plus the TPM2_ReadPublic "Name" value
+    PublicEccParametersBuilder, SymmetricDefinition,
+}; // the TPM public-template types this module builds, the TPM2_ReadPublic "Name" value, and the session cipher
 use tss_esapi::traits::Marshall; // `.marshall()`, for serializing a `Public` area to its wire bytes
 use tss_esapi::{Context, TctiNameConf}; // the ESAPI connection handle and its configuration type
 
@@ -553,6 +555,242 @@ fn validate_derivation_secret_is_honored(ctx: &mut Context) -> Result<Option<boo
     Ok(Some(true))
 }
 
+// ---------------------------------------------------------------------
+// Session parameter encryption.
+// ---------------------------------------------------------------------
+//
+// A discrete TPM sits on an LPC or SPI bus that an interposer can read
+// byte-for-byte. `TPM2_ECDH_ZGen`'s response is the shared point Z, and
+// since the wrapping protocol derives every payload's key from a Z that
+// is constant per service, one captured response is every payload for
+// that service. A firmware TPM (Intel PTT, AMD fTPM) or a virtual TPM has
+// no external bus, so this is pure overhead there -- hence the `auto`
+// policy mode, which skips it only for known-internal manufacturers.
+//
+// The mechanism is the TPM 2.0 specification's own (Part 1 §19.6): an
+// HMAC session started with `tpmKey` set to a TPM-resident decrypt key,
+// so the session salt is encrypted to that key (one-pass ECDH) and the
+// session key derived from it is never on the bus in cleartext; with
+// `TPMA_SESSION.encrypt` set, the first response parameter -- here
+// `outPoint`, i.e. Z -- is AES-128-CFB encrypted under a key derived from
+// the session key. The cryptography lives in tpm2-tss's ESAPI layer,
+// which tss-esapi wraps; this module only configures the session.
+//
+// Two things are load-bearing. An *unsalted* session's key derives from
+// the two nonces, both visible on the bus, so the interposer computes it
+// too -- salting is the entire defense, not an option. And the salt
+// key's public half is itself learned over the bus at `TPM2_ReadPublic`,
+// so an interposer can substitute its own and man-in-the-middle the
+// session; that is what `tpm.pinned_session_salt_key_name` defeats, and
+// why `required` mode refuses to run without a pin.
+//
+// Known limitation on a discrete TPM: parameter encryption covers only
+// the *first* parameter of a command, and `TPM2_CreatePrimary`'s first
+// parameter is `inSensitive`, not `inPublic`. The derivation-secret-
+// derived `unique` label therefore still crosses the bus in cleartext
+// when the service key is (re)created, and an interposer that captures
+// it can re-derive the key itself. On a discrete TPM, the derivation
+// secret protects against *software* attackers only; closing this needs
+// a persisted, parent-encrypted key blob (`TPM2_Create` + `TPM2_Load`)
+// rather than a derived primary.
+
+/// Label for the deterministic salt key's `unique` field. Leading
+/// underscores keep it outside the service-name charset, so no real
+/// service can ever collide with it.
+const SESSION_SALT_KEY_LABEL: &str = "__hkdfguard_session_salt_key__";
+
+/// `TPM_PT_MANUFACTURER` identifiers of TPMs that live inside the SoC or
+/// a hypervisor and so have no external bus to probe. Anything not listed
+/// is treated as discrete and encrypted: `auto` only ever *skips*
+/// encryption for a TPM positively known to be internal.
+///
+/// The property is four ASCII bytes packed big-endian; vendors shorter
+/// than four characters pad with a space *or* a NUL depending on the
+/// implementation (libtpms/swtpm reports `"IBM\0"`), so comparison is on
+/// the identifier with trailing padding stripped.
+const NO_EXTERNAL_BUS_MANUFACTURERS: &[&[u8]] = &[
+    b"INTC", // Intel PTT (fTPM inside the CSME)
+    b"AMD",  // AMD fTPM (inside the PSP)
+    b"QCOM", // Qualcomm fTPM
+    b"MSFT", // Hyper-V vTPM
+    b"IBM",  // IBM software TPM, i.e. swtpm / libtpms
+    b"GOOG", // Google Cloud vTPM
+    b"VMW",  // VMware vTPM
+];
+
+/// The manufacturer identifier with trailing space/NUL padding removed.
+fn manufacturer_id_bytes(id: u32) -> Vec<u8> {
+    let bytes = id.to_be_bytes();
+    let end = bytes
+        .iter()
+        .rposition(|b| *b != b' ' && *b != 0)
+        .map_or(0, |i| i + 1);
+    bytes[..end].to_vec()
+}
+
+fn manufacturer_has_no_external_bus(id: u32) -> bool {
+    let trimmed = manufacturer_id_bytes(id);
+    NO_EXTERNAL_BUS_MANUFACTURERS.iter().any(|m| *m == trimmed.as_slice())
+}
+
+/// Once-per-process `auto`-mode verdict: does this TPM lack an external
+/// bus? A fact about the hardware, so cached like the conformance
+/// verdict. Only consulted under `auto`; `required`/`off` are policy and
+/// are re-read on every call like everything else.
+static TPM_NO_EXTERNAL_BUS: OnceLock<bool> = OnceLock::new();
+
+/// Logged once: `auto` chose to encrypt but no salt-key Name is pinned.
+static UNPINNED_SALT_KEY_WARNED: OnceLock<()> = OnceLock::new();
+
+/// Whether `TPM2_ECDH_ZGen` should run inside an encrypted session on
+/// this call, per `tpm.session_encryption`.
+fn session_encryption_enabled(ctx: &mut Context) -> Result<bool> {
+    use crate::policy::SessionEncryption;
+    match crate::policy::tpm_session_encryption() {
+        SessionEncryption::Required => Ok(true),
+        SessionEncryption::Off => Ok(false),
+        SessionEncryption::Auto => {
+            if let Some(internal) = TPM_NO_EXTERNAL_BUS.get() {
+                return Ok(!internal);
+            }
+            let internal = match ctx.get_tpm_property(PropertyTag::Manufacturer) {
+                Ok(Some(id)) if manufacturer_has_no_external_bus(id) => {
+                    log::info!(
+                        "hkdfguard: TPM manufacturer {:?} has no external bus; session encryption skipped (tpm.session_encryption: auto)",
+                        String::from_utf8_lossy(&id.to_be_bytes())
+                    );
+                    true
+                }
+                Ok(Some(id)) => {
+                    log::info!(
+                        "hkdfguard: TPM manufacturer {:?} treated as discrete; ECDH runs in a salted, parameter-encrypted session",
+                        String::from_utf8_lossy(&id.to_be_bytes())
+                    );
+                    false
+                }
+                Ok(None) => {
+                    log::warn!("hkdfguard: TPM did not report a manufacturer; assuming discrete and encrypting sessions");
+                    false
+                }
+                Err(e) => {
+                    return Err(Error::Provider(format!("TPM2_GetCapability(manufacturer) failed: {e}")));
+                }
+            };
+            Ok(!*TPM_NO_EXTERNAL_BUS.get_or_init(|| internal))
+        }
+    }
+}
+
+/// Derives the deterministic session salt key: the same proven template
+/// shape as a service key (ECC P-256, unrestricted decrypt, no scheme --
+/// a valid `tpmKey` for `TPM2_StartAuthSession`'s one-pass-ECDH salt),
+/// under a fixed label and with **no** derivation secret. It must be
+/// derivable before anything secret is trusted, and it protects nothing
+/// on its own: its private half only ever unwraps session salts. Verifies
+/// the Name (self-consistency, and the policy pin if one is set) before
+/// returning the still-loaded handle; the caller flushes it.
+fn create_session_salt_key(ctx: &mut Context) -> Result<KeyHandle> {
+    let template = service_public_template(SESSION_SALT_KEY_LABEL, None)?;
+    let key_handle = ctx
+        .execute_with_nullauth_session(|ctx| {
+            ctx.create_primary(Hierarchy::Owner, template.clone(), None, None, None, None)
+        })
+        .map_err(|e| Error::Provider(format!("TPM2_CreatePrimary (session salt key) failed: {e}")))?
+        .key_handle;
+
+    let (public, name, _qualified_name) = match ctx.read_public(key_handle) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = ctx.flush_context(key_handle.into());
+            return Err(Error::Provider(format!("TPM2_ReadPublic (session salt key) failed: {e}")));
+        }
+    };
+    if let Err(e) = verify_salt_key_name(&public, &name) {
+        let _ = ctx.flush_context(key_handle.into());
+        return Err(e);
+    }
+    Ok(key_handle)
+}
+
+// Same two checks as `verify_name`, against the session salt key's own
+// policy pin. The pin is what stops a bus-resident attacker substituting
+// their salt key; `required` mode can't load without one (enforced at
+// policy validation), and `auto` warns once when it's missing.
+fn verify_salt_key_name(public: &Public, name: &Name) -> Result<()> {
+    let expected = computed_name(public)?;
+    if name.value() != expected.as_slice() {
+        return Err(Error::Provider(format!(
+            "session salt key Name mismatch: TPM reported {} for a public area whose Name is {}",
+            hex(name.value()),
+            hex(&expected)
+        )));
+    }
+    match crate::policy::pinned_session_salt_key_name()? {
+        Some(pinned) if name.value() != pinned.as_slice() => Err(Error::Provider(format!(
+            "session salt key Name {} does not match the Name pinned in policy ({})",
+            hex(name.value()),
+            hex(&pinned)
+        ))),
+        Some(_) => Ok(()),
+        None => {
+            UNPINNED_SALT_KEY_WARNED.get_or_init(|| {
+                log::warn!(
+                    "hkdfguard: encrypting TPM sessions with an unpinned salt key (Name {}); this defeats passive bus sniffing but not an active interposer -- set tpm.pinned_session_salt_key_name to close that",
+                    hex(name.value())
+                );
+            });
+            Ok(())
+        }
+    }
+}
+
+/// Starts a salted HMAC session with response and command parameter
+/// encryption (AES-128-CFB). The caller flushes it.
+fn start_encrypted_session(ctx: &mut Context, salt_key: KeyHandle) -> Result<AuthSession> {
+    let session = ctx
+        .start_auth_session(
+            Some(salt_key), // salted: the session key depends on a secret only this TPM can unwrap
+            None,
+            None,
+            SessionType::Hmac,
+            SymmetricDefinition::AES_128_CFB,
+            HashingAlgorithm::Sha256,
+        )
+        .map_err(|e| Error::Provider(format!("TPM2_StartAuthSession failed: {e}")))?
+        .ok_or_else(|| Error::Provider("TPM2_StartAuthSession returned no session".into()))?;
+
+    let (attributes, mask) = SessionAttributesBuilder::new()
+        .with_decrypt(true) // encrypt the command's first parameter (inPoint)
+        .with_encrypt(true) // encrypt the response's first parameter (outPoint, i.e. Z)
+        .with_continue_session(true)
+        .build();
+    if let Err(e) = ctx.tr_sess_set_attributes(session, attributes, mask) {
+        let _ = ctx.flush_context(SessionHandle::from(session).into());
+        return Err(Error::Provider(format!("failed to set TPM session attributes: {e}")));
+    }
+    Ok(session)
+}
+
+/// `TPM2_ECDH_ZGen` inside a salted, parameter-encrypted session, owning
+/// the salt key's and the session's lifecycles: both are flushed on every
+/// path, so neither a transient-object slot nor a session slot (TPMs have
+/// very few) can leak.
+fn ecdh_z_gen_encrypted(ctx: &mut Context, key_handle: KeyHandle, peer_point: &EccPoint) -> Result<EccPoint> {
+    let salt_key = create_session_salt_key(ctx)?;
+    let result = match start_encrypted_session(ctx, salt_key) {
+        Err(e) => Err(e),
+        Ok(session) => {
+            let z = ctx
+                .execute_with_session(Some(session), |ctx| ctx.ecdh_z_gen(key_handle, peer_point.clone()))
+                .map_err(|e| Error::Provider(format!("TPM2_ECDH_ZGen (encrypted session) failed: {e}")));
+            let _ = ctx.flush_context(SessionHandle::from(session).into());
+            z
+        }
+    };
+    let _ = ctx.flush_context(salt_key.into());
+    result
+}
+
 // Handle type returned from `get_or_create_kek`; deliberately does *not*
 // hold a loaded TPM key -- that's created fresh (deterministically) inside
 // `ecdh`, once the peer's ephemeral public key is known.
@@ -584,14 +822,22 @@ impl KekHandle for Tpm2Handle {
         // secret at all.
         let (key_handle, _public, _name) = create_and_verify_primary(ctx, &self.service)?;
 
-        let z_result = ctx
-            .execute_with_nullauth_session(|ctx| ctx.ecdh_z_gen(key_handle, peer_point.clone())); // TPM2_ECDH_ZGen: computes the shared point Z inside the TPM
+        // TPM2_ECDH_ZGen: computes the shared point Z inside the TPM. Under
+        // an encrypted session its response -- Z itself -- is AES-CFB
+        // encrypted before it crosses the bus; see `ecdh_z_gen_encrypted`.
+        let z_result = match session_encryption_enabled(ctx) {
+            Err(e) => Err(e),
+            Ok(true) => ecdh_z_gen_encrypted(ctx, key_handle, &peer_point),
+            Ok(false) => ctx
+                .execute_with_nullauth_session(|ctx| ctx.ecdh_z_gen(key_handle, peer_point.clone()))
+                .map_err(|e| Error::Provider(format!("TPM2_ECDH_ZGen failed: {e}"))),
+        };
 
         // Always flush the transient primary, even on ECDH failure, so we
         // never leak TPM transient-object slots.
         let _ = ctx.flush_context(key_handle.into()); // best-effort cleanup; ignore errors since we're already on an error/success path either way
 
-        let z = z_result.map_err(|e| Error::Provider(format!("TPM2_ECDH_ZGen failed: {e}")))?; // now propagate any ECDH failure
+        let z = z_result?; // now propagate any ECDH failure
 
         let mut secret = [0u8; 32];
         let x_bytes = z.x().value(); // the shared secret is conventionally just the X-coordinate of Z
@@ -1406,6 +1652,154 @@ mod tests {
         let random_peer = p256::SecretKey::random(&mut rand_core::OsRng).public_key();
         let z_random = create_ecdh_secret("com.company.orders", &random_peer).unwrap();
         assert_ne!(z1, z_random);
+    }
+
+    // ---- session parameter encryption ----
+
+    #[test]
+    fn manufacturer_classification_skips_only_known_internal_tpms() {
+        let id = |s: &[u8; 4]| u32::from_be_bytes(*s);
+        // Known fTPM / vTPM vendors: no bus, skip -- whether the short
+        // identifier is padded with spaces or with NULs.
+        for m in [b"INTC", b"AMD ", b"AMD\0", b"IBM ", b"IBM\0", b"MSFT", b"VMW\0"] {
+            assert!(manufacturer_has_no_external_bus(id(m)), "{:?}", String::from_utf8_lossy(m));
+        }
+        // Discrete vendors: encrypt.
+        for m in [b"IFX ", b"IFX\0", b"STM ", b"NTC ", b"ATML"] {
+            assert!(!manufacturer_has_no_external_bus(id(m)), "{:?}", String::from_utf8_lossy(m));
+        }
+        // Unknown: encrypt -- auto only ever skips for a positive match.
+        assert!(!manufacturer_has_no_external_bus(id(b"ZZZZ")));
+        assert!(!manufacturer_has_no_external_bus(0)); // all-NUL trims to empty, which matches nothing
+
+        // Padding is stripped, and only padding.
+        assert_eq!(manufacturer_id_bytes(id(b"IBM\0")), b"IBM");
+        assert_eq!(manufacturer_id_bytes(id(b"IBM ")), b"IBM");
+        assert_eq!(manufacturer_id_bytes(id(b"INTC")), b"INTC");
+        assert_eq!(manufacturer_id_bytes(0), b"");
+    }
+
+    #[test]
+    #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
+    #[serial]
+    fn encrypted_session_ecdh_yields_the_same_z_as_a_plain_session() {
+        // Correctness: parameter encryption must be transparent -- the
+        // TPM computes the same Z, ESAPI decrypts the response, and the
+        // caller sees identical bytes. If the salt key template weren't
+        // an acceptable `tpmKey`, or the attributes were wrong, this is
+        // where it would fail.
+        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
+        let h = crate::crypto::static_ecdh_point().unwrap();
+        let peer = encode_peer_point(&h).unwrap();
+
+        let (plain, encrypted) = with_tpm_context(|ctx| {
+            let (key, _p, _n) = create_and_verify_primary_with(ctx, "com.company.orders", None)?;
+            let plain = ctx
+                .execute_with_nullauth_session(|ctx| ctx.ecdh_z_gen(key, peer.clone()))
+                .map_err(|e| Error::Provider(format!("plain ECDH failed: {e}")));
+            let encrypted = ecdh_z_gen_encrypted(ctx, key, &peer);
+            let _ = ctx.flush_context(key.into());
+            Ok((plain?, encrypted?))
+        })
+        .unwrap();
+        std::env::remove_var("HKDFGUARD_POLICY_FILE");
+
+        assert_eq!(plain.x().value(), encrypted.x().value(), "Z must be identical through an encrypted session");
+        assert_eq!(plain.y().value(), encrypted.y().value());
+    }
+
+    #[test]
+    #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
+    #[serial]
+    fn session_salt_key_is_deterministic_and_pinnable() {
+        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
+        let names = with_tpm_context(|ctx| {
+            let mut names = Vec::new();
+            for _ in 0..2 {
+                let key = create_session_salt_key(ctx)?;
+                let (_p, name, _q) = ctx.read_public(key).map_err(|e| Error::Provider(e.to_string()))?;
+                let _ = ctx.flush_context(key.into());
+                names.push(name.value().to_vec());
+            }
+            Ok(names)
+        })
+        .unwrap();
+        std::env::remove_var("HKDFGUARD_POLICY_FILE");
+        assert_eq!(names[0], names[1], "the salt key must be stable, or it could never be pinned");
+
+        // Pinned to the real Name under `required`: loads. Pinned to a
+        // corrupted Name: refused before any session is started.
+        let real = hex(&names[0]);
+        let mut wrong = names[0].clone();
+        wrong[2] ^= 0xff;
+        let policy_for = |name_hex: &str| {
+            format!("selection:\n  mode: require\n  provider: tpm2\ntpm:\n  session_encryption: required\n  pinned_session_salt_key_name: \"{name_hex}\"\n")
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.yaml");
+
+        std::fs::write(&path, policy_for(&real)).unwrap();
+        std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
+        with_tpm_context(|ctx| {
+            let key = create_session_salt_key(ctx)?;
+            let _ = ctx.flush_context(key.into());
+            Ok(())
+        })
+        .expect("a correctly pinned salt key must load");
+
+        std::fs::write(&path, policy_for(&hex(&wrong))).unwrap();
+        let refused = with_tpm_context(|ctx| create_session_salt_key(ctx).map(|k| { let _ = ctx.flush_context(k.into()); }));
+        std::env::remove_var("HKDFGUARD_POLICY_FILE");
+        assert!(refused.is_err(), "a salt key whose Name doesn't match the pin must be refused");
+    }
+
+    #[test]
+    #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
+    #[serial]
+    fn auto_mode_skips_encryption_on_swtpm_and_required_forces_it() {
+        // swtpm reports manufacturer "IBM ", a known no-bus TPM, so `auto`
+        // (the default, no policy file) skips encryption; `required` still
+        // encrypts. Both paths must still produce a working ECDH.
+        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
+        let (auto, reported) = with_tpm_context(|ctx| {
+            let reported = ctx
+                .get_tpm_property(PropertyTag::Manufacturer)
+                .map_err(|e| Error::Provider(e.to_string()))?;
+            Ok((session_encryption_enabled(ctx)?, reported))
+        })
+        .unwrap();
+        std::env::remove_var("HKDFGUARD_POLICY_FILE");
+        // Report what the TPM actually said, so a classification miss
+        // explains itself instead of just failing.
+        assert!(
+            !auto,
+            "auto must skip encryption on swtpm; TPM_PT_MANUFACTURER was {:?} (raw {reported:?})",
+            reported.map(|id| String::from_utf8_lossy(&id.to_be_bytes()).into_owned())
+        );
+
+        // `required` needs a pin; learn the real salt-key Name first.
+        let real = with_tpm_context(|ctx| {
+            let key = create_session_salt_key(ctx)?;
+            let (_p, name, _q) = ctx.read_public(key).map_err(|e| Error::Provider(e.to_string()))?;
+            let _ = ctx.flush_context(key.into());
+            Ok(hex(name.value()))
+        })
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.yaml");
+        std::fs::write(
+            &path,
+            format!("selection:\n  mode: require\n  provider: tpm2\ntpm:\n  session_encryption: required\n  pinned_session_salt_key_name: \"{real}\"\n"),
+        )
+        .unwrap();
+        std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
+        let required = with_tpm_context(session_encryption_enabled).unwrap();
+        // And the full production path -- load_kek + ecdh -- works under it.
+        let h = crate::crypto::static_ecdh_point().unwrap();
+        let z = create_ecdh_secret("com.company.orders", &h);
+        std::env::remove_var("HKDFGUARD_POLICY_FILE");
+        assert!(required, "required must encrypt regardless of manufacturer");
+        assert_ne!(z.unwrap(), [0u8; 32], "ECDH through the encrypted session must succeed");
     }
 
     // Writes a policy pinning `service` to `name_hex` and points

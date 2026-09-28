@@ -30,7 +30,6 @@ mod secure_file; // hardened, check-then-read-safe file access + self-wiping Sec
 pub use error::status; // re-export the status-code constants as part of this crate's public (Rust-side) surface
 
 use rand_core::{OsRng, RngCore}; // the OS CSPRNG, used by hkdfguard_generate_and_wrap_dek below
-use std::ffi::CStr; // for reading the caller's NUL-terminated `service` string
 use std::os::raw::{c_char, c_int}; // C-ABI-compatible integer/char types
 use std::ptr; // raw-pointer helpers (`copy_nonoverlapping`, `write_bytes`)
 use std::sync::atomic::{AtomicU32, Ordering}; // per-process count of setup calls, for the misuse warning
@@ -345,17 +344,36 @@ fn cstr_to_service(ptr: *const c_char) -> Result<String, c_int> {
     if ptr.is_null() {
         return Err(status::INVALID_SERVICE_NAME); // no service string supplied at all
     }
-    // SAFETY: caller contract (see function-level Safety docs) guarantees
-    // `ptr` is a valid, NUL-terminated, readable C string for the duration
-    // of this call.
-    let cstr = unsafe { CStr::from_ptr(ptr) };
-    let s = cstr.to_str().map_err(|_| status::INVALID_SERVICE_NAME)?; // reject non-UTF-8 byte sequences
-    if s.is_empty() {
+    // Bounded scan for the terminator, rather than `CStr::from_ptr`, which
+    // would read until it found a NUL -- however far away that was --
+    // *before* the length rule below could apply. A caller that passes an
+    // unterminated buffer is violating the contract either way, but this
+    // reads at most MAX_SERVICE_LEN + 1 bytes and then fails safe, instead
+    // of over-reading until it happens to hit a zero byte. Byte-by-byte,
+    // so a correctly terminated short string never has anything past its
+    // own NUL touched.
+    let mut len = 0usize;
+    loop {
+        if len > MAX_SERVICE_LEN {
+            return Err(status::INVALID_SERVICE_NAME); // no NUL within 129 bytes: either over the limit or unterminated; reject without reading further
+        }
+        // SAFETY: caller contract (see function-level Safety docs)
+        // guarantees `ptr` points to a readable, NUL-terminated string. Each
+        // read is at offset `len` <= MAX_SERVICE_LEN, and the loop stops at
+        // the first NUL, so no byte beyond the terminator -- and never more
+        // than MAX_SERVICE_LEN + 1 bytes in total -- is ever read.
+        if unsafe { *ptr.add(len) } == 0 {
+            break;
+        }
+        len += 1;
+    }
+    if len == 0 {
         return Err(status::INVALID_SERVICE_NAME); // a service string was supplied, but it's empty
     }
-    if s.len() > MAX_SERVICE_LEN {
-        return Err(status::INVALID_SERVICE_NAME); // enforce the <=128 byte length rule
-    }
+    // SAFETY: the loop above established that `len` bytes starting at `ptr`
+    // are readable and non-NUL.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    let s = std::str::from_utf8(bytes).map_err(|_| status::INVALID_SERVICE_NAME)?; // reject non-UTF-8 byte sequences
     if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
         return Err(status::INVALID_SERVICE_NAME); // only ASCII alphanumeric characters and '.' are allowed
     }
@@ -1486,6 +1504,34 @@ mod ffi_tests {
 
         std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
         std::env::remove_var("HKDFGUARD_POLICY_FILE");
+    }
+
+    #[test]
+    fn unterminated_service_buffer_is_rejected_without_over_reading() {
+        // Finding #13. A buffer of MAX_SERVICE_LEN + 1 non-NUL bytes and
+        // *no* terminator at all. The old `CStr::from_ptr` would have read
+        // past the end of this array looking for a zero byte; the bounded
+        // scan reads exactly the 129 bytes that exist, finds no NUL, and
+        // rejects. Under the old code this test would be undefined
+        // behavior, which is precisely the regression it guards against.
+        let unterminated = [b'a'; MAX_SERVICE_LEN + 1];
+        let rc = hkdfguard_create_kek(unterminated.as_ptr() as *const c_char);
+        assert_eq!(rc, status::INVALID_SERVICE_NAME);
+
+        // And the boundary still behaves: exactly MAX_SERVICE_LEN bytes
+        // plus a terminator is accepted by the parser (it may then fail
+        // for provider reasons, but never as an invalid service name).
+        let mut at_limit = [b'a'; MAX_SERVICE_LEN + 1];
+        at_limit[MAX_SERVICE_LEN] = 0;
+        assert!(cstr_to_service(at_limit.as_ptr() as *const c_char).is_ok());
+
+        // One byte over, terminated: rejected by the length rule.
+        let mut over = [b'a'; MAX_SERVICE_LEN + 2];
+        over[MAX_SERVICE_LEN + 1] = 0;
+        assert_eq!(
+            cstr_to_service(over.as_ptr() as *const c_char).unwrap_err(),
+            status::INVALID_SERVICE_NAME
+        );
     }
 
     #[test]
