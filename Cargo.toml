@@ -3,7 +3,7 @@ name = "hkdfguard"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Linux implementation of HKDFGuard: ECDH(P-256) -> HKDF-SHA512 -> AES-256-GCM DEK wrapping with a pluggable, priority-ordered KEK provider chain (TPM2, PKCS#11, external secret, software, ephemeral)."
+description = "Linux implementation of HKDFGuard: ECDH(P-256) -> HKDF-SHA512 -> AES-256-GCM DEK wrapping with a pluggable, priority-ordered KEK provider chain (TPM2, PKCS#11, external secret, ephemeral)."
 repository = "https://github.com/torinblair/KeyProtectionCore-Linux"
 
 [lib]
@@ -23,7 +23,6 @@ rand_core = { version = "0.6", features = ["std"] }
 zeroize = { version = "1", features = ["derive"] }
 log = "0.4"
 thiserror = "1"
-dirs = "5"
 libc = "0.2"
 # Used only by the src/bin/hkdfguard-v1-initialize CLI tool, to decode its
 # --dek argument; already pulled in transitively by other dependencies, so
@@ -35,17 +34,25 @@ base64 = "0.22"
 # are not present on every build host. See README.md "Provider build matrix".
 tss-esapi = { version = "7", optional = true }
 cryptoki = { version = "0.6", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
 
 [dev-dependencies]
 env_logger = "0.11"
 tempfile = "3"
 serial_test = "3"
+# Only to call `ExposeSecret` on cryptoki's `AuthPin` (a secrecy 0.8
+# `SecretString`) in the PKCS#11 PIN-file tests; same version cryptoki
+# itself already pulls in, so this adds no new crate to the build.
+secrecy = "0.8"
 
 [features]
-# Software, external-secret and ephemeral are pure-Rust / filesystem-only
-# and always buildable, so they ship in `default`.
-default = ["software", "external-secret", "ephemeral"]
-software = []
+# external-secret and ephemeral are pure-Rust / filesystem-only and always
+# buildable, so they ship in `default`. There is deliberately no
+# software-backed (locally-generated, filesystem-encrypted-at-rest) KEK
+# provider: deployments without TPM2/PKCS#11 hardware are expected to
+# provision a KEK via external-secret instead.
+default = ["external-secret", "ephemeral"]
 external-secret = []
 ephemeral = []
 # Hardware-backed providers: opt in per-deployment.

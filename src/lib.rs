@@ -1,6 +1,6 @@
 //! HKDFGuard (Linux): `ECDH(P-256) -> HKDF-SHA512 -> AES-256-GCM` DEK
 //! wrapping backed by a priority-ordered chain of KEK providers (TPM2,
-//! PKCS#11, external secret, software, ephemeral).
+//! PKCS#11, external secret, ephemeral).
 //!
 //! This crate's only public interface is the stable C ABI below. No
 //! Rust-specific type crosses that boundary, no provider handle (TPM,
@@ -23,7 +23,9 @@
 mod crypto; // ECDH -> HKDF -> AES-GCM protocol
 mod error; // internal error type + public status codes
 mod payload; // wrapped-payload wire format
+mod policy; // administrative key-selection policy (/etc/hkdfguard/policy.yaml)
 mod provider; // provider trait + selection chain
+mod secure_file; // hardened, check-then-read-safe file access + self-wiping SecretBuffer
 
 pub use error::status; // re-export the status-code constants as part of this crate's public (Rust-side) surface
 
@@ -31,19 +33,101 @@ use rand_core::{OsRng, RngCore}; // the OS CSPRNG, used by hkdfguard_generate_an
 use std::ffi::CStr; // for reading the caller's NUL-terminated `service` string
 use std::os::raw::{c_char, c_int}; // C-ABI-compatible integer/char types
 use std::ptr; // raw-pointer helpers (`copy_nonoverlapping`, `write_bytes`)
+use std::sync::atomic::{AtomicU32, Ordering}; // per-process count of setup calls, for the misuse warning
+use std::sync::Mutex; // serializes setup calls (see `gated_setup`)
+use std::time::{Duration, Instant}; // the setup-call latency floor
 use zeroize::Zeroize; // scrub sensitive stack buffers before returning
 
-const MAX_SERVICE_LEN: usize = 255; // spec-mandated maximum service-name length in bytes
+const MAX_SERVICE_LEN: usize = 128; // spec-mandated maximum service-name length in bytes
+
+/// Serializes every setup call (`hkdfguard_create_kek`,
+/// `hkdfguard_kek_exists`) so that, combined with the latency floor in
+/// `gated_setup`, their aggregate rate is capped at one per
+/// `policy::setup_min_delay()` regardless of how many threads call in.
+static SETUP_GATE: Mutex<()> = Mutex::new(());
+
+/// How many setup calls this process has made. They're meant to happen
+/// once per application startup, so a count well beyond that is the
+/// signature of a caller looping on them -- see `SETUP_CALLS_WARN_AT`.
+static SETUP_CALLS: AtomicU32 = AtomicU32::new(0);
+
+/// Setup-call count past which a warning is logged (once). Generous enough
+/// for a multi-service application's genuine startup, small enough that a
+/// hot loop trips it within seconds.
+const SETUP_CALLS_WARN_AT: u32 = 10;
+
+/// Test-only override of the setup latency floor. `Some(d)` uses `d`
+/// instead of consulting the policy; `None` uses the policy exactly as
+/// production does. Defaults to `Some(Duration::ZERO)` so the test suite's
+/// dozens of setup calls don't each cost a second; the tests that exercise
+/// the floor itself set it explicitly and are `#[serial]`.
+#[cfg(test)]
+static SETUP_DELAY_OVERRIDE_FOR_TESTS: Mutex<Option<Duration>> = Mutex::new(Some(Duration::ZERO));
+
+#[cfg(test)]
+fn set_setup_delay_for_tests(override_delay: Option<Duration>) {
+    *SETUP_DELAY_OVERRIDE_FOR_TESTS.lock().unwrap_or_else(|p| p.into_inner()) = override_delay;
+}
+
+fn effective_setup_min_delay() -> Duration {
+    #[cfg(test)]
+    {
+        if let Some(d) = *SETUP_DELAY_OVERRIDE_FOR_TESTS.lock().unwrap_or_else(|p| p.into_inner()) {
+            return d;
+        }
+    }
+    policy::setup_min_delay()
+}
+
+/// Runs `f` (the provider-touching part of a setup call) under the setup
+/// gate: serialized against every other setup call, and not returning
+/// until at least `policy::setup_min_delay()` has elapsed since entry --
+/// whatever `f` returned, and however quickly. Argument validation happens
+/// *before* callers reach this, so an invalid pointer or service string
+/// still fails immediately; only calls that would actually reach a
+/// provider pay the floor. See `policy::setup_min_delay` for the rationale.
+fn gated_setup<T>(f: impl FnOnce() -> T) -> T {
+    // A panic inside an earlier setup call (caught at the FFI boundary)
+    // poisons the mutex; that's not a reason to stop gating, so recover
+    // the guard rather than propagating the poison.
+    let _serialized = SETUP_GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entered = Instant::now();
+    let floor = effective_setup_min_delay();
+
+    let result = f();
+
+    let count = SETUP_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if count == SETUP_CALLS_WARN_AT + 1 {
+        log::warn!(
+            "hkdfguard: more than {SETUP_CALLS_WARN_AT} create_kek/kek_exists calls in this process; \
+             these are meant to run once per application startup, and each costs a fresh provider \
+             connection plus at least {} ms",
+            floor.as_millis()
+        );
+    }
+
+    if let Some(remaining) = floor.checked_sub(entered.elapsed()) {
+        if !remaining.is_zero() {
+            std::thread::sleep(remaining);
+        }
+    }
+    result
+}
 
 /// Wraps a 32-byte Data Encryption Key (DEK) under the persistent
 /// Key Encryption Key (KEK) identified by `service`, using the currently
 /// strongest available provider.
 ///
 /// # Parameters
-/// - `service`: NUL-terminated UTF-8 string, 1..=255 bytes, identifying
-///   the KEK. The caller retains ownership; it is only read during the
-///   call. A null pointer or an empty string yields
-///   [`status::MISSING_SERVICE_NAME`].
+/// - `service`: NUL-terminated UTF-8 string, 1..=128 bytes, identifying
+///   the KEK; only ASCII alphanumeric characters and `.` are allowed, and
+///   it may not start with `.` or contain two consecutive dots (`..`). A
+///   null pointer, an empty string, a string over 128 bytes, non-UTF-8
+///   bytes, a disallowed character, or a dot rule violation all yield
+///   [`status::INVALID_SERVICE_NAME`]. Case-insensitive: normalized
+///   to lowercase internally, so e.g. `"Com.Example.Orders"` and
+///   `"com.example.orders"` always resolve to the same KEK. The caller
+///   retains ownership; it is only read during the call.
 /// - `dek` / `dek_len`: the 32-byte DEK to wrap. `dek_len` must be exactly
 ///   32.
 /// - `out` / `out_len`: on input, `*out_len` is the capacity of `out` in
@@ -91,9 +175,11 @@ pub extern "C" fn hkdfguard_wrap_dek(
 ///
 /// # Parameters
 /// - `service`: must match the value passed to `hkdfguard_wrap_dek` when
-///   this payload was produced; any mismatch is indistinguishable from
-///   tampering and yields [`status::CRYPTO_ERROR`]. A null pointer or an
-///   empty string yields [`status::MISSING_SERVICE_NAME`].
+///   this payload was produced (case-insensitively -- see that function's
+///   doc comment); any other mismatch is indistinguishable from tampering
+///   and yields [`status::CRYPTO_ERROR`]. An invalid service string (see
+///   `hkdfguard_wrap_dek`'s doc comment) yields
+///   [`status::INVALID_SERVICE_NAME`].
 /// - `wrapped` / `wrapped_len`: the wrapped payload bytes.
 /// - `out` / `out_len`: on input, `*out_len` is the capacity of `out`. On
 ///   success, the 32-byte DEK is written to `out` and `*out_len` is set to
@@ -125,6 +211,61 @@ pub extern "C" fn hkdfguard_unwrap_dek(
             // attempt to zero `out` in the panic path -- this indicates a
             // bug in this crate, not a normal failure, and is reported at
             // ERROR level above.
+            status::INTERNAL_ERROR
+        }
+    }
+}
+
+/// Ensures a persistent KEK exists for `service`, creating one (on the
+/// strongest available, policy-allowed provider) if it does not already.
+/// Idempotent: safe to call again for a `service` that already has one --
+/// this just confirms it's still there, doesn't rotate or recreate it.
+///
+/// This is the *only* way a KEK ever gets created; [`hkdfguard_wrap_dek`]
+/// and [`hkdfguard_generate_and_wrap_dek`] both fail with
+/// [`status::KEK_NOT_FOUND`] if called before this for a given `service`.
+///
+/// # Parameters
+/// - `service`: see [`hkdfguard_wrap_dek`].
+///
+/// # Returns
+/// One of the status codes in [`status`]. Never throws/unwinds.
+///
+/// # Safety
+/// `service` must be a valid, NUL-terminated, readable C string pointer.
+#[no_mangle]
+pub extern "C" fn hkdfguard_create_kek(service: *const c_char) -> c_int {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| create_kek_impl(service))) {
+        Ok(code) => code,
+        Err(_) => {
+            log::error!("hkdfguard: internal panic caught at hkdfguard_create_kek boundary");
+            status::INTERNAL_ERROR
+        }
+    }
+}
+
+/// Reports whether a persistent KEK already exists for `service`, without
+/// creating one. `Ok`/[`status::OK`] with `*exists` set to `0` means the
+/// chain was fully walked and nothing has one yet -- call
+/// [`hkdfguard_create_kek`] to provision one.
+///
+/// # Parameters
+/// - `service`: see [`hkdfguard_wrap_dek`].
+/// - `exists`: out-parameter; on [`status::OK`], set to `1` if a KEK
+///   exists for `service`, `0` otherwise. Untouched on any other status.
+///
+/// # Returns
+/// One of the status codes in [`status`]. Never throws/unwinds.
+///
+/// # Safety
+/// `service` must be a valid, NUL-terminated, readable C string pointer.
+/// `exists` must be a valid, writable pointer to an `int`.
+#[no_mangle]
+pub extern "C" fn hkdfguard_kek_exists(service: *const c_char, exists: *mut c_int) -> c_int {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| kek_exists_impl(service, exists))) {
+        Ok(code) => code,
+        Err(_) => {
+            log::error!("hkdfguard: internal panic caught at hkdfguard_kek_exists boundary");
             status::INTERNAL_ERROR
         }
     }
@@ -190,25 +331,97 @@ fn generate_and_wrap_impl(
     code
 }
 
-// Validates and borrows the caller's `service` C string as a Rust `&str`,
-// or returns the appropriate status code if it's null, not UTF-8, empty,
-// or too long. Shared by both `wrap_impl` and `unwrap_impl`.
-fn cstr_to_service<'a>(ptr: *const c_char) -> Result<&'a str, c_int> {
+// Validates the caller's `service` C string and normalizes it to the
+// crate's canonical form, or returns the appropriate status code if it's
+// null, not UTF-8, empty, too long, or contains a disallowed character.
+// Shared by both `wrap_impl` and `unwrap_impl` (and so, transitively, by
+// `hkdfguard_generate_and_wrap_dek` too, via `wrap_impl`).
+//
+// Normalization is lowercasing: two service strings that differ only in
+// case (e.g. "Com.Example.Orders" and "com.example.orders") always
+// resolve to the exact same KEK, on both the wrap and unwrap side, since
+// both go through this same function.
+fn cstr_to_service(ptr: *const c_char) -> Result<String, c_int> {
     if ptr.is_null() {
-        return Err(status::MISSING_SERVICE_NAME); // no service string supplied at all
+        return Err(status::INVALID_SERVICE_NAME); // no service string supplied at all
     }
     // SAFETY: caller contract (see function-level Safety docs) guarantees
     // `ptr` is a valid, NUL-terminated, readable C string for the duration
     // of this call.
     let cstr = unsafe { CStr::from_ptr(ptr) };
-    let s = cstr.to_str().map_err(|_| status::INVALID_UTF8)?; // reject non-UTF-8 byte sequences
+    let s = cstr.to_str().map_err(|_| status::INVALID_SERVICE_NAME)?; // reject non-UTF-8 byte sequences
     if s.is_empty() {
-        return Err(status::MISSING_SERVICE_NAME); // a service string was supplied, but it's empty
+        return Err(status::INVALID_SERVICE_NAME); // a service string was supplied, but it's empty
     }
     if s.len() > MAX_SERVICE_LEN {
-        return Err(status::INVALID_ARGUMENT); // enforce the <=255 byte length rule
+        return Err(status::INVALID_SERVICE_NAME); // enforce the <=128 byte length rule
     }
-    Ok(s)
+    if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
+        return Err(status::INVALID_SERVICE_NAME); // only ASCII alphanumeric characters and '.' are allowed
+    }
+    if s.starts_with('.') || s.contains("..") {
+        // A service name is used directly as a file name by the
+        // external-secret provider (`<mount>/<service>`), so it must
+        // never be able to name "." (the mount itself), ".." (its
+        // parent), or a hidden dot-file, and never contain an empty
+        // label between dots.
+        return Err(status::INVALID_SERVICE_NAME);
+    }
+    Ok(normalize_service(s))
+}
+
+// The canonical form a validated service string is reduced to: lowercase,
+// so case never affects KEK identity. Exposed at `pub(crate)` (rather than
+// inlined into `cstr_to_service` alone) so other code that needs to match
+// this exact normalization -- e.g. the TPM2 provider's conformance tests,
+// which check that varying a service string's case doesn't change the key
+// the same way production's own normalization guarantees -- shares this
+// one definition instead of risking drift from a second copy of it.
+pub(crate) fn normalize_service(s: &str) -> String {
+    s.to_ascii_lowercase()
+}
+
+// The actual logic behind `hkdfguard_create_kek`, running inside the
+// `catch_unwind` wrapper above.
+fn create_kek_impl(service: *const c_char) -> c_int {
+    let service_str = match cstr_to_service(service) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+
+    gated_setup(|| match provider::create_kek(&service_str) {
+        Ok(_) => status::OK,
+        Err(e) => {
+            log::error!("hkdfguard: create_kek failed for service (redacted): {e}"); // never log the service name or key material
+            e.status_code()
+        }
+    })
+}
+
+// The actual logic behind `hkdfguard_kek_exists`, running inside the
+// `catch_unwind` wrapper above.
+fn kek_exists_impl(service: *const c_char, exists: *mut c_int) -> c_int {
+    if exists.is_null() {
+        return status::INVALID_ARGUMENT;
+    }
+
+    let service_str = match cstr_to_service(service) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+
+    gated_setup(|| match provider::kek_exists(&service_str) {
+        Ok(found) => {
+            // SAFETY: exists is non-null per check above; caller contract
+            // guarantees it's a valid, writable pointer to an `int`.
+            unsafe { *exists = if found { 1 } else { 0 } };
+            status::OK
+        }
+        Err(e) => {
+            log::error!("hkdfguard: kek_exists failed for service (redacted): {e}");
+            e.status_code()
+        }
+    })
 }
 
 // The actual logic behind `hkdfguard_wrap_dek`, running inside the
@@ -246,7 +459,7 @@ fn wrap_impl(
     let mut dek_array = [0u8; crypto::DEK_LEN]; // owned, fixed-size copy (the crypto layer wants `&[u8; 32]`)
     dek_array.copy_from_slice(dek_slice);
 
-    let result = crypto::wrap(service_str, &dek_array); // do the actual ECDH -> HKDF -> AES-GCM work
+    let result = crypto::wrap(&service_str, &dek_array); // do the actual ECDH -> HKDF -> AES-GCM work
     dek_array.zeroize(); // our local copy of the plaintext DEK is no longer needed; scrub it now
 
     let wrapped = match result {
@@ -322,7 +535,7 @@ fn unwrap_impl(
     let wrapped_slice =
         unsafe { std::slice::from_raw_parts(wrapped, wrapped_len as usize) }; // borrow the caller's wrapped-payload bytes
 
-    let mut dek = match crypto::unwrap(service_str, wrapped_slice) {
+    let mut dek = match crypto::unwrap(&service_str, wrapped_slice) {
         Ok(dek) => dek, // recovered plaintext DEK, still only in this local variable
         Err(e) => {
             log::error!("hkdfguard: unwrap failed for service (redacted): {e}"); // log the reason, never the key material
@@ -358,26 +571,180 @@ mod ffi_tests {
     use super::*; // bring the exported functions + `status` into scope
     use serial_test::serial; // these tests mutate shared env vars, so they must run one at a time
     use std::ffi::CString; // to build NUL-terminated strings to pass across the "FFI boundary" in tests
-    use tempfile::tempdir; // throwaway directory for the software provider's storage
-
-    // Points the software provider at a fresh temp directory and disables
-    // the external-secret provider so tests are deterministic.
-    fn with_isolated_software_provider<F: FnOnce()>(f: F) {
-        provider::reset_selected_provider_for_tests(); // don't let an earlier test's cached provider choice leak in
-        let dir = tempdir().unwrap();
-        std::env::set_var("HKDFGUARD_SOFTWARE_DIR", dir.path());
+    // Disables the external-secret provider so tests deterministically
+    // land on Ephemeral -- the only provider left reachable once
+    // external-secret is unavailable, with no persisted-to-disk
+    // software-backed fallback in between.
+    fn with_isolated_ephemeral_provider<F: FnOnce()>(f: F) {
         std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-for-tests");
+        // Ephemeral is only reachable through an explicit policy opt-in
+        // (see provider::allowed_chain), so write one.
+        let _policy = policy::allow_ephemeral_policy_for_tests();
         f();
-        std::env::remove_var("HKDFGUARD_SOFTWARE_DIR");
+        std::env::remove_var("HKDFGUARD_POLICY_FILE");
         std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
-        provider::reset_selected_provider_for_tests(); // don't leak this test's cached choice into whatever runs next
+    }
+
+    // Calls the real hkdfguard_create_kek FFI entry point and asserts it
+    // succeeded -- wrap/generate_and_wrap now only ever load an existing
+    // KEK, so every test below that wraps something must provision it
+    // first, exactly as a real caller would.
+    fn create_kek_for_test(service: &CString) {
+        assert_eq!(hkdfguard_create_kek(service.as_ptr()), status::OK);
+    }
+
+    // ---- setup-call gate (create_kek / kek_exists latency floor) ----
+
+    // Runs `f` with the setup latency floor overridden to `delay`, then
+    // restores the suite-wide zero override whatever happens.
+    fn with_setup_delay<F: FnOnce()>(delay: Option<Duration>, f: F) {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                set_setup_delay_for_tests(Some(Duration::ZERO));
+            }
+        }
+        let _restore = Restore;
+        set_setup_delay_for_tests(delay);
+        f();
+    }
+
+    #[test]
+    #[serial]
+    fn setup_calls_take_at_least_the_configured_floor() {
+        with_isolated_ephemeral_provider(|| {
+            with_setup_delay(Some(Duration::from_millis(50)), || {
+                let service = CString::new("com.company.orders.setupfloor").unwrap();
+
+                let started = Instant::now();
+                assert_eq!(hkdfguard_create_kek(service.as_ptr()), status::OK);
+                assert!(started.elapsed() >= Duration::from_millis(50), "create_kek returned early");
+
+                let mut exists: c_int = -1;
+                let started = Instant::now();
+                assert_eq!(hkdfguard_kek_exists(service.as_ptr(), &mut exists), status::OK);
+                assert_eq!(exists, 1);
+                assert!(started.elapsed() >= Duration::from_millis(50), "kek_exists returned early");
+            });
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn setup_floor_applies_equally_to_a_missing_kek() {
+        // The floor is on latency, not on success: "doesn't exist" must
+        // cost the same as "exists", or kek_exists is a fast oracle.
+        with_isolated_ephemeral_provider(|| {
+            with_setup_delay(Some(Duration::from_millis(50)), || {
+                let service = CString::new("com.company.nevercreated.setupfloor").unwrap();
+                let mut exists: c_int = -1;
+                let started = Instant::now();
+                assert_eq!(hkdfguard_kek_exists(service.as_ptr(), &mut exists), status::OK);
+                assert_eq!(exists, 0);
+                assert!(started.elapsed() >= Duration::from_millis(50));
+            });
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn setup_floor_applies_to_failed_calls_too() {
+        // create_kek must fail here, and must still take the full floor
+        // rather than failing fast. Policy pins external-secret and its
+        // mount doesn't exist, so the failure is deterministic: relying
+        // instead on "no provider happens to be available" would make
+        // this pass only on hosts without a reachable TPM or PKCS#11
+        // token.
+        std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-for-tests");
+        let _policy = policy::require_provider_policy_for_tests("external-secret");
+        with_setup_delay(Some(Duration::from_millis(50)), || {
+            let service = CString::new("com.company.orders.setupfloorfail").unwrap();
+            let started = Instant::now();
+            assert_ne!(hkdfguard_create_kek(service.as_ptr()), status::OK);
+            assert!(started.elapsed() >= Duration::from_millis(50));
+        });
+        std::env::remove_var("HKDFGUARD_POLICY_FILE");
+        std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
+    }
+
+    #[test]
+    #[serial]
+    fn invalid_arguments_are_rejected_before_the_floor() {
+        // Validation failures never reach a provider, so they shouldn't
+        // pay for one: an obviously-bad call returns immediately.
+        with_setup_delay(Some(Duration::from_millis(500)), || {
+            let bad = CString::new("..evil").unwrap();
+            let started = Instant::now();
+            assert_eq!(hkdfguard_create_kek(bad.as_ptr()), status::INVALID_SERVICE_NAME);
+            assert_eq!(hkdfguard_kek_exists(bad.as_ptr(), ptr::null_mut()), status::INVALID_ARGUMENT);
+            assert!(started.elapsed() < Duration::from_millis(500));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn setup_calls_are_serialized_across_threads() {
+        // Two concurrent calls must not overlap their floors: total wall
+        // time is at least 2x the floor, i.e. the aggregate rate really is
+        // capped at one call per floor regardless of thread count.
+        with_isolated_ephemeral_provider(|| {
+            with_setup_delay(Some(Duration::from_millis(60)), || {
+                let started = Instant::now();
+                let threads: Vec<_> = (0..2)
+                    .map(|i| {
+                        std::thread::spawn(move || {
+                            let service = CString::new(format!("com.company.orders.serialized{i}")).unwrap();
+                            assert_eq!(hkdfguard_create_kek(service.as_ptr()), status::OK);
+                        })
+                    })
+                    .collect();
+                for t in threads {
+                    t.join().unwrap();
+                }
+                assert!(
+                    started.elapsed() >= Duration::from_millis(120),
+                    "two gated calls overlapped: {:?}",
+                    started.elapsed()
+                );
+            });
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn setup_floor_is_taken_from_the_policy_file() {
+        // With the test override cleared, the floor comes from the same
+        // policy file that names the providers -- exactly as in production.
+        std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-for-tests");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.yaml");
+        std::fs::write(
+            &path,
+            "selection:\n  mode: prefer\npreferred_order:\n  - ephemeral\nstartup_behavior:\n  setup_min_delay_ms: 80\n",
+        )
+        .unwrap();
+        std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
+
+        with_setup_delay(None, || {
+            let service = CString::new("com.company.orders.policyfloor").unwrap();
+            let started = Instant::now();
+            assert_eq!(hkdfguard_create_kek(service.as_ptr()), status::OK);
+            let elapsed = started.elapsed();
+            assert!(elapsed >= Duration::from_millis(80), "policy floor not honored: {elapsed:?}");
+            // Sanity check that it's the policy's 80 ms and not the 1 s default.
+            assert!(elapsed < Duration::from_millis(1000), "took {elapsed:?}; default floor used instead of policy");
+        });
+
+        std::env::remove_var("HKDFGUARD_POLICY_FILE");
+        std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
     }
 
     #[test]
     #[serial]
     fn ffi_round_trip() {
-        with_isolated_software_provider(|| {
+        with_isolated_ephemeral_provider(|| {
             let service = CString::new("com.company.orders").unwrap(); // NUL-terminated, as the C ABI requires
+            create_kek_for_test(&service);
             let dek = [0xABu8; 32];
             let mut wrapped_buf = [0u8; 512]; // generously-sized output buffer
             let mut wrapped_len: c_int = wrapped_buf.len() as c_int; // declare its capacity
@@ -409,8 +776,9 @@ mod ffi_tests {
     #[test]
     #[serial]
     fn generate_and_wrap_round_trip() {
-        with_isolated_software_provider(|| {
+        with_isolated_ephemeral_provider(|| {
             let service = CString::new("com.company.orders").unwrap();
+            create_kek_for_test(&service);
             let mut wrapped_buf = [0u8; 512]; // generously-sized output buffer
             let mut wrapped_len: c_int = wrapped_buf.len() as c_int;
 
@@ -446,8 +814,9 @@ mod ffi_tests {
         // itself, not just a fresh nonce/ephemeral key -- this is the
         // check that actually distinguishes "generates a new DEK" from
         // "wraps a fixed/reused buffer."
-        with_isolated_software_provider(|| {
+        with_isolated_ephemeral_provider(|| {
             let service = CString::new("com.company.orders").unwrap();
+            create_kek_for_test(&service);
 
             let mut wrapped1 = [0u8; 512];
             let mut wrapped1_len: c_int = wrapped1.len() as c_int;
@@ -482,8 +851,9 @@ mod ffi_tests {
     #[test]
     #[serial]
     fn generate_and_wrap_buffer_too_small_reports_required_size_without_writing() {
-        with_isolated_software_provider(|| {
+        with_isolated_ephemeral_provider(|| {
             let service = CString::new("com.company.orders").unwrap();
+            create_kek_for_test(&service);
             let mut tiny = [0xFFu8; 4]; // way too small to hold a wrapped payload
             let mut tiny_len: c_int = tiny.len() as c_int;
 
@@ -495,11 +865,11 @@ mod ffi_tests {
     }
 
     #[test]
-    fn generate_and_wrap_null_service_is_missing_service_name() {
+    fn generate_and_wrap_null_service_is_invalid_service_name() {
         let mut out = [0u8; 512];
         let mut out_len: c_int = out.len() as c_int;
         let rc = hkdfguard_generate_and_wrap_dek(std::ptr::null(), out.as_mut_ptr(), &mut out_len);
-        assert_eq!(rc, status::MISSING_SERVICE_NAME);
+        assert_eq!(rc, status::INVALID_SERVICE_NAME);
     }
 
     #[test]
@@ -530,8 +900,9 @@ mod ffi_tests {
     #[test]
     #[serial]
     fn buffer_too_small_reports_required_size_without_writing() {
-        with_isolated_software_provider(|| {
+        with_isolated_ephemeral_provider(|| {
             let service = CString::new("com.company.orders").unwrap();
+            create_kek_for_test(&service);
             let dek = [0x55u8; 32];
             let mut tiny = [0xFFu8; 4]; // way too small to hold a wrapped payload
             let mut tiny_len: c_int = tiny.len() as c_int;
@@ -552,7 +923,7 @@ mod ffi_tests {
     #[test]
     #[serial]
     fn unwrap_failure_zeroes_caller_buffer() {
-        with_isolated_software_provider(|| {
+        with_isolated_ephemeral_provider(|| {
             let service = CString::new("com.company.orders").unwrap();
             let garbage = [0u8; 8]; // not a valid wrapped payload at all
             let mut out = [0xAAu8; 32]; // pre-filled with a recognizable non-zero pattern
@@ -571,7 +942,7 @@ mod ffi_tests {
     }
 
     #[test]
-    fn null_service_is_missing_service_name() {
+    fn null_service_is_invalid_service_name() {
         let dek = [0u8; 32];
         let mut out = [0u8; 512];
         let mut out_len: c_int = out.len() as c_int;
@@ -582,7 +953,7 @@ mod ffi_tests {
             out.as_mut_ptr(),
             &mut out_len,
         );
-        assert_eq!(rc, status::MISSING_SERVICE_NAME);
+        assert_eq!(rc, status::INVALID_SERVICE_NAME);
 
         let rc = hkdfguard_unwrap_dek(
             std::ptr::null(),
@@ -591,7 +962,7 @@ mod ffi_tests {
             out.as_mut_ptr(),
             &mut out_len,
         );
-        assert_eq!(rc, status::MISSING_SERVICE_NAME);
+        assert_eq!(rc, status::INVALID_SERVICE_NAME);
     }
 
     #[test]
@@ -725,7 +1096,7 @@ mod ffi_tests {
                 out.as_mut_ptr(),
                 &mut out_len
             ),
-            status::MISSING_SERVICE_NAME
+            status::INVALID_SERVICE_NAME
         );
         assert_eq!(
             hkdfguard_unwrap_dek(
@@ -735,10 +1106,10 @@ mod ffi_tests {
                 out.as_mut_ptr(),
                 &mut out_len
             ),
-            status::MISSING_SERVICE_NAME
+            status::INVALID_SERVICE_NAME
         );
 
-        // Oversized service string (> 255 bytes)
+        // Oversized service string (> 128 bytes)
         let long_svc_str = "a".repeat(256);
         let long_svc = CString::new(long_svc_str).unwrap();
         assert_eq!(
@@ -749,7 +1120,7 @@ mod ffi_tests {
                 out.as_mut_ptr(),
                 &mut out_len
             ),
-            status::INVALID_ARGUMENT
+            status::INVALID_SERVICE_NAME
         );
         assert_eq!(
             hkdfguard_unwrap_dek(
@@ -759,7 +1130,7 @@ mod ffi_tests {
                 out.as_mut_ptr(),
                 &mut out_len
             ),
-            status::INVALID_ARGUMENT
+            status::INVALID_SERVICE_NAME
         );
 
         // Invalid UTF-8 service string (e.g. 0xFF, 0xFE)
@@ -772,7 +1143,7 @@ mod ffi_tests {
                 out.as_mut_ptr(),
                 &mut out_len
             ),
-            status::INVALID_UTF8
+            status::INVALID_SERVICE_NAME
         );
         assert_eq!(
             hkdfguard_unwrap_dek(
@@ -782,15 +1153,16 @@ mod ffi_tests {
                 out.as_mut_ptr(),
                 &mut out_len
             ),
-            status::INVALID_UTF8
+            status::INVALID_SERVICE_NAME
         );
     }
 
     #[test]
     #[serial]
     fn unwrap_buffer_too_small_sets_required_length_and_zeroes() {
-        with_isolated_software_provider(|| {
+        with_isolated_ephemeral_provider(|| {
             let service = CString::new("com.company.orders").unwrap();
+            create_kek_for_test(&service);
             let dek = [0x77u8; 32];
             let mut wrapped = [0u8; 512];
             let mut wrapped_len: c_int = 512;
@@ -826,11 +1198,12 @@ mod ffi_tests {
     #[test]
     #[serial]
     fn boundary_service_lengths_round_trip() {
-        with_isolated_software_provider(|| {
+        with_isolated_ephemeral_provider(|| {
             let dek = [0x12u8; 32];
 
             // 1-byte service name
             let svc1 = CString::new("x").unwrap();
+            create_kek_for_test(&svc1);
             let mut wrapped = [0u8; 512];
             let mut wrapped_len: c_int = 512;
             assert_eq!(
@@ -857,13 +1230,14 @@ mod ffi_tests {
             );
             assert_eq!(out, dek);
 
-            // 255-byte service name
-            let svc255 = CString::new("s".repeat(255)).unwrap();
+            // 128-byte service name (the new maximum)
+            let svc128 = CString::new("s".repeat(128)).unwrap();
+            create_kek_for_test(&svc128);
             let mut wrapped2 = [0u8; 512];
             let mut wrapped2_len: c_int = 512;
             assert_eq!(
                 hkdfguard_wrap_dek(
-                    svc255.as_ptr(),
+                    svc128.as_ptr(),
                     dek.as_ptr(),
                     32,
                     wrapped2.as_mut_ptr(),
@@ -875,7 +1249,7 @@ mod ffi_tests {
             let mut out2_len: c_int = 32;
             assert_eq!(
                 hkdfguard_unwrap_dek(
-                    svc255.as_ptr(),
+                    svc128.as_ptr(),
                     wrapped2.as_ptr(),
                     wrapped2_len,
                     out2.as_mut_ptr(),
@@ -885,5 +1259,253 @@ mod ffi_tests {
             );
             assert_eq!(out2, dek);
         });
+    }
+
+    #[test]
+    #[serial]
+    fn service_name_over_128_bytes_is_invalid_service_name() {
+        let dek = [0u8; 32];
+        let mut out = [0u8; 512];
+        let mut out_len: c_int = 512;
+
+        let svc129 = CString::new("s".repeat(129)).unwrap();
+        assert_eq!(
+            hkdfguard_wrap_dek(svc129.as_ptr(), dek.as_ptr(), 32, out.as_mut_ptr(), &mut out_len),
+            status::INVALID_SERVICE_NAME
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn service_name_rejects_non_alphanumeric_dot_characters() {
+        let dek = [0u8; 32];
+        let mut out = [0u8; 512];
+        let mut out_len: c_int = 512;
+
+        for bad in ["com_example.orders", "com example.orders", "com-example.orders", "com/example"] {
+            let svc = CString::new(bad).unwrap();
+            assert_eq!(
+                hkdfguard_wrap_dek(svc.as_ptr(), dek.as_ptr(), 32, out.as_mut_ptr(), &mut out_len),
+                status::INVALID_SERVICE_NAME,
+                "should reject \"{bad}\""
+            );
+        }
+    }
+
+    #[test]
+    fn service_name_rejects_leading_dot_and_consecutive_dots() {
+        let dek = [0u8; 32];
+        let mut out = [0u8; 512];
+        let mut out_len: c_int = 512;
+        let mut exists: c_int = 0;
+
+        // Every entry point rejects these before any provider sees them.
+        for bad in [".", "..", "...", ".hidden", ".com.example", "..parent", "com..example", "com.example..", "a...b"] {
+            let svc = CString::new(bad).unwrap();
+            assert_eq!(hkdfguard_create_kek(svc.as_ptr()), status::INVALID_SERVICE_NAME, "create_kek {bad:?}");
+            assert_eq!(hkdfguard_kek_exists(svc.as_ptr(), &mut exists), status::INVALID_SERVICE_NAME, "kek_exists {bad:?}");
+            assert_eq!(
+                hkdfguard_wrap_dek(svc.as_ptr(), dek.as_ptr(), 32, out.as_mut_ptr(), &mut out_len),
+                status::INVALID_SERVICE_NAME,
+                "wrap {bad:?}"
+            );
+            let mut dek_out = [0u8; 32];
+            let mut dek_out_len: c_int = 32;
+            assert_eq!(
+                hkdfguard_unwrap_dek(svc.as_ptr(), out.as_ptr(), 64, dek_out.as_mut_ptr(), &mut dek_out_len),
+                status::INVALID_SERVICE_NAME,
+                "unwrap {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn service_name_with_single_interior_and_trailing_dots_is_still_accepted() {
+        // The new rules only forbid a leading dot and consecutive dots;
+        // ordinary dotted names (and a single trailing dot) are unaffected.
+        with_isolated_ephemeral_provider(|| {
+            for ok in ["com.example.dottest", "a.b.c.d", "x", "com.example.trailing."] {
+                let svc = CString::new(ok).unwrap();
+                assert_eq!(hkdfguard_create_kek(svc.as_ptr()), status::OK, "{ok:?}");
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn service_name_is_normalized_to_lowercase() {
+        with_isolated_ephemeral_provider(|| {
+            let dek = [0x55u8; 32];
+            let mixed_case = CString::new("Com.Example.Orders").unwrap();
+            create_kek_for_test(&mixed_case); // normalizes to lowercase internally, same as wrap/unwrap
+            let mut wrapped = [0u8; 512];
+            let mut wrapped_len: c_int = 512;
+            assert_eq!(
+                hkdfguard_wrap_dek(
+                    mixed_case.as_ptr(),
+                    dek.as_ptr(),
+                    32,
+                    wrapped.as_mut_ptr(),
+                    &mut wrapped_len
+                ),
+                status::OK
+            );
+
+            // A different-case (but otherwise identical) service string
+            // must unwrap the same payload -- proving both sides normalize
+            // to the same canonical (lowercase) form.
+            let lowercase = CString::new("com.example.orders").unwrap();
+            let mut out = [0u8; 32];
+            let mut out_len: c_int = 32;
+            assert_eq!(
+                hkdfguard_unwrap_dek(
+                    lowercase.as_ptr(),
+                    wrapped.as_ptr(),
+                    wrapped_len,
+                    out.as_mut_ptr(),
+                    &mut out_len
+                ),
+                status::OK
+            );
+            assert_eq!(out, dek);
+
+            // And a third, differently-cased variant of the very same name
+            // must also unwrap it.
+            let shouty_case = CString::new("COM.EXAMPLE.ORDERS").unwrap();
+            let mut out2 = [0u8; 32];
+            let mut out2_len: c_int = 32;
+            assert_eq!(
+                hkdfguard_unwrap_dek(
+                    shouty_case.as_ptr(),
+                    wrapped.as_ptr(),
+                    wrapped_len,
+                    out2.as_mut_ptr(),
+                    &mut out2_len
+                ),
+                status::OK
+            );
+            assert_eq!(out2, dek);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn create_kek_then_kek_exists_then_wrap_succeeds() {
+        with_isolated_ephemeral_provider(|| {
+            // A service name unique to this test: Ephemeral's key map is
+            // process-global and never cleared between tests, so a
+            // generic name another test also resolves via Ephemeral
+            // could already exist by the time this "starts nonexistent"
+            // assertion runs.
+            let service = CString::new("com.company.orders.kekexiststest").unwrap();
+
+            let mut exists: c_int = -1; // recognizable sentinel, must be overwritten
+            assert_eq!(hkdfguard_kek_exists(service.as_ptr(), &mut exists), status::OK);
+            assert_eq!(exists, 0);
+
+            assert_eq!(hkdfguard_create_kek(service.as_ptr()), status::OK);
+
+            assert_eq!(hkdfguard_kek_exists(service.as_ptr(), &mut exists), status::OK);
+            assert_eq!(exists, 1);
+
+            // hkdfguard_create_kek is idempotent: calling it again for a
+            // service that already has one just confirms it, no error.
+            assert_eq!(hkdfguard_create_kek(service.as_ptr()), status::OK);
+
+            let dek = [0x66u8; 32];
+            let mut wrapped = [0u8; 512];
+            let mut wrapped_len: c_int = 512;
+            assert_eq!(
+                hkdfguard_wrap_dek(service.as_ptr(), dek.as_ptr(), 32, wrapped.as_mut_ptr(), &mut wrapped_len),
+                status::OK
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn wrap_before_create_kek_fails_with_kek_not_found() {
+        with_isolated_ephemeral_provider(|| {
+            let service = CString::new("com.company.unprovisioned").unwrap();
+            let dek = [0x11u8; 32];
+            let mut wrapped = [0u8; 512];
+            let mut wrapped_len: c_int = 512;
+
+            let rc = hkdfguard_wrap_dek(service.as_ptr(), dek.as_ptr(), 32, wrapped.as_mut_ptr(), &mut wrapped_len);
+            assert_eq!(rc, status::KEK_NOT_FOUND);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn unwrap_after_kek_rotation_fails_with_fingerprint_mismatch() {
+        // external-secret, not Ephemeral, is what's rotated here: this
+        // test needs key material something *outside* this process can
+        // rewrite, and Ephemeral is in-memory only -- there's no file to
+        // rotate out from under it. Pinned by policy, or a reachable
+        // TPM/PKCS#11 device would win the chain and there would be
+        // nothing for the rotation below to rotate.
+        let _policy = policy::require_provider_policy_for_tests("external-secret");
+        let ext_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", ext_dir.path());
+        let service_str = "com.company.rotated";
+        let secret_path = ext_dir.path().join(service_str);
+        let service = CString::new(service_str).unwrap();
+
+        let key_a = p256::SecretKey::random(&mut rand_core::OsRng);
+        std::fs::write(&secret_path, key_a.to_bytes()).unwrap();
+        create_kek_for_test(&service); // finds the pre-provisioned key; external-secret never creates one itself
+
+        let dek = [0x33u8; 32];
+        let mut wrapped = [0u8; 512];
+        let mut wrapped_len: c_int = 512;
+        assert_eq!(
+            hkdfguard_wrap_dek(service.as_ptr(), dek.as_ptr(), 32, wrapped.as_mut_ptr(), &mut wrapped_len),
+            status::OK
+        );
+
+        // Simulate an out-of-band KEK rotation: the deployment platform
+        // rewrites the mounted secret file with a brand new, unrelated
+        // key under the exact same service name.
+        let key_b = p256::SecretKey::random(&mut rand_core::OsRng);
+        std::fs::write(&secret_path, key_b.to_bytes()).unwrap();
+
+        let mut out = [0xAAu8; 32]; // recognizable non-zero pattern
+        let mut out_len: c_int = out.len() as c_int;
+        let rc = hkdfguard_unwrap_dek(
+            service.as_ptr(),
+            wrapped.as_ptr(),
+            wrapped_len,
+            out.as_mut_ptr(),
+            &mut out_len,
+        );
+        assert_eq!(rc, status::FINGERPRINT_MISMATCH);
+        assert_eq!(rc, -16, "must match macOS's HKDFGuardStatus.fingerprintMismatch");
+        assert_eq!(out, [0u8; 32], "output buffer must still be zeroed on failure");
+
+        std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
+        std::env::remove_var("HKDFGUARD_POLICY_FILE");
+    }
+
+    #[test]
+    fn create_kek_and_kek_exists_null_service_is_invalid_service_name() {
+        assert_eq!(hkdfguard_create_kek(std::ptr::null()), status::INVALID_SERVICE_NAME);
+
+        let mut exists: c_int = 0;
+        assert_eq!(
+            hkdfguard_kek_exists(std::ptr::null(), &mut exists),
+            status::INVALID_SERVICE_NAME
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn kek_exists_null_out_pointer_is_invalid_argument() {
+        let service = CString::new("com.company.orders").unwrap();
+        assert_eq!(
+            hkdfguard_kek_exists(service.as_ptr(), std::ptr::null_mut()),
+            status::INVALID_ARGUMENT
+        );
     }
 }

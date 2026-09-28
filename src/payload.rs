@@ -10,25 +10,51 @@
 //!
 //! ```text
 //! offset  size  field
-//! 0       1     version            (currently 1)
-//! 1       1     provider_type      (1=TPM2 2=PKCS11 3=EXTERNAL_SECRET 4=SOFTWARE 5=EPHEMERAL)
+//! 0       1     version            (currently 3)
+//! 1       1     provider_type      (1=TPM2 2=PKCS11 3=EXTERNAL_SECRET 5=EPHEMERAL;
+//!                                   4 was SOFTWARE, retired -- see `ProviderType`)
 //! 2       2     key_id_len (u16)
 //! 4       N     key_id             (provider-specific opaque identifier)
-//! 4+N     65    ephemeral_public_key (uncompressed SEC1 P-256 point: 0x04 || X || Y)
-//! 69+N    12    nonce              (AES-256-GCM 96-bit nonce)
-//! 81+N    4     ciphertext_len (u32)
-//! 85+N    M     ciphertext         (AES-256-GCM ciphertext, includes 16-byte tag)
+//! 4+N     32    salt               (per-payload random HKDF salt)
+//! 36+N    12    nonce              (AES-256-GCM 96-bit nonce)
+//! 48+N    4     ciphertext_len (u32)
+//! 52+N    M     ciphertext         (AES-256-GCM ciphertext, includes 16-byte tag)
+//! 52+N+M  32    fingerprint        (SHA-256 of the persistent KEK's public key --
+//!                                   see `crypto::kek_fingerprint` -- checked by
+//!                                   `unwrap` before any ECDH/AES-GCM is attempted)
 //! ```
 //!
 //! The service name is intentionally NOT part of this payload -- per spec it
-//! is supplied out-of-band on every wrap/unwrap call.
+//! is supplied out-of-band on every wrap/unwrap call. It is nonetheless
+//! bound into the key derivation; see [`crate::crypto`].
+//!
+//! Version 2 added the trailing `fingerprint` field; a version-1 payload
+//! (produced before that field existed) is rejected outright by
+//! `from_bytes` rather than misparsed, since a fixed-size trailing field
+//! can't be distinguished from "shorter ciphertext" any other way.
+//!
+//! Version 3 replaced the 65-byte `ephemeral_public_key` with a 32-byte
+//! `salt`. The protocol no longer uses an ephemeral ECDH key, because
+//! anyone holding the KEK's (non-secret) public key could reproduce the
+//! shared secret it produced and therefore mint a payload that unwrapped
+//! to a DEK of their choosing. The wrapping key is now derived from an
+//! ECDH only the key's holder can perform, with this `salt` providing the
+//! per-payload key separation the ephemeral key used to -- see
+//! [`crate::crypto`] for the full rationale. A version-2 payload is
+//! rejected rather than misparsed: the two layouts differ in length and
+//! meaning, and a v2 payload's wrapping key is not derivable under v3.
+//!
+//! Every field here except the ciphertext is authenticated, both as the
+//! AEAD's associated data and as part of the HKDF `info` -- see
+//! [`Payload::authenticated_bytes`].
 
 use crate::error::{Error, Result}; // this module's own error type + `Result<T, Error>` alias
 use crate::provider::ProviderType; // the 1..=5 provider tag stored in the payload
 
-pub const VERSION: u8 = 1; // current wire-format version; bump and branch in `from_bytes` if the layout ever changes
-pub const UNCOMPRESSED_POINT_LEN: usize = 65; // SEC1 uncompressed P-256 point: 1 tag byte (0x04) + 32-byte X + 32-byte Y
+pub const VERSION: u8 = 3; // current wire-format version; bump and branch in `from_bytes` if the layout ever changes
+pub const SALT_LEN: usize = 32; // per-payload HKDF salt; 32 bytes matches SHA-256's output size, HKDF's natural salt width
 pub const NONCE_LEN: usize = 12; // AES-GCM's standard 96-bit nonce size
+pub const FINGERPRINT_LEN: usize = 32; // SHA-256 digest size
 
 // Plain Rust struct mirroring the wire layout above; `to_bytes`/`from_bytes`
 // are the only places that translate between this and raw bytes.
@@ -36,34 +62,61 @@ pub const NONCE_LEN: usize = 12; // AES-GCM's standard 96-bit nonce size
 pub struct Payload {
     pub provider_type: ProviderType, // which provider produced (and must later reload) the KEK
     pub key_id: Vec<u8>,             // provider-specific opaque tag, variable length
-    pub ephemeral_public_key: [u8; UNCOMPRESSED_POINT_LEN], // the wrapper's one-time ECDH public key
+    pub salt: [u8; SALT_LEN],        // per-payload random HKDF salt; what makes each payload's wrapping key unique
     pub nonce: [u8; NONCE_LEN],      // the AES-GCM nonce used for this one encryption
     pub ciphertext: Vec<u8>,         // AES-GCM ciphertext, tag included at the end
+    pub fingerprint: [u8; FINGERPRINT_LEN], // SHA-256 of the persistent KEK's public key at wrap time
 }
 
 impl Payload {
-    // Serializes this payload into the exact byte layout documented above.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        // Pre-size the output buffer so `extend_from_slice` below never
-        // needs to reallocate: 1(version) + 1(provider) + 2(key_id len) +
-        // key_id + 65(pubkey) + 12(nonce) + 4(ciphertext len) + ciphertext.
-        let mut out = Vec::with_capacity(
-            2 + 2
-                + self.key_id.len()
-                + UNCOMPRESSED_POINT_LEN
-                + NONCE_LEN
-                + 4
-                + self.ciphertext.len(),
-        );
+    // Length of everything this payload serializes to except the
+    // ciphertext bytes and the trailing fingerprint.
+    fn prefix_len(&self) -> usize {
+        1 + 1 + 2 + self.key_id.len() + SALT_LEN + NONCE_LEN + 4
+    }
+
+    // Writes every field except the ciphertext bytes and the trailing
+    // fingerprint, in wire order.
+    //
+    // This is the *single* definition of field order, shared by
+    // `to_bytes` and `authenticated_bytes`, so the serialized form and
+    // the authenticated form can never drift apart -- a field added here
+    // is automatically both written and authenticated. Getting that wrong
+    // in either direction is how unauthenticated header fields (and the
+    // attacks they enable) creep into a format over time.
+    fn write_prefix(&self, out: &mut Vec<u8>) {
         out.push(VERSION); // byte 0: format version
         out.push(self.provider_type as u8); // byte 1: provider tag (enum cast to its u8 discriminant)
         out.extend_from_slice(&(self.key_id.len() as u16).to_le_bytes()); // bytes 2..4: key_id length, little-endian u16
         out.extend_from_slice(&self.key_id); // the key_id bytes themselves
-        out.extend_from_slice(&self.ephemeral_public_key); // fixed 65-byte ephemeral public key
+        out.extend_from_slice(&self.salt); // fixed 32-byte per-payload HKDF salt
         out.extend_from_slice(&self.nonce); // fixed 12-byte AES-GCM nonce
         out.extend_from_slice(&(self.ciphertext.len() as u32).to_le_bytes()); // ciphertext length, little-endian u32
+    }
+
+    // Serializes this payload into the exact byte layout documented above.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.prefix_len() + self.ciphertext.len() + FINGERPRINT_LEN);
+        self.write_prefix(&mut out);
         out.extend_from_slice(&self.ciphertext); // the ciphertext (+ tag) bytes themselves
+        out.extend_from_slice(&self.fingerprint); // fixed 32-byte trailing KEK fingerprint
         out // return the fully assembled buffer
+    }
+
+    /// Every byte of this payload except the ciphertext itself: the
+    /// header fields in wire order, followed by the trailing fingerprint.
+    ///
+    /// Used both as the AEAD's associated data and as part of the HKDF
+    /// `info`, so every non-ciphertext byte is authenticated *and* bound
+    /// into key derivation. The ciphertext is excluded because the AEAD
+    /// already authenticates it directly; its declared *length* is
+    /// included, since that is a header field a tamperer could otherwise
+    /// shift.
+    pub fn authenticated_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.prefix_len() + FINGERPRINT_LEN);
+        self.write_prefix(&mut out);
+        out.extend_from_slice(&self.fingerprint);
+        out
     }
 
     // Parses a byte slice back into a `Payload`, validating every field as
@@ -84,13 +137,14 @@ impl Payload {
         let key_id_len = u16::from_le_bytes(cursor.take(2)?.try_into().unwrap()) as usize; // read the 2-byte length prefix, then widen to usize for indexing
         let key_id = cursor.take(key_id_len)?.to_vec(); // read exactly that many bytes and copy them into an owned Vec
 
-        let ephemeral_public_key: [u8; UNCOMPRESSED_POINT_LEN] =
-            cursor.take(UNCOMPRESSED_POINT_LEN)?.try_into().unwrap(); // read the fixed 65-byte public key into a fixed-size array
+        let salt: [u8; SALT_LEN] = cursor.take(SALT_LEN)?.try_into().unwrap(); // read the fixed 32-byte HKDF salt into a fixed-size array
 
         let nonce: [u8; NONCE_LEN] = cursor.take(NONCE_LEN)?.try_into().unwrap(); // read the fixed 12-byte nonce into a fixed-size array
 
         let ciphertext_len = u32::from_le_bytes(cursor.take(4)?.try_into().unwrap()) as usize; // read the 4-byte ciphertext length prefix
         let ciphertext = cursor.take(ciphertext_len)?.to_vec(); // read exactly that many ciphertext bytes
+
+        let fingerprint: [u8; FINGERPRINT_LEN] = cursor.take(FINGERPRINT_LEN)?.try_into().unwrap(); // read the fixed 32-byte trailing fingerprint
 
         if cursor.pos != cursor.buf.len() {
             // anything left over after consuming every declared field means the
@@ -102,9 +156,10 @@ impl Payload {
         Ok(Payload {
             provider_type,
             key_id,
-            ephemeral_public_key,
+            salt,
             nonce,
             ciphertext,
+            fingerprint,
         }) // hand back the fully reconstructed, validated payload
     }
 }
@@ -141,20 +196,22 @@ mod tests {
     fn round_trips() {
         // Build an arbitrary payload...
         let payload = Payload {
-            provider_type: ProviderType::Software,
+            provider_type: ProviderType::ExternalSecret,
             key_id: vec![1, 2, 3, 4],
-            ephemeral_public_key: [7u8; UNCOMPRESSED_POINT_LEN],
+            salt: [7u8; SALT_LEN],
             nonce: [9u8; NONCE_LEN],
             ciphertext: vec![0xAA; 48],
+            fingerprint: [0xEE; FINGERPRINT_LEN],
         };
         let bytes = payload.to_bytes(); // ...serialize it...
         let parsed = Payload::from_bytes(&bytes).unwrap(); // ...and parse it back.
         // Every field should survive the round trip unchanged.
         assert_eq!(parsed.provider_type, payload.provider_type);
         assert_eq!(parsed.key_id, payload.key_id);
-        assert_eq!(parsed.ephemeral_public_key, payload.ephemeral_public_key);
+        assert_eq!(parsed.salt, payload.salt);
         assert_eq!(parsed.nonce, payload.nonce);
         assert_eq!(parsed.ciphertext, payload.ciphertext);
+        assert_eq!(parsed.fingerprint, payload.fingerprint);
     }
 
     #[test]
@@ -162,15 +219,16 @@ mod tests {
         let payload = Payload {
             provider_type: ProviderType::Ephemeral,
             key_id: vec![],
-            ephemeral_public_key: [0x04; UNCOMPRESSED_POINT_LEN],
+            salt: [0x04; SALT_LEN],
             nonce: [0x55; NONCE_LEN],
             ciphertext: vec![],
+            fingerprint: [0xEE; FINGERPRINT_LEN],
         };
         let bytes = payload.to_bytes();
         let parsed = Payload::from_bytes(&bytes).unwrap();
         assert_eq!(parsed.provider_type, ProviderType::Ephemeral);
         assert!(parsed.key_id.is_empty());
-        assert_eq!(parsed.ephemeral_public_key, [0x04; UNCOMPRESSED_POINT_LEN]);
+        assert_eq!(parsed.salt, [0x04; SALT_LEN]);
         assert_eq!(parsed.nonce, [0x55; NONCE_LEN]);
         assert!(parsed.ciphertext.is_empty());
     }
@@ -181,15 +239,15 @@ mod tests {
             ProviderType::Tpm2,
             ProviderType::Pkcs11,
             ProviderType::ExternalSecret,
-            ProviderType::Software,
             ProviderType::Ephemeral,
         ] {
             let payload = Payload {
                 provider_type: pt,
                 key_id: vec![0x12, 0x34],
-                ephemeral_public_key: [0x42; UNCOMPRESSED_POINT_LEN],
+                salt: [0x42; SALT_LEN],
                 nonce: [0x24; NONCE_LEN],
                 ciphertext: vec![0x99; 48],
+                fingerprint: [0xEE; FINGERPRINT_LEN],
             };
             let bytes = payload.to_bytes();
             let parsed = Payload::from_bytes(&bytes).unwrap();
@@ -200,14 +258,28 @@ mod tests {
     #[test]
     fn rejects_unsupported_version() {
         let payload = Payload {
-            provider_type: ProviderType::Software,
+            provider_type: ProviderType::ExternalSecret,
             key_id: vec![1, 2],
-            ephemeral_public_key: [1u8; UNCOMPRESSED_POINT_LEN],
+            salt: [1u8; SALT_LEN],
             nonce: [2u8; NONCE_LEN],
             ciphertext: vec![3u8; 16],
+            fingerprint: [0xEE; FINGERPRINT_LEN],
         };
         let mut bytes = payload.to_bytes();
-        bytes[0] = 2; // version 2
+        bytes[0] = 1; // version 1: predates the trailing fingerprint field, must be rejected outright
+        let err = Payload::from_bytes(&bytes).unwrap_err();
+        assert!(matches!(err, Error::Crypto("unsupported wrapped payload version")));
+
+        // Version 2: the ephemeral-ECDH format. Rejected rather than
+        // misparsed -- its layout differs (65-byte point where v3 has a
+        // 32-byte salt) and its wrapping key is not derivable under v3's
+        // static-point derivation, so there is nothing useful to do with
+        // one beyond refusing it clearly.
+        bytes[0] = 2;
+        let err = Payload::from_bytes(&bytes).unwrap_err();
+        assert!(matches!(err, Error::Crypto("unsupported wrapped payload version")));
+
+        bytes[0] = 4; // version 4: doesn't exist yet
         let err = Payload::from_bytes(&bytes).unwrap_err();
         assert!(matches!(err, Error::Crypto("unsupported wrapped payload version")));
 
@@ -219,11 +291,12 @@ mod tests {
     #[test]
     fn rejects_unknown_provider_type() {
         let payload = Payload {
-            provider_type: ProviderType::Software,
+            provider_type: ProviderType::ExternalSecret,
             key_id: vec![1, 2],
-            ephemeral_public_key: [1u8; UNCOMPRESSED_POINT_LEN],
+            salt: [1u8; SALT_LEN],
             nonce: [2u8; NONCE_LEN],
             ciphertext: vec![3u8; 16],
+            fingerprint: [0xEE; FINGERPRINT_LEN],
         };
         let mut bytes = payload.to_bytes();
         bytes[1] = 0; // invalid provider 0
@@ -244,9 +317,10 @@ mod tests {
         let payload = Payload {
             provider_type: ProviderType::Ephemeral,
             key_id: vec![1, 2, 3],
-            ephemeral_public_key: [1u8; UNCOMPRESSED_POINT_LEN],
+            salt: [1u8; SALT_LEN],
             nonce: [2u8; NONCE_LEN],
             ciphertext: vec![3u8; 16],
+            fingerprint: [0xEE; FINGERPRINT_LEN],
         };
         let bytes = payload.to_bytes();
         // Test truncating at every single possible length up to the full length
@@ -264,9 +338,10 @@ mod tests {
         let payload = Payload {
             provider_type: ProviderType::Ephemeral,
             key_id: vec![],
-            ephemeral_public_key: [1u8; UNCOMPRESSED_POINT_LEN],
+            salt: [1u8; SALT_LEN],
             nonce: [2u8; NONCE_LEN],
             ciphertext: vec![3u8; 16],
+            fingerprint: [0xEE; FINGERPRINT_LEN],
         };
         let mut bytes = payload.to_bytes();
         bytes.push(0xFF); // append one stray byte after a complete, valid payload
@@ -277,11 +352,12 @@ mod tests {
     #[test]
     fn rejects_invalid_declared_lengths() {
         let payload = Payload {
-            provider_type: ProviderType::Software,
+            provider_type: ProviderType::ExternalSecret,
             key_id: vec![1, 2, 3, 4],
-            ephemeral_public_key: [1u8; UNCOMPRESSED_POINT_LEN],
+            salt: [1u8; SALT_LEN],
             nonce: [2u8; NONCE_LEN],
             ciphertext: vec![3u8; 16],
+            fingerprint: [0xEE; FINGERPRINT_LEN],
         };
         let mut bytes = payload.to_bytes();
         // Modify key_id_len (bytes 2..4) to claim a huge length
@@ -291,7 +367,7 @@ mod tests {
 
         // Restore and modify ciphertext_len (last 4 bytes before ciphertext)
         let mut bytes2 = payload.to_bytes();
-        let ct_len_offset = 1 + 1 + 2 + 4 + UNCOMPRESSED_POINT_LEN + NONCE_LEN;
+        let ct_len_offset = 1 + 1 + 2 + 4 + SALT_LEN + NONCE_LEN;
         bytes2[ct_len_offset] = 0xFF;
         bytes2[ct_len_offset + 1] = 0xFF;
         bytes2[ct_len_offset + 2] = 0xFF;

@@ -1,6 +1,6 @@
 # Linux test/build environment for HKDFGuard.
 #
-# Includes everything the default (software/external-secret/ephemeral) and
+# Includes everything the default (external-secret/ephemeral) and
 # hardware-backed (tpm2 via swtpm, pkcs11 via SoftHSM2) providers need, so
 # the whole provider chain -- including the two providers that cannot be
 # built or tested on the macOS host this crate was originally written on --

@@ -39,8 +39,8 @@ impl Default for EphemeralProvider {
     }
 }
 
-// The handle type this provider hands back from `get_or_create_kek`; holds
-// a clone of the in-memory secret key long enough to perform one ECDH.
+// The handle type this provider hands back from `load_kek`; holds a clone
+// of the in-memory secret key long enough to perform one ECDH.
 struct EphemeralHandle {
     key_id: Vec<u8>,       // diagnostic-only tag, embedded in the wrapped payload
     secret_key: SecretKey, // the actual private key material for this service
@@ -62,6 +62,10 @@ impl KekHandle for EphemeralHandle {
         out.copy_from_slice(shared.raw_secret_bytes().as_slice()); // copy the shared X-coordinate bytes in
         Ok(SharedSecret::new(out)) // wrap in the zeroizing `SharedSecret` alias before returning
     }
+
+    fn public_key(&self) -> Result<PublicKey> {
+        Ok(self.secret_key.public_key()) // trivial: the public half is always derivable from the private key we already hold
+    }
 }
 
 impl KekProvider for EphemeralProvider {
@@ -74,16 +78,32 @@ impl KekProvider for EphemeralProvider {
         true
     }
 
-    fn get_or_create_kek(&self, service: &str) -> Result<Box<dyn KekHandle>> {
+    fn kek_exists(&self, service: &str) -> Result<bool> {
+        let keys = self
+            .keys
+            .lock()
+            .map_err(|_| Error::Provider("ephemeral key map lock poisoned".into()))?;
+        Ok(keys.contains_key(service))
+    }
+
+    fn load_kek(&self, service: &str, create_if_missing: bool) -> Result<Box<dyn KekHandle>> {
         let mut keys = self
             .keys
             .lock() // acquire the mutex; blocks if another call is using the map right now
             .map_err(|_| Error::Provider("ephemeral key map lock poisoned".into()))?; // a prior panic while holding the lock would poison it
 
-        let secret_key = keys
-            .entry(service.to_string()) // look up (or prepare to insert) this service's slot
-            .or_insert_with(|| SecretKey::random(&mut OsRng)) // generate a brand-new random key only if none exists yet
-            .clone(); // clone out of the map so we can release the lock before returning
+        let secret_key = if let Some(existing) = keys.get(service) {
+            existing.clone()
+        } else {
+            if !create_if_missing {
+                return Err(Error::KeyNotProvisioned(
+                    "no ephemeral KEK created yet for this service",
+                ));
+            }
+            let fresh = SecretKey::random(&mut OsRng); // generate a brand-new random key only since none exists yet
+            keys.insert(service.to_string(), fresh.clone());
+            fresh
+        }; // lock released once this block ends, before returning
 
         // key_id is a stable-per-process, non-secret tag derived from the
         // service name only for human-readable diagnostics; it carries no
@@ -114,17 +134,52 @@ mod tests {
     }
 
     #[test]
+    fn kek_exists_is_false_until_created_then_true_and_load_kek_declines_without_create() {
+        let provider = EphemeralProvider::new();
+        // A service name unique to this test, since PROCESS_KEYS is shared
+        // process-wide across every EphemeralProvider instance/test.
+        let service = "com.company.kek-exists-test";
+
+        assert!(!provider.kek_exists(service).unwrap());
+        match provider.load_kek(service, false) {
+            Err(Error::KeyNotProvisioned(_)) => {}
+            Err(other) => panic!("expected KeyNotProvisioned, got {other:?}"),
+            Ok(_) => panic!("expected KeyNotProvisioned, got Ok"),
+        }
+
+        provider.load_kek(service, true).unwrap(); // now actually create it
+
+        assert!(provider.kek_exists(service).unwrap());
+        provider.load_kek(service, false).unwrap(); // now loads fine without creating
+    }
+
+    #[test]
+    fn public_key_matches_the_key_used_for_ecdh() {
+        let provider = EphemeralProvider::new();
+        let handle = provider.load_kek("com.company.pubkey-test", true).unwrap();
+        let reported_public = handle.public_key().unwrap();
+
+        let eph = SecretKey::random(&mut OsRng);
+        let eph_pub = eph.public_key();
+
+        let via_handle = handle.ecdh(&eph_pub).unwrap();
+        let via_reported = p256::ecdh::diffie_hellman(eph.to_nonzero_scalar(), reported_public.as_affine());
+
+        assert_eq!(via_handle.as_slice(), via_reported.raw_secret_bytes().as_slice());
+    }
+
+    #[test]
     fn key_id_format() {
         let provider = EphemeralProvider::new();
-        let handle = provider.get_or_create_kek("com.company.orders").unwrap();
+        let handle = provider.load_kek("com.company.orders", true).unwrap();
         assert_eq!(handle.key_id(), b"ephemeral:com.company.orders");
     }
 
     #[test]
     fn same_service_returns_same_key_within_process() {
         let provider = EphemeralProvider::new();
-        let h1 = provider.get_or_create_kek("com.company.orders").unwrap(); // first call creates the key
-        let h2 = provider.get_or_create_kek("com.company.orders").unwrap(); // second call must reuse it
+        let h1 = provider.load_kek("com.company.orders", true).unwrap(); // first call creates the key
+        let h2 = provider.load_kek("com.company.orders", true).unwrap(); // second call must reuse it
 
         let eph = SecretKey::random(&mut OsRng); // a throwaway "caller" ephemeral key for this test
         let eph_pub = eph.public_key();
@@ -137,8 +192,8 @@ mod tests {
     #[test]
     fn different_services_have_different_keys() {
         let provider = EphemeralProvider::new();
-        let h1 = provider.get_or_create_kek("com.company.orders").unwrap();
-        let h2 = provider.get_or_create_kek("com.company.billing").unwrap(); // a different service name
+        let h1 = provider.load_kek("com.company.orders", true).unwrap();
+        let h2 = provider.load_kek("com.company.billing", true).unwrap(); // a different service name
 
         let eph = SecretKey::random(&mut OsRng);
         let eph_pub = eph.public_key();
@@ -157,7 +212,7 @@ mod tests {
             let p = Arc::clone(&provider);
             handles.push(thread::spawn(move || {
                 let service = if i % 2 == 0 { "service.a" } else { "service.b" };
-                let h = p.get_or_create_kek(service).unwrap();
+                let h = p.load_kek(service, true).unwrap();
                 let eph = SecretKey::random(&mut OsRng);
                 h.ecdh(&eph.public_key()).unwrap()
             }));
@@ -168,8 +223,8 @@ mod tests {
         }
 
         // Verify that keys for service.a and service.b are stable
-        let ha = provider.get_or_create_kek("service.a").unwrap();
-        let hb = provider.get_or_create_kek("service.b").unwrap();
+        let ha = provider.load_kek("service.a", true).unwrap();
+        let hb = provider.load_kek("service.b", true).unwrap();
         let eph = SecretKey::random(&mut OsRng);
         assert_ne!(
             *ha.ecdh(&eph.public_key()).unwrap(),

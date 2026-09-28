@@ -17,10 +17,19 @@ int main(void) {
         dek[i] = (uint8_t)i;
     }
 
+    /* hkdfguard_wrap_dek never creates a KEK itself -- it must already
+     * exist. hkdfguard_create_kek is idempotent, so calling it
+     * unconditionally here is safe whether or not one already does. */
+    int rc = hkdfguard_create_kek(service);
+    if (rc != HKDFGUARD_OK) {
+        fprintf(stderr, "create_kek failed: %d\n", rc);
+        return 1;
+    }
+
     uint8_t wrapped[512];
     int wrapped_len = sizeof(wrapped);
 
-    int rc = hkdfguard_wrap_dek(service, dek, HKDFGUARD_DEK_LEN, wrapped, &wrapped_len);
+    rc = hkdfguard_wrap_dek(service, dek, HKDFGUARD_DEK_LEN, wrapped, &wrapped_len);
     if (rc != HKDFGUARD_OK) {
         fprintf(stderr, "wrap failed: %d\n", rc);
         return 1;

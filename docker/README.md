@@ -17,8 +17,8 @@ docker/run-tests.sh
 This builds the image and runs [`entrypoint-test.sh`](entrypoint-test.sh),
 which:
 
-1. `cargo build` / `cargo test` with the default features (software,
-   external-secret, ephemeral) -- unit tests plus the CLI integration tests
+1. `cargo build` / `cargo test` with the default features (external-secret,
+   ephemeral) -- unit tests plus the CLI integration tests
    in [`tests/cli_initialize_round_trip.rs`](../tests/cli_initialize_round_trip.rs),
    which drive the `hkdfguard-v1-initialize` binary as a real subprocess.
 2. `cargo build --features tpm2,pkcs11` -- confirms this crate actually
@@ -58,8 +58,8 @@ runs [`entrypoint-build.sh`](entrypoint-build.sh) inside each, which:
    above; run `docker/run-tests.sh` separately before a real release if you
    want that stronger guarantee.
 2. Runs `cargo build --release --all-features`, so the distributed library
-   supports every KEK provider (TPM2, PKCS#11, external secret, software,
-   ephemeral), not just the ones enabled by default.
+   supports every KEK provider (TPM2, PKCS#11, external secret, ephemeral),
+   not just the ones enabled by default.
 3. Copies `libHkdfGuardKeyProtectionLinux.so`,
    `libHkdfGuardKeyProtectionLinux.a`, the `hkdfguard-v1-initialize` CLI
    binary, and `include/hkdfguard.h` into `/dist` inside the container,
@@ -117,3 +117,27 @@ then run `cargo test --features tpm2 -- --ignored --test-threads=1`
 inside. Note this gives the container access to the host's real TPM state
 -- keys it creates are real and persist in TPM NV/derivation state exactly
 as they would outside Docker.
+
+## TPM conformance suite (multi-container, persistent swtpm)
+
+`src/provider/tpm2.rs`'s `mod tests` includes a `#[ignore]`d conformance
+suite that empirically validates the assumptions the TPM2 provider's
+whole persistence model depends on (deterministic `TPM2_CreatePrimary`,
+distinct keys per service, ECDH repeatability, ...) -- see that module's
+doc comments. `docker/run-tests.sh` already runs it against a swtpm
+instance that lives and dies with that one container. For a setup where
+swtpm keeps running (or gets restarted) independently of the test runner
+-- e.g. to test persistence across a TPM restart -- use the multi-container
+setup instead:
+
+```sh
+docker compose -f docker/docker-compose.yml up --build --abort-on-container-exit
+docker compose -f docker/docker-compose.yml down -v   # also drops the persisted TPM state volume
+```
+
+`scripts/tpm-reboot-test.sh` approximates reboot-persistence testing more
+directly: it starts swtpm with persistent state, captures a primary key's
+public area and TPM Name, stops and restarts swtpm against that same
+state, and asserts both captures are identical. Run it from a shell that
+has `swtpm`/`tpm2-tools` on PATH (the container from `docker/Dockerfile`
+qualifies).

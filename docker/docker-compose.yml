@@ -1,0 +1,67 @@
+# Multi-container TPM2 conformance test environment: a standalone `swtpm`
+# service (its state persisted in a named volume, so it survives a
+# restart -- see scripts/tpm-reboot-test.sh, which relies on exactly that)
+# and an `hkdfguard-test-runner` service that builds this crate and runs
+# the `#[ignore]`d TPM determinism/vendor-compatibility conformance suite
+# (src/provider/tpm2.rs's `mod tests`) against it over the network.
+#
+# This is a heavier-weight alternative to docker/run-tests.sh's single
+# container, which starts swtpm as a background process inside the same
+# container as the test runner and never restarts it mid-run. Use this
+# compose setup specifically when you need swtpm to keep running (or be
+# restarted) independently of the test runner's own lifecycle.
+#
+# Usage:
+#   docker compose -f docker/docker-compose.yml up --build --abort-on-container-exit
+#   docker compose -f docker/docker-compose.yml down -v   # also drops the persisted TPM state volume
+
+services:
+  swtpm:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.swtpm
+    volumes:
+      - swtpm-state:/var/lib/swtpm
+    ports:
+      - "2321:2321" # TPM command port
+      - "2322:2322" # TPM control port
+    command:
+      - socket
+      - --tpmstate
+      - dir=/var/lib/swtpm
+      - --tpm2
+      - --server
+      - type=tcp,port=2321,bindaddr=0.0.0.0
+      - --ctrl
+      - type=tcp,port=2322,bindaddr=0.0.0.0
+      - --flags
+      - not-need-init
+    healthcheck:
+      test: ["CMD-SHELL", "echo > /dev/tcp/127.0.0.1/2321"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  hkdfguard-test-runner:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      swtpm:
+        condition: service_healthy
+    environment:
+      TCTI: "swtpm:host=swtpm,port=2321"
+      TPM2TOOLS_TCTI: "swtpm:host=swtpm,port=2321"
+    # Overrides docker/Dockerfile's own ENTRYPOINT (entrypoint-test.sh,
+    # which runs the full single-container matrix, including starting its
+    # own swtpm): here we only want the TPM conformance suite, run against
+    # the separate `swtpm` service above.
+    entrypoint: ["bash", "-lc"]
+    command:
+      - |
+        set -euo pipefail
+        tpm2_startup -c -T "$$TCTI"
+        cargo test --features tpm2 -- --ignored --test-threads=1
+
+volumes:
+  swtpm-state:
