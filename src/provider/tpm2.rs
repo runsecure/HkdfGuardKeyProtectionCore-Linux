@@ -1802,6 +1802,43 @@ mod tests {
         assert_ne!(z.unwrap(), [0u8; 32], "ECDH through the encrypted session must succeed");
     }
 
+    // ---- operator helpers: obtain the Names to pin in policy ----
+    //
+    // Not assertions. Run with `-- --ignored --exact --nocapture` to print
+    // the Name the *real* TPM reports, for `tpm.pinned_session_salt_key_name`
+    // and `tpm.pinned_names`. They go through the production derivation,
+    // so they honor a configured derivation secret and any pins already in
+    // policy -- a pin learned without a derivation secret will not match
+    // once one is provisioned. `scripts/native-tpm-test.sh` drives these.
+
+    #[test]
+    #[ignore = "operator helper (prints the session salt key Name to pin); requires a TPM2 device"]
+    #[serial]
+    fn print_session_salt_key_name_for_pinning() {
+        let name = with_tpm_context(|ctx| {
+            let key = create_session_salt_key(ctx)?;
+            let (_public, name, _qualified) = ctx.read_public(key).map_err(|e| Error::Provider(e.to_string()))?;
+            let _ = ctx.flush_context(key.into());
+            Ok(hex(name.value()))
+        })
+        .expect("no TPM available, or the salt key failed its checks");
+        println!("SALT_KEY_NAME={name}");
+    }
+
+    #[test]
+    #[ignore = "operator helper (prints a service key's Name to pin); requires a TPM2 device"]
+    #[serial]
+    fn print_service_key_name_for_pinning() {
+        // Which service, via env -- there is no other way to pass a value
+        // to a test. Normalized exactly as the C ABI would normalize it.
+        let service = std::env::var("HKDFGUARD_PIN_SERVICE").unwrap_or_else(|_| "com.company.orders".to_string());
+        let service = crate::normalize_service(&service);
+        let (_public, name) = with_tpm_context(|ctx| create_and_read_primary(ctx, &service))
+            .expect("no TPM available, or the service key failed its checks");
+        println!("SERVICE={service}");
+        println!("SERVICE_KEY_NAME={}", hex(name.value()));
+    }
+
     // Writes a policy pinning `service` to `name_hex` and points
     // HKDFGUARD_POLICY_FILE at it for the duration of `f`.
     fn with_pinned_name<T>(service: &str, name_hex: &str, f: impl FnOnce() -> T) -> T {

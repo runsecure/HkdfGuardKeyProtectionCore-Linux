@@ -33,6 +33,11 @@
 # against every other version.
 #
 # Usage: scripts/tpm-reboot-test.sh
+#
+# For the real thing -- a genuine reboot of a machine with a real TPM,
+# driving hkdfguard's own code rather than a stand-in template -- use
+# `scripts/native-tpm-test.sh reboot capture`, reboot, then
+# `scripts/native-tpm-test.sh reboot verify`.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

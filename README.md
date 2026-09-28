@@ -275,6 +275,47 @@ cargo test --features tpm2 -- --ignored     # needs a TPM or swtpm, on Linux
 cargo test --features pkcs11 -- --ignored   # needs SoftHSM2 or another PKCS#11 module
 ```
 
+### Testing on a native Linux TPM (Intel PTT / AMD fTPM / discrete)
+
+Docker proves the code against `swtpm`. To prove it against the hardware
+you will actually deploy on:
+
+```sh
+scripts/native-tpm-preflight.sh   # read-only: device access, tpm2-tools, libtss2-esys, vendor
+scripts/native-tpm-test.sh        # the full matrix, on the real TPM
+```
+
+The preflight identifies the TPM from `TPM2_PT_MANUFACTURER` and tells you
+what `tpm.session_encryption: auto` will decide on it (skip for an
+fTPM/vTPM, encrypt for a discrete chip). The full run then does everything
+`docker/entrypoint-test.sh` does, against the real device: the
+conformance suite (determinism, Name formula, the fixed ECDH point,
+encrypted-session correctness), the same suite again with a derivation
+secret provisioned, a C ABI round trip with the KEK on the TPM under both
+`auto` and a fully pinned `required` policy, and the CLI-to-C-consumer
+cross-process check. It learns the Names to pin from the TPM itself via
+two operator-helper tests (run them directly to get values for your own
+policy):
+
+```sh
+cargo test --features tpm2 --lib print_session_salt_key_name_for_pinning -- --ignored --nocapture
+HKDFGUARD_PIN_SERVICE=com.company.orders \
+cargo test --features tpm2 --lib print_service_key_name_for_pinning -- --ignored --nocapture
+```
+
+Nothing under `/etc/hkdfguard` is touched and no state is left on the
+TPM. On a discrete chip one fTPM-specific assertion is skipped (the
+mechanism it exercises still runs).
+
+The one property `swtpm` can only approximate is survival of a real
+reboot. For that:
+
+```sh
+scripts/native-tpm-test.sh reboot capture   # wraps a DEK on the TPM and saves state
+# reboot the machine
+scripts/native-tpm-test.sh reboot verify    # the same KEK must re-derive and unwrap it
+```
+
 ### Testing in Docker (recommended if you're not already on Linux)
 
 ```sh
