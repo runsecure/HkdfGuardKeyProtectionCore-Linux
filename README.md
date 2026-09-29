@@ -370,23 +370,42 @@ Every common mechanism meets the mode requirement with one setting:
 
 Because a wrapped payload can only be produced on the host that holds the
 KEK, a deployment pipeline delivers the *plaintext* DEK to the host and
-wraps it there. This CLI is that step.
-
-The DEK is base64 of exactly 32 bytes, and is read from stdin or a file —
-never from a command-line argument or an environment variable, both of
-which are readable by any process running as the same user
-(`/proc/<pid>/cmdline`, `/proc/<pid>/environ`).
+wraps it there. This CLI is that step, in two deliberately separate
+commands:
 
 ```sh
-# stdin -- printf is a shell builtin, so the DEK never reaches any argv
-printf '%s' "$DEK_B64" | hkdfguard-v1-initialize /var/lib/app/key.bin \
+# 1. Once, at deployment time: ensure the service has a KEK. This is the
+#    only command that makes the (deliberately slow) setup calls.
+hkdfguard-v1-initialize provision --service-name com.company.orders
+
+# 2. Wrap a DEK under it. Never creates a KEK: if none is provisioned it
+#    fails and names the command above.
+printf '%s' "$DEK_B64" | hkdfguard-v1-initialize wrap \
+    --key-file-path /var/lib/app/key.bin \
     --service-name com.company.orders --dek-stdin
 
-# file -- a Kubernetes/Vault secret mount, or a systemd credential
-hkdfguard-v1-initialize /var/lib/app/key.bin \
+# ...or from a file: a Kubernetes/Vault secret mount, or a systemd credential
+hkdfguard-v1-initialize wrap \
+    --key-file-path /var/lib/app/key.bin \
     --service-name com.company.orders \
     --dek-file "$CREDENTIALS_DIRECTORY/dek"
 ```
+
+`provision` is idempotent: it checks first and reports "already
+provisioned" without touching an existing KEK. On a TPM the KEK is derived
+on demand, so it always reports present; for `external-secret` the mounted
+file *is* the provisioning; only Ephemeral actually creates anything.
+
+The DEK is base64 of exactly 32 bytes, read from stdin or a file — never
+from a command-line argument or an environment variable, both of which are
+readable by any process running as the same user (`/proc/<pid>/cmdline`,
+`/proc/<pid>/environ`). `printf` is a shell builtin, so the DEK never
+reaches any argv.
+
+`wrap --force` completes the wrap in memory *before* it securely
+overwrites and replaces the existing key file, so a wrap that fails — no
+KEK, provider unavailable, bad input — never destroys the key file that
+was already there.
 
 A `--dek-file` must be a regular file, not a symlink, owned by root or by
 the invoking user, with no group or other access (e.g. `0400`/`0600`) — the

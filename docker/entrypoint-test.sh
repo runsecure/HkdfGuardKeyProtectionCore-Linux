@@ -96,12 +96,18 @@ DEK_FILE=$(mktemp)
 head -c 32 /dev/urandom > "$DEK_FILE"
 WRAPPED_FILE=$(mktemp)
 
+# `provision` is the only command that makes the (deliberately slow) setup
+# calls. For external-secret the mounted file *is* the provisioning, so
+# this reports "already provisioned" -- and must still exit 0.
+target/release/hkdfguard-v1-initialize provision --service-name "$CLISO_SERVICE"
+
 # The DEK goes in on stdin, never on the command line: argv is readable by
 # any process of the same user through /proc/<pid>/cmdline. `printf` is a
 # shell builtin, so the base64 never becomes a child process's argv either.
 # This is also the invocation a real deployment pipeline should use.
 DEK_B64=$(base64 -w0 < "$DEK_FILE")
-printf '%s' "$DEK_B64" | target/release/hkdfguard-v1-initialize "$WRAPPED_FILE" \
+printf '%s' "$DEK_B64" | target/release/hkdfguard-v1-initialize wrap \
+    --key-file-path "$WRAPPED_FILE" \
     --service-name "$CLISO_SERVICE" \
     --dek-stdin \
     --force
@@ -115,19 +121,32 @@ LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$WRAPPED_FILE" "$CLISO_SER
 WRAPPED_FILE2=$(mktemp)
 DEK_B64_FILE=$(mktemp)
 ( umask 077; base64 -w0 < "$DEK_FILE" > "$DEK_B64_FILE" )
-target/release/hkdfguard-v1-initialize "$WRAPPED_FILE2" \
+target/release/hkdfguard-v1-initialize wrap \
+    --key-file-path "$WRAPPED_FILE2" \
     --service-name "$CLISO_SERVICE" \
     --dek-file "$DEK_B64_FILE" \
     --force
 LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$WRAPPED_FILE2" "$CLISO_SERVICE" "$DEK_FILE"
 
 # The retired argv form must be refused outright, not silently accepted.
-if printf '%s' "$(base64 -w0 < "$DEK_FILE")" | target/release/hkdfguard-v1-initialize \
-        "$(mktemp -u)" --service-name "$CLISO_SERVICE" --dek AAAA 2>/dev/null; then
+if printf '%s' "$(base64 -w0 < "$DEK_FILE")" | target/release/hkdfguard-v1-initialize wrap \
+        --key-file-path "$(mktemp -u)" --service-name "$CLISO_SERVICE" --dek AAAA 2>/dev/null; then
     echo "FAIL: --dek was accepted; it must be rejected" >&2
     exit 1
 fi
-echo "--dek correctly rejected; stdin and --dek-file both round-tripped."
+
+# `wrap` never provisions: with nothing mounted for this service it must
+# fail and point at `provision`, rather than quietly creating a KEK.
+UNPROVISIONED_OUT=$(mktemp -u)
+if printf '%s' "$(base64 -w0 < "$DEK_FILE")" | target/release/hkdfguard-v1-initialize wrap \
+        --key-file-path "$UNPROVISIONED_OUT" --service-name com.hkdfguard.dockertest.unprovisioned --dek-stdin 2>/tmp/unprov.err; then
+    echo "FAIL: wrap succeeded for a service with no provisioned KEK" >&2
+    exit 1
+fi
+grep -q 'provision --service-name com.hkdfguard.dockertest.unprovisioned' /tmp/unprov.err \
+    || { echo "FAIL: wrap's error did not point at the provision command:" >&2; cat /tmp/unprov.err >&2; exit 1; }
+[ ! -e "$UNPROVISIONED_OUT" ] || { echo "FAIL: a failed wrap wrote an output file" >&2; exit 1; }
+echo "--dek correctly rejected; unprovisioned wrap correctly refused; stdin and --dek-file both round-tripped."
 
 rm -f "$DEK_FILE" "$WRAPPED_FILE" "$WRAPPED_FILE2" "$DEK_B64_FILE"
 unset HKDFGUARD_EXTERNAL_SECRET_DIR

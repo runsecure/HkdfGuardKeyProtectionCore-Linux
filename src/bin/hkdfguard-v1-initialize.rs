@@ -1,21 +1,30 @@
-//! CLI tool: wraps a caller-supplied Data Encryption Key (DEK) under a
-//! persistent KEK and writes the wrapped payload to a file.
+//! CLI tool for setting up a service's persistent KEK and wrapping DEKs
+//! under it. Two subcommands, deliberately separate:
 //!
-//! Calls into the `hkdfguard` library through its stable C ABI
-//! (`hkdfguard_create_kek`, then `hkdfguard_wrap_dek`), the same interface
-//! any other-language caller uses -- this tool takes no shortcut through
-//! the library's internal Rust types. As of the KEK-provisioning split,
-//! `hkdfguard_wrap_dek` never creates a KEK itself, so this tool -- being
-//! the one that initializes a service's very first wrapped key -- always
-//! provisions the KEK explicitly first; `hkdfguard_create_kek` is
-//! idempotent, so this is safe even if the KEK already existed.
+//! - `provision` -- ensure a KEK exists for a service. This is the *only*
+//!   place the setup calls (`hkdfguard_kek_exists`, `hkdfguard_create_kek`)
+//!   are made. They are deliberately slow (see the library's setup-call
+//!   latency floor) and meant to run once, at deployment time.
+//! - `wrap` -- wrap a caller-supplied Data Encryption Key (DEK) under the
+//!   service's KEK and write the wrapped payload to a file. It never
+//!   creates a KEK: if none is provisioned, it fails and says to run
+//!   `provision`. That keeps the fast, repeatable operation free of the
+//!   setup calls, and makes "the KEK is missing" a loud, specific error
+//!   instead of something quietly fixed on the fly.
+//!
+//! Both call into the `hkdfguard` library through its stable C ABI, the
+//! same interface any other-language caller uses -- this tool takes no
+//! shortcut through the library's internal Rust types.
 //!
 //! The KEK's `service` identity is exactly the caller-supplied
 //! `--service-name`; there is no further structure to it.
 //!
 //! Usage:
 //! ```text
-//! hkdfguard-v1-initialize <key-file-path> \
+//! hkdfguard-v1-initialize provision --service-name|-sn <name>
+//!
+//! hkdfguard-v1-initialize wrap \
+//!     --key-file-path|-kf <path> \
 //!     --service-name|-sn <name> \
 //!     (--dek-stdin | --dek-file <path>) \
 //!     [--force|-f]
@@ -35,10 +44,10 @@
 //!
 //! ```text
 //! # stdin -- printf is a shell builtin, so nothing reaches argv
-//! printf '%s' "$DEK_B64" | hkdfguard-v1-initialize key.bin -sn svc --dek-stdin
+//! printf '%s' "$DEK_B64" | hkdfguard-v1-initialize wrap -kf key.bin -sn svc --dek-stdin
 //!
 //! # file -- e.g. a Kubernetes/Vault secret mount or a systemd credential
-//! hkdfguard-v1-initialize key.bin -sn svc --dek-file "$CREDENTIALS_DIRECTORY/dek"
+//! hkdfguard-v1-initialize wrap -kf key.bin -sn svc --dek-file "$CREDENTIALS_DIRECTORY/dek"
 //! ```
 //!
 //! A `--dek-file` must be a regular file, must not be a symlink, must be
@@ -51,13 +60,17 @@
 //! again), the exposure moves upstream. Whatever drives this tool has to
 //! avoid both.
 //!
-//! When `--force` overwrites an existing file at `<key-file-path>`, the old
-//! contents are securely overwritten in place before the file is removed
-//! (see [`secure_delete`]) rather than just truncated/replaced. Note this
-//! is a best-effort measure against a plain read of the disk: it cannot
-//! guarantee erasure on copy-on-write or log-structured filesystems (e.g.
-//! btrfs, ZFS), or on flash storage doing wear-leveling remaps, where the
-//! original blocks may still exist elsewhere on the device.
+//! ## Overwriting
+//!
+//! When `--force` replaces an existing file at `--key-file-path`, the wrap
+//! is completed in memory *first*, and only then is the old file securely
+//! overwritten in place and removed (see [`secure_delete`]). A wrap that
+//! fails -- no KEK provisioned, provider unavailable, bad DEK input --
+//! therefore never destroys the key file that was already there. The
+//! secure overwrite is a best-effort measure against a plain read of the
+//! disk: it cannot guarantee erasure on copy-on-write or log-structured
+//! filesystems (e.g. btrfs, ZFS), or on flash storage doing wear-leveling
+//! remaps, where the original blocks may still exist elsewhere.
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rand_core::{OsRng, RngCore};
@@ -69,7 +82,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::ExitCode;
 use zeroize::{Zeroize, Zeroizing};
-use HkdfGuardKeyProtectionLinux::{hkdfguard_create_kek, hkdfguard_wrap_dek, status};
+use HkdfGuardKeyProtectionLinux::{hkdfguard_create_kek, hkdfguard_kek_exists, hkdfguard_wrap_dek, status};
 
 // rw-r-----: readable by the owning deployment user and its group, writable
 // only by the owner, inaccessible to everyone else.
@@ -108,33 +121,94 @@ enum DekSource {
     File(String),
 }
 
-struct Args {
-    key_file_path: String,
-    service_name: String,
-    dek_source: DekSource,
-    force: bool,
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    Provision {
+        service_name: String,
+    },
+    Wrap {
+        key_file_path: String,
+        service_name: String,
+        dek_source: DekSource,
+        force: bool,
+    },
 }
 
 enum ParseOutcome {
-    Run(Args),
+    Run(Command),
     Help,
 }
 
 fn print_usage() {
     eprintln!(
-        "Usage: {PROGRAM_NAME} <key-file-path> --service-name|-sn <name> (--dek-stdin | --dek-file <path>) [--force|-f]\n\
+        "Usage:\n\
+         \x20 {PROGRAM_NAME} provision --service-name|-sn <name>\n\
+         \x20 {PROGRAM_NAME} wrap --key-file-path|-kf <path> --service-name|-sn <name> (--dek-stdin | --dek-file <path>) [--force|-f]\n\
+         \n\
+         provision  ensures a KEK exists for the service. Run once, at deployment time;\n\
+         \x20          this is the only command that makes the (deliberately slow) setup calls.\n\
+         wrap       wraps a DEK under the service's existing KEK and writes the payload to\n\
+         \x20          --key-file-path. Fails if the KEK has not been provisioned.\n\
          \n\
          The DEK is base64 of exactly 32 bytes, read from stdin or a file -- never\n\
          from a command-line argument or an environment variable, both of which are\n\
          readable by other processes of the same user.\n\
          \n\
          Examples:\n\
-           printf '%s' \"$DEK_B64\" | {PROGRAM_NAME} key.bin -sn svc --dek-stdin\n\
-           {PROGRAM_NAME} key.bin -sn svc --dek-file \"$CREDENTIALS_DIRECTORY/dek\""
+         \x20 {PROGRAM_NAME} provision -sn svc\n\
+         \x20 printf '%s' \"$DEK_B64\" | {PROGRAM_NAME} wrap -kf key.bin -sn svc --dek-stdin\n\
+         \x20 {PROGRAM_NAME} wrap -kf key.bin -sn svc --dek-file \"$CREDENTIALS_DIRECTORY/dek\""
     );
 }
 
+// Parses `--service-name|-sn <value>` when `arg` is that flag; the shared
+// piece of both subcommands' argument loops.
+fn take_service_name(arg: &str, args: &mut impl Iterator<Item = String>) -> Result<String, String> {
+    let value = args.next().ok_or_else(|| format!("{arg} requires a value"))?;
+    if value.is_empty() {
+        return Err("--service-name must not be empty".to_string());
+    }
+    Ok(value)
+}
+
 fn parse_args(args: impl Iterator<Item = String>) -> Result<ParseOutcome, String> {
+    let mut args = args.skip(1); // skip argv[0]
+
+    let subcommand = match args.next() {
+        None => return Err("missing subcommand: expected `provision` or `wrap`".to_string()),
+        Some(s) if s == "--help" || s == "-h" || s == "help" => return Ok(ParseOutcome::Help),
+        Some(s) => s,
+    };
+
+    match subcommand.as_str() {
+        "provision" => parse_provision(&mut args),
+        "wrap" => parse_wrap(&mut args),
+        other if !other.starts_with('-') && (other.contains('/') || other.ends_with(".key") || other.ends_with(".bin")) => Err(format!(
+            "unknown subcommand {other:?}. The key file path is no longer positional: use `wrap --key-file-path|-kf {other}`"
+        )),
+        other => Err(format!("unknown subcommand {other:?}: expected `provision` or `wrap`")),
+    }
+}
+
+fn parse_provision(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, String> {
+    let mut service_name: Option<String> = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return Ok(ParseOutcome::Help),
+            "--service-name" | "-sn" => service_name = Some(take_service_name(&arg, args)?),
+            "--key-file-path" | "-kf" | "--dek-stdin" | "--dek-file" | "--dek" | "-d" | "--force" | "-f" => {
+                return Err(format!("{arg} is not valid for `provision`; it belongs to `wrap`"))
+            }
+            other => return Err(format!("unrecognized argument for `provision`: {other}")),
+        }
+    }
+
+    let service_name = service_name.ok_or("provision: missing required --service-name|-sn")?;
+    Ok(ParseOutcome::Run(Command::Provision { service_name }))
+}
+
+fn parse_wrap(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, String> {
     let mut key_file_path: Option<String> = None;
     let mut service_name: Option<String> = None;
     let mut dek_source: Option<DekSource> = None;
@@ -151,17 +225,17 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParseOutcome, String
         Ok(())
     }
 
-    let mut args = args.skip(1); // skip argv[0]
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => return Ok(ParseOutcome::Help),
             "--force" | "-f" => force = true,
-            "--service-name" | "-sn" => {
+            "--service-name" | "-sn" => service_name = Some(take_service_name(&arg, args)?),
+            "--key-file-path" | "-kf" => {
                 let value = args.next().ok_or_else(|| format!("{arg} requires a value"))?;
                 if value.is_empty() {
-                    return Err("--service-name must not be empty".to_string());
+                    return Err("--key-file-path must not be empty".to_string());
                 }
-                service_name = Some(value);
+                key_file_path = Some(value);
             }
             "--dek-stdin" => set_source(&mut dek_source, DekSource::Stdin)?,
             "--dek-file" => {
@@ -182,18 +256,20 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParseOutcome, String
                         .to_string(),
                 )
             }
-            other if key_file_path.is_none() && !other.starts_with('-') => {
-                key_file_path = Some(other.to_string());
+            other if !other.starts_with('-') => {
+                return Err(format!(
+                    "unexpected positional argument {other:?}: the key file path is given as --key-file-path|-kf"
+                ))
             }
-            other => return Err(format!("unrecognized argument: {other}")),
+            other => return Err(format!("unrecognized argument for `wrap`: {other}")),
         }
     }
 
-    let key_file_path = key_file_path.ok_or("missing required <key-file-path>")?;
-    let service_name = service_name.ok_or("missing required --service-name|-sn")?;
-    let dek_source = dek_source.ok_or("missing required --dek-stdin or --dek-file <path>")?;
+    let key_file_path = key_file_path.ok_or("wrap: missing required --key-file-path|-kf")?;
+    let service_name = service_name.ok_or("wrap: missing required --service-name|-sn")?;
+    let dek_source = dek_source.ok_or("wrap: missing required --dek-stdin or --dek-file <path>")?;
 
-    Ok(ParseOutcome::Run(Args {
+    Ok(ParseOutcome::Run(Command::Wrap {
         key_file_path,
         service_name,
         dek_source,
@@ -316,8 +392,8 @@ fn load_dek(source: &DekSource) -> Result<Zeroizing<Vec<u8>>, String> {
     dek
 }
 
-// Maps a hkdfguard_wrap_dek status code to a human-readable description,
-// for a clearer error message than a bare integer.
+// Maps a library status code to a human-readable description, for a
+// clearer error message than a bare integer.
 fn describe_status(code: c_int) -> String {
     match code {
         status::INVALID_ARGUMENT => "invalid argument (bad DEK length, etc.)".to_string(),
@@ -334,7 +410,9 @@ fn describe_status(code: c_int) -> String {
     }
 }
 
-fn wrap_dek(service: &CString, dek: &[u8]) -> Result<Vec<u8>, String> {
+// Wraps `dek` under `service`'s *existing* KEK. Never provisions one: a
+// missing KEK is reported with the exact command that fixes it.
+fn wrap_dek(service: &CString, service_display: &str, dek: &[u8]) -> Result<Vec<u8>, String> {
     let mut wrapped = vec![0u8; INITIAL_WRAPPED_CAPACITY];
     let mut wrapped_len: c_int = wrapped.len() as c_int;
 
@@ -358,6 +436,12 @@ fn wrap_dek(service: &CString, dek: &[u8]) -> Result<Vec<u8>, String> {
         );
     }
 
+    if rc == status::KEK_NOT_FOUND {
+        return Err(format!(
+            "no KEK is provisioned for service \"{service_display}\"; run \
+             `{PROGRAM_NAME} provision --service-name {service_display}` first"
+        ));
+    }
     if rc != status::OK {
         return Err(format!("hkdfguard_wrap_dek failed: {}", describe_status(rc)));
     }
@@ -384,6 +468,23 @@ fn validate_service_charset(service: &str) -> Result<(), String> {
         return Err(format!("service name \"{service}\" must not contain consecutive dots"));
     }
     Ok(())
+}
+
+// Validates and normalizes `--service-name` in place, returning it as the
+// C string both subcommands hand to the library. Lowercased to match the
+// library's own normalization (the ABI treats the name case-insensitively),
+// so what's printed here always reflects the actual KEK identity used. Not
+// secret -- a logical identifier, not key material.
+fn prepare_service(service_name: &mut str) -> Result<CString, String> {
+    if service_name.len() > MAX_SERVICE_LEN {
+        return Err(format!(
+            "--service-name must be at most {MAX_SERVICE_LEN} bytes, got {}",
+            service_name.len()
+        ));
+    }
+    validate_service_charset(service_name)?;
+    service_name.make_ascii_lowercase();
+    CString::new(&*service_name).map_err(|_| "the service name must not contain a NUL byte".to_string())
 }
 
 // Overwrites `path`'s existing content in place for `SECURE_DELETE_ROUNDS`
@@ -437,99 +538,116 @@ fn overwrite_pass(file: &mut File, path: &Path, buf: &[u8]) -> Result<(), String
         .map_err(|e| format!("secure delete: failed to sync {}: {e}", path.display()))
 }
 
-fn run(args: &mut Args) -> Result<(), String> {
-    // Fast, friendly pre-check: fail before ever touching the KEK provider
-    // if the output path obviously already exists and --force wasn't
-    // passed. The final `create_new` open below is the actual correctness
-    // guarantee against the exists-then-create race; this is purely a
-    // fail-fast convenience on top of it.
-    let path = Path::new(&args.key_file_path);
-    if path.exists() {
-        if !args.force {
-            return Err(format!(
-                "{} already exists; pass --force|-f to overwrite",
-                args.key_file_path
-            ));
-        }
-        secure_delete(path)?;
+// `provision`: the only place the setup calls are made. Checks first so
+// the outcome can be reported precisely -- "already provisioned" versus
+// "provisioned now" -- and so an existing KEK is never touched.
+fn run_provision(mut service_name: String) -> Result<(), String> {
+    let service_c = prepare_service(&mut service_name)?;
+
+    let mut exists: c_int = 0;
+    let rc = hkdfguard_kek_exists(service_c.as_ptr(), &mut exists);
+    if rc != status::OK {
+        return Err(format!("hkdfguard_kek_exists failed: {}", describe_status(rc)));
+    }
+    if exists == 1 {
+        println!("KEK already provisioned for service \"{service_name}\"; nothing to do");
+        return Ok(());
     }
 
-    // `args.service_name` is not secret -- it's a logical identifier, not
-    // key material -- so no special scoping is needed for it. Validated
-    // before the DEK's own tightly-scoped block below. Lowercased to match
-    // the library's own normalization (hkdfguard_wrap_dek/_unwrap_dek treat
-    // the service name case-insensitively), so what's printed and recorded
-    // here always reflects the actual KEK identity that gets used.
-    if args.service_name.len() > MAX_SERVICE_LEN {
-        return Err(format!(
-            "--service-name must be at most {MAX_SERVICE_LEN} bytes, got {}",
-            args.service_name.len()
-        ));
-    }
-    validate_service_charset(&args.service_name)?;
-    args.service_name.make_ascii_lowercase();
-    let service_c = CString::new(args.service_name.clone())
-        .map_err(|_| "the service name must not contain a NUL byte".to_string())?;
-
-    // Provision the KEK before ever touching the secret DEK bytes below --
-    // hkdfguard_wrap_dek no longer creates one itself, and this tool is the
-    // one that initializes a service's very first key, so it's the right
-    // place to do so. Idempotent: harmless if this service already has one.
     let rc = hkdfguard_create_kek(service_c.as_ptr());
     if rc != status::OK {
         return Err(format!("hkdfguard_create_kek failed: {}", describe_status(rc)));
     }
+    println!("KEK provisioned for service \"{service_name}\"");
+    Ok(())
+}
+
+// `wrap`: no setup calls. The wrap is completed in memory before the
+// existing key file (if any) is touched, so a failure -- most likely "no
+// KEK provisioned" -- never costs the caller the key file they had.
+fn run_wrap(key_file_path: String, mut service_name: String, dek_source: DekSource, force: bool) -> Result<(), String> {
+    let path = Path::new(&key_file_path);
+
+    // Fast, friendly pre-check: fail before reading the DEK or touching
+    // the provider if the output path obviously already exists and --force
+    // wasn't passed. The final `create_new` open below is the actual
+    // correctness guarantee against the exists-then-create race; this is
+    // purely a fail-fast convenience on top of it.
+    if path.exists() && !force {
+        return Err(format!("{key_file_path} already exists; pass --force|-f to overwrite"));
+    }
+
+    let service_c = prepare_service(&mut service_name)?;
 
     let wrapped = {
         // The plaintext DEK is scoped as tightly as possible: read and
         // decode it, wrap it, and let `Zeroizing`'s `Drop` scrub it the
         // instant this block ends -- immediately after wrap_dek is done
-        // with it, rather than at the end of run(), which would leave it
-        // sitting in memory, unused but unwiped, through the final file
+        // with it, rather than at the end of this function, which would
+        // leave it sitting in memory, unused but unwiped, through the file
         // write below. `load_dek` wipes the base64 text it read on the way
         // out, so no copy of that survives this line either.
-        let dek = load_dek(&args.dek_source)?;
-        wrap_dek(&service_c, &dek)?
+        let dek = load_dek(&dek_source)?;
+        wrap_dek(&service_c, &service_name, &dek)?
         // `dek`'s `Zeroizing` wrapper zeroes it here, as this block ends --
         // immediately after wrap_dek returns the wrapped (encrypted, no
         // longer secret) form, which is the only thing that survives past
         // this point.
     };
 
+    // Only now, with a complete wrapped payload in hand, replace the old
+    // file. Re-evaluated here rather than trusting the pre-check above, in
+    // case the file appeared in the meantime.
+    if path.exists() {
+        if !force {
+            return Err(format!("{key_file_path} already exists; pass --force|-f to overwrite"));
+        }
+        secure_delete(path)?;
+    }
+
     // `create_new` makes "does this file already exist" and "create it"
     // one indivisible kernel operation (the actual correctness guarantee
-    // against the exists-then-create race -- the `path.exists()` check
-    // above is purely a fail-fast convenience, not this guarantee), and
-    // `.mode(KEY_FILE_MODE)` sets the permissions at the moment of
-    // creation so there's no window where the file briefly exists with
-    // broader (umask-derived) permissions before being locked down after
-    // the fact. By the time this runs, `path` is always either brand new
-    // or was just deleted by `secure_delete` above, so `set_permissions`
-    // below is defense-in-depth against the umask, not strictly required.
+    // against the exists-then-create race), and `.mode(KEY_FILE_MODE)`
+    // sets the permissions at the moment of creation so there's no window
+    // where the file briefly exists with broader (umask-derived)
+    // permissions before being locked down after the fact. By the time
+    // this runs, `path` is always either brand new or was just deleted by
+    // `secure_delete` above, so `set_permissions` below is defense-in-depth
+    // against the umask, not strictly required.
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(KEY_FILE_MODE)
-        .open(&args.key_file_path)
+        .open(&key_file_path)
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
-                format!("{} already exists; pass --force|-f to overwrite", args.key_file_path)
+                format!("{key_file_path} already exists; pass --force|-f to overwrite")
             } else {
-                format!("failed to open {}: {e}", args.key_file_path)
+                format!("failed to open {key_file_path}: {e}")
             }
         })?;
     file.write_all(&wrapped)
-        .map_err(|e| format!("failed to write {}: {e}", args.key_file_path))?;
+        .map_err(|e| format!("failed to write {key_file_path}: {e}"))?;
     file.set_permissions(fs::Permissions::from_mode(KEY_FILE_MODE))
-        .map_err(|e| format!("failed to set permissions on {}: {e}", args.key_file_path))?;
+        .map_err(|e| format!("failed to set permissions on {key_file_path}: {e}"))?;
 
     println!(
-        "wrapped key written to {} ({} bytes, service \"{}\")",
-        args.key_file_path,
-        wrapped.len(),
-        args.service_name
+        "wrapped key written to {key_file_path} ({} bytes, service \"{service_name}\")",
+        wrapped.len()
     );
     Ok(())
+}
+
+fn run(command: Command) -> Result<(), String> {
+    match command {
+        Command::Provision { service_name } => run_provision(service_name),
+        Command::Wrap {
+            key_file_path,
+            service_name,
+            dek_source,
+            force,
+        } => run_wrap(key_file_path, service_name, dek_source, force),
+    }
 }
 
 fn main() -> ExitCode {
@@ -538,7 +656,7 @@ fn main() -> ExitCode {
             print_usage();
             ExitCode::SUCCESS
         }
-        Ok(ParseOutcome::Run(mut args)) => match run(&mut args) {
+        Ok(ParseOutcome::Run(command)) => match run(command) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -556,7 +674,27 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tempfile::NamedTempFile;
+
+    fn argv(parts: &[&str]) -> impl Iterator<Item = String> {
+        parts.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
+    }
+
+    // `ParseOutcome` has no `Debug` impl, so pull results out by matching.
+    fn expect_run(args: impl Iterator<Item = String>) -> Command {
+        match parse_args(args) {
+            Ok(ParseOutcome::Run(c)) => c,
+            Ok(ParseOutcome::Help) => panic!("expected Run, got Help"),
+            Err(e) => panic!("expected Run, got error: {e}"),
+        }
+    }
+    fn expect_parse_err(args: impl Iterator<Item = String>) -> String {
+        match parse_args(args) {
+            Err(e) => e,
+            Ok(_) => panic!("expected a parse error"),
+        }
+    }
 
     // `secure_delete`'s multi-pass overwrite content isn't observable from
     // outside the function by the time it returns (the file is gone by
@@ -612,69 +750,209 @@ mod tests {
         }
     }
 
+    // ---- subcommand parsing ----
+
     #[test]
-    fn parse_args_requires_service_name() {
-        let argv = ["prog", "key.bin", "--dek-stdin"].into_iter().map(String::from);
-        assert!(parse_args(argv).is_err());
+    fn parse_requires_a_subcommand() {
+        let err = expect_parse_err(argv(&["prog"]));
+        assert!(err.contains("provision") && err.contains("wrap"), "{err}");
+
+        let err = expect_parse_err(argv(&["prog", "frobnicate", "-sn", "svc"]));
+        assert!(err.contains("unknown subcommand"), "{err}");
     }
 
     #[test]
-    fn parse_args_accepts_stdin_and_file_sources() {
-        let argv = ["prog", "key.bin", "-sn", "svc", "--dek-stdin"].into_iter().map(String::from);
-        match parse_args(argv) {
-            Ok(ParseOutcome::Run(args)) => assert_eq!(args.dek_source, DekSource::Stdin),
-            _ => panic!("expected Run"),
+    fn parse_help_in_every_position() {
+        for args in [
+            vec!["prog", "--help"],
+            vec!["prog", "-h"],
+            vec!["prog", "help"],
+            vec!["prog", "provision", "--help"],
+            vec!["prog", "wrap", "-kf", "k", "-h"],
+        ] {
+            assert!(matches!(parse_args(argv(&args)), Ok(ParseOutcome::Help)), "{args:?}");
         }
+    }
 
-        let argv = ["prog", "key.bin", "-sn", "svc", "--dek-file", "/run/secrets/dek"]
-            .into_iter()
-            .map(String::from);
-        match parse_args(argv) {
-            Ok(ParseOutcome::Run(args)) => {
-                assert_eq!(args.dek_source, DekSource::File("/run/secrets/dek".to_string()));
+    #[test]
+    fn old_positional_key_file_form_is_rejected_with_a_pointer_to_the_new_flag() {
+        // The pre-subcommand invocation put the key file first. It must
+        // fail -- and say what to do instead -- rather than being read as
+        // a subcommand name.
+        let err = expect_parse_err(argv(&["prog", "key.bin", "-sn", "svc", "--dek-stdin"]));
+        assert!(err.contains("--key-file-path"), "{err}");
+
+        let err = expect_parse_err(argv(&["prog", "/var/lib/app/wrapped", "-sn", "svc", "--dek-stdin"]));
+        assert!(err.contains("--key-file-path"), "{err}");
+
+        // And a stray positional inside `wrap` is refused the same way.
+        let err = expect_parse_err(argv(&["prog", "wrap", "key.bin", "-sn", "svc", "--dek-stdin"]));
+        assert!(err.contains("--key-file-path"), "{err}");
+    }
+
+    #[test]
+    fn parse_provision() {
+        assert_eq!(
+            expect_run(argv(&["prog", "provision", "--service-name", "svc"])),
+            Command::Provision { service_name: "svc".to_string() }
+        );
+        assert_eq!(
+            expect_run(argv(&["prog", "provision", "-sn", "svc"])),
+            Command::Provision { service_name: "svc".to_string() }
+        );
+
+        let err = expect_parse_err(argv(&["prog", "provision"]));
+        assert!(err.contains("--service-name"), "{err}");
+        let err = expect_parse_err(argv(&["prog", "provision", "-sn", ""]));
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn provision_refuses_wrap_only_flags() {
+        for flag in [
+            vec!["--key-file-path", "k"],
+            vec!["-kf", "k"],
+            vec!["--dek-stdin"],
+            vec!["--dek-file", "/x"],
+            vec!["--force"],
+        ] {
+            let mut a = vec!["prog", "provision", "-sn", "svc"];
+            a.extend(flag.iter());
+            let err = expect_parse_err(argv(&a));
+            assert!(err.contains("belongs to `wrap`"), "{flag:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn parse_wrap_accepts_stdin_and_file_sources() {
+        match expect_run(argv(&["prog", "wrap", "-kf", "key.bin", "-sn", "svc", "--dek-stdin"])) {
+            Command::Wrap { key_file_path, service_name, dek_source, force } => {
+                assert_eq!(key_file_path, "key.bin");
+                assert_eq!(service_name, "svc");
+                assert_eq!(dek_source, DekSource::Stdin);
+                assert!(!force);
             }
-            _ => panic!("expected Run"),
+            other => panic!("expected Wrap, got {other:?}"),
+        }
+
+        match expect_run(argv(&[
+            "prog", "wrap", "--key-file-path", "key.bin", "--service-name", "svc", "--dek-file", "/run/secrets/dek", "--force",
+        ])) {
+            Command::Wrap { dek_source, force, .. } => {
+                assert_eq!(dek_source, DekSource::File("/run/secrets/dek".to_string()));
+                assert!(force);
+            }
+            other => panic!("expected Wrap, got {other:?}"),
         }
     }
 
     #[test]
-    fn parse_args_requires_exactly_one_dek_source() {
-        // None.
-        let argv = ["prog", "key.bin", "-sn", "svc"].into_iter().map(String::from);
-        assert!(parse_args(argv).is_err(), "a DEK source is mandatory");
+    fn parse_wrap_requires_key_file_service_and_exactly_one_dek_source() {
+        let err = expect_parse_err(argv(&["prog", "wrap", "-sn", "svc", "--dek-stdin"]));
+        assert!(err.contains("--key-file-path"), "{err}");
 
-        // Two -- rejected rather than last-one-wins, so an ambiguous
-        // invocation can't quietly wrap the wrong key.
-        let argv = ["prog", "key.bin", "-sn", "svc", "--dek-stdin", "--dek-file", "/x"]
-            .into_iter()
-            .map(String::from);
-        assert!(parse_args(argv).is_err());
+        let err = expect_parse_err(argv(&["prog", "wrap", "-kf", "k", "--dek-stdin"]));
+        assert!(err.contains("--service-name"), "{err}");
 
-        let argv = ["prog", "key.bin", "-sn", "svc", "--dek-file", "/x", "--dek-file", "/y"]
-            .into_iter()
-            .map(String::from);
-        assert!(parse_args(argv).is_err());
-    }
+        let err = expect_parse_err(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc"]));
+        assert!(err.contains("--dek-stdin"), "a DEK source is mandatory: {err}");
 
-    // `ParseOutcome` has no `Debug` impl (and `Args` deliberately doesn't
-    // grow one), so pull the error out by matching rather than unwrap_err.
-    fn expect_parse_err(args: impl Iterator<Item = String>) -> String {
-        match parse_args(args) {
-            Err(e) => e,
-            Ok(_) => panic!("expected a parse error"),
-        }
+        // Two sources -- rejected rather than last-one-wins, so an
+        // ambiguous invocation can't quietly wrap the wrong key.
+        assert!(parse_args(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-stdin", "--dek-file", "/x"])).is_err());
+        assert!(parse_args(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", "--dek-file", "/x", "--dek-file", "/y"])).is_err());
     }
 
     #[test]
-    fn parse_args_rejects_the_removed_dek_flag_with_an_explanation() {
+    fn parse_wrap_rejects_the_removed_dek_flag_with_an_explanation() {
         for flag in ["--dek", "-d"] {
-            let argv = ["prog", "key.bin", "-sn", "svc", flag, "AAAA"].into_iter().map(String::from);
-            let err = expect_parse_err(argv);
+            let err = expect_parse_err(argv(&["prog", "wrap", "-kf", "k", "-sn", "svc", flag, "AAAA"]));
             assert!(
                 err.contains("cmdline") && err.contains("--dek-stdin"),
                 "the error must explain why and point at the replacement, got: {err}"
             );
         }
+    }
+
+    // ---- provision / wrap against the real library, in-process ----
+
+    // Points the library at a policy that names Ephemeral (the only
+    // provider that can *create* a KEK without external state) and at no
+    // external-secret mount. Ephemeral keys are per-process, which is
+    // exactly right for an in-process test of the provision flow.
+    fn with_ephemeral_policy<F: FnOnce()>(f: F) {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = dir.path().join("policy.yaml");
+        fs::write(&policy, "selection:\n  mode: prefer\npreferred_order:\n  - external-secret\n  - ephemeral\n").unwrap();
+        std::env::set_var("HKDFGUARD_POLICY_FILE", &policy);
+        std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-hkdfguard-cli-test");
+        f();
+        std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
+        std::env::remove_var("HKDFGUARD_POLICY_FILE");
+    }
+
+    #[test]
+    #[serial]
+    fn provision_creates_then_reports_already_provisioned() {
+        // Pays the library's real setup-call floor (this binary links the
+        // library without cfg(test)): kek_exists + create_kek, then
+        // kek_exists again -- a few seconds, once.
+        with_ephemeral_policy(|| {
+            let service = "com.hkdfguard.clitest.provision".to_string();
+            run_provision(service.clone()).expect("first provision must create the KEK");
+            run_provision(service).expect("second provision must be a no-op success");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn wrap_without_a_provisioned_kek_fails_with_the_provision_hint_and_touches_nothing() {
+        with_ephemeral_policy(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let key_path = dir.path().join("wrapped.key");
+            fs::write(&key_path, b"the key file that was already here").unwrap();
+
+            let dek_path = dir.path().join("dek.b64");
+            fs::write(&dek_path, STANDARD.encode([0x5au8; DEK_LEN])).unwrap();
+            fs::set_permissions(&dek_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+            // --force is given, and the KEK is missing: the old file must
+            // survive, because the wrap fails before it is ever touched.
+            let err = run_wrap(
+                key_path.to_str().unwrap().to_string(),
+                "com.hkdfguard.clitest.neverprovisioned".to_string(),
+                DekSource::File(dek_path.to_str().unwrap().to_string()),
+                true,
+            )
+            .unwrap_err();
+            assert!(err.contains("provision --service-name"), "must point at the fix: {err}");
+            assert_eq!(fs::read(&key_path).unwrap(), b"the key file that was already here");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn provision_then_wrap_round_trip_in_process() {
+        with_ephemeral_policy(|| {
+            let service = "com.hkdfguard.clitest.roundtrip".to_string();
+            run_provision(service.clone()).unwrap();
+
+            let dir = tempfile::tempdir().unwrap();
+            let key_path = dir.path().join("wrapped.key");
+            let dek_path = dir.path().join("dek.b64");
+            fs::write(&dek_path, STANDARD.encode([0x5au8; DEK_LEN])).unwrap();
+            fs::set_permissions(&dek_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+            run_wrap(
+                key_path.to_str().unwrap().to_string(),
+                service,
+                DekSource::File(dek_path.to_str().unwrap().to_string()),
+                false,
+            )
+            .unwrap();
+            assert!(key_path.exists());
+            assert_eq!(fs::metadata(&key_path).unwrap().permissions().mode() & 0o777, KEY_FILE_MODE);
+        });
     }
 
     // ---- DEK decoding ----
