@@ -277,13 +277,15 @@ All of the below has actually been run, in Docker on Debian bookworm/aarch64
 |---|---|---|---|
 | `external-secret`, `ephemeral` (default) | yes | yes -- verified | unit tests pass; full wrap/unwrap round trip through the compiled C ABI (`examples/wrap_unwrap.c`) verified |
 | `pkcs11` | yes (build-only; no module to talk to) | yes -- verified, linked against real `cryptoki` 0.6.2 + `libsofthsm2.so` | `#[ignore]`d tests pass against a real SoftHSM2 token: `C_GenerateKeyPair` + `CKM_ECDH1_DERIVE` executed for real, same key reproduced deterministically, and `CKM_ECDH1_DERIVE` against the fixed point `H` accepted |
-| `tpm2` | **no** -- `tss-esapi-sys` ships pregenerated bindings only for specific Linux target tuples and hard-fails on macOS/aarch64 | yes -- verified, linked against real `libtss2-esys` 3.2.1 | The `#[ignore]`d conformance suite passes against a real `swtpm` instance: `TPM2_CreatePrimary` determinism and per-service uniqueness, the client-side Name formula matching the TPM's own, `TPM2_ECDH_ZGen` against `H`, the derivation secret genuinely changing the derived key, and salted/parameter-encrypted sessions producing the same `Z` as plain ones |
+| `tpm2` | **no** -- `tss-esapi-sys` ships pregenerated bindings only for specific Linux target tuples and hard-fails on macOS/aarch64 | yes -- verified, linked against real `libtss2-esys` 3.2.1 | The `#[ignore]`d conformance suite passes against a real `swtpm` instance: `TPM2_CreatePrimary` determinism and per-service uniqueness, the client-side Name formula matching the TPM's own, `TPM2_ECDH_ZGen` against `H`, the derivation secret genuinely changing the derived key, and salted/parameter-encrypted sessions producing the same `Z` as plain ones. The same suite, plus the reboot-persistence check, has also been run via `scripts/native-tpm-test.sh` against real firmware TPMs: **Intel PTT** and **AMD fTPM** |
 
-Neither hardware provider has been exercised by this repo's maintainers
-against a physical TPM chip, an fTPM, or a hardware HSM/YubiHSM -- only
-their software-simulated equivalents (`swtpm`, SoftHSM2).
-`scripts/native-tpm-test.sh` (next section) exists precisely so you can
-run the same matrix on your real hardware before depending on it.
+The TPM provider has been verified against `swtpm` and against two real
+firmware TPMs, Intel PTT and AMD fTPM. It has **not** been exercised
+against a discrete TPM chip (e.g. Infineon or Nuvoton) or against a
+hardware HSM/YubiHSM -- the PKCS#11 provider has only ever been run
+against SoftHSM2. `scripts/native-tpm-test.sh` (next section) exists
+precisely so you can run the same matrix on your own hardware, including
+a discrete chip, before depending on it.
 
 Run the ignored hardware/module tests yourself once you have the real backend:
 
@@ -294,8 +296,13 @@ cargo test --features pkcs11 -- --ignored   # needs SoftHSM2 or another PKCS#11 
 
 ### Testing on a native Linux TPM (Intel PTT / AMD fTPM / discrete)
 
-Docker proves the code against `swtpm`. To prove it against the hardware
-you will actually deploy on:
+Docker proves the code against `swtpm`. This repo's maintainers have run
+the scripts below to completion, including reboot persistence, on real
+**Intel PTT** and **AMD fTPM** firmware TPMs. A **discrete** TPM (e.g.
+Infineon, Nuvoton) has not yet been tested -- the code path exists (see
+the known limitation on parameter encryption below) but is unverified
+against real discrete hardware. To prove it against the hardware you
+will actually deploy on:
 
 ```sh
 scripts/native-tpm-preflight.sh   # read-only: device access, tpm2-tools, libtss2-esys, vendor
@@ -498,11 +505,11 @@ its default.
 ## Design decisions worth knowing
 
 - **Wire format is hand-rolled, not `serde`+`bincode`.** The wrapped
-  payload ([`src/payload.rs`](src/payload.rs)) is a security-critical,
-  cross-language, cross-version format the macOS and Windows
-  implementations must also be able to parse; every field width and order
-  is pinned explicitly rather than left to a serialization library's
-  derive output.
+  payload ([`src/payload.rs`](src/payload.rs)) is security-critical: it
+  is the AAD input as well as the on-disk layout, so every field width
+  and order is pinned explicitly rather than left to a serialization
+  library's derive output, which could silently change across a
+  dependency bump. 
 - **Pure-Rust crypto (`p256`/`hkdf`/`aes-gcm`), not OpenSSL**, for the
   protocol itself. No system OpenSSL version skew across distros, trivial
   static linking (`libHkdfGuardKeyProtectionLinux.a`), and RustCrypto's P-256/HKDF-SHA512/

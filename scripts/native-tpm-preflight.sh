@@ -122,6 +122,7 @@ if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists tss2-esys 2>/dev
     ok "libtss2-esys $(pkg-config --modversion tss2-esys) (tss-esapi-sys links against this)"
 else
     fail "libtss2-esys development files not found (Debian/Ubuntu: libtss2-dev; Fedora: tpm2-tss-devel). The tpm2 feature cannot build without them"
+    fail "if you have installed, please also verify the pkg-config package is installed (pkgconf)"
 fi
 
 # ---- optional: PKCS#11 ----

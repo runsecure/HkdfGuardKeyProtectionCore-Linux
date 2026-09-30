@@ -1,0 +1,137 @@
+# Builds and tests HKDFGuard for linux/x86_64 and linux/aarch64, each on a
+# *native* runner (no QEMU), inside the same docker/Dockerfile image that
+# docker/run-tests.sh and docker/build-dist.sh use locally -- so CI builds
+# exactly what a developer builds, against Debian bookworm's glibc 2.36 and
+# libtss2-esys.
+#
+# Per architecture:
+#   1. docker/entrypoint-test.sh  -- the full matrix, including the TPM
+#      conformance suite against swtpm and PKCS#11 against SoftHSM2. A
+#      binary is never published for an architecture where this fails.
+#   2. docker/entrypoint-build.sh -- release build (--all-features) and
+#      artifact collection.
+#   3. Package as hkdfguard-<version>-linux-<arch>.tar.gz with a SHA-256.
+#
+# On a `v*` tag, a release job attaches both archives to a GitHub Release.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The image (apt packages + rustup) is the slow part and rarely
+      # changes; cache its layers per architecture.
+      - name: Build the build/test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          tags: hkdfguard-ci:${{ matrix.arch }}
+          load: true
+          cache-from: type=gha,scope=hkdfguard-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=hkdfguard-${{ matrix.arch }}
+
+      - name: Full test matrix (swtpm + SoftHSM2)
+        run: docker run --rm hkdfguard-ci:${{ matrix.arch }}
+
+      - name: Release build
+        run: |
+          mkdir -p dist
+          docker run --rm \
+            -v "$PWD/dist:/dist" \
+            --entrypoint docker/entrypoint-build.sh \
+            hkdfguard-ci:${{ matrix.arch }}
+
+      - name: Verify architecture of the produced binaries
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" dist
+          case "${{ matrix.arch }}" in
+            x86_64)  want='x86-64' ;;
+            aarch64) want='ARM aarch64' ;;
+          esac
+          for f in dist/libHkdfGuardKeyProtectionLinux.so dist/hkdfguard-v1-initialize; do
+            file "$f"
+            file "$f" | grep -q "$want" || { echo "::error::$f is not $want"; exit 1; }
+          done
+
+      - name: Package
+        id: package
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="$(git rev-parse --short HEAD)"
+          fi
+          name="hkdfguard-${version}-linux-${{ matrix.arch }}"
+          mkdir -p "pkg/$name/lib" "pkg/$name/bin" "pkg/$name/include"
+          cp dist/libHkdfGuardKeyProtectionLinux.so dist/libHkdfGuardKeyProtectionLinux.a "pkg/$name/lib/"
+          # The project's release artifact name (see scripts/build-release.sh).
+          cp dist/libHkdfGuardKeyProtectionLinux.so "pkg/$name/lib/HkdfGuard.Kms.Linux.v1.so"
+          cp dist/hkdfguard-v1-initialize "pkg/$name/bin/"
+          cp dist/hkdfguard.h "pkg/$name/include/"
+          cp README.md "pkg/$name/"
+          tar -C pkg -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          cat "$name.tar.gz.sha256"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            ${{ steps.package.outputs.name }}.tar.gz
+            ${{ steps.package.outputs.name }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.tar.gz.sha256
+          generate_release_notes: true
