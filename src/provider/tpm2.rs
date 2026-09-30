@@ -1125,11 +1125,10 @@ mod tests {
     fn absent_secret_is_an_error_when_policy_requires_one() {
         let dir = tempfile::tempdir().unwrap();
         let policy = dir.path().join("policy.yaml");
-        std::fs::write(
+        crate::secure_file::write_world_readable_for_tests(
             &policy,
             "selection:\n  mode: require\n  provider: tpm2\ntpm:\n  require_derivation_secret: true\n",
-        )
-        .unwrap();
+        );
         std::env::set_var("HKDFGUARD_POLICY_FILE", &policy);
         let result = with_no_secret_file(read_derivation_secret);
         std::env::remove_var("HKDFGUARD_POLICY_FILE");
@@ -1738,7 +1737,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
 
-        std::fs::write(&path, policy_for(&real)).unwrap();
+        crate::secure_file::write_world_readable_for_tests(&path, policy_for(&real));
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
         with_tpm_context(|ctx| {
             let key = create_session_salt_key(ctx)?;
@@ -1747,7 +1746,7 @@ mod tests {
         })
         .expect("a correctly pinned salt key must load");
 
-        std::fs::write(&path, policy_for(&hex(&wrong))).unwrap();
+        crate::secure_file::write_world_readable_for_tests(&path, policy_for(&hex(&wrong)));
         let refused = with_tpm_context(|ctx| create_session_salt_key(ctx).map(|k| { let _ = ctx.flush_context(k.into()); }));
         std::env::remove_var("HKDFGUARD_POLICY_FILE");
         assert!(refused.is_err(), "a salt key whose Name doesn't match the pin must be refused");
@@ -1787,11 +1786,10 @@ mod tests {
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
-        std::fs::write(
+        crate::secure_file::write_world_readable_for_tests(
             &path,
             format!("selection:\n  mode: require\n  provider: tpm2\ntpm:\n  session_encryption: required\n  pinned_session_salt_key_name: \"{real}\"\n"),
-        )
-        .unwrap();
+        );
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
         let required = with_tpm_context(session_encryption_enabled).unwrap();
         // And the full production path -- load_kek + ecdh -- works under it.
@@ -1844,13 +1842,12 @@ mod tests {
     fn with_pinned_name<T>(service: &str, name_hex: &str, f: impl FnOnce() -> T) -> T {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
-        std::fs::write(
+        crate::secure_file::write_world_readable_for_tests(
             &path,
             format!(
                 "selection:\n  mode: require\n  provider: tpm2\ntpm:\n  pinned_names:\n    {service}: \"{name_hex}\"\n"
             ),
-        )
-        .unwrap();
+        );
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
         let result = f();
         std::env::remove_var("HKDFGUARD_POLICY_FILE");

@@ -736,11 +736,10 @@ mod ffi_tests {
         std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-for-tests");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
-        std::fs::write(
+        crate::secure_file::write_world_readable_for_tests(
             &path,
             "selection:\n  mode: prefer\npreferred_order:\n  - ephemeral\nstartup_behavior:\n  setup_min_delay_ms: 80\n",
-        )
-        .unwrap();
+        );
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
 
         with_setup_delay(None, || {

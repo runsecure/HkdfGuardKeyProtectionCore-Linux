@@ -156,6 +156,18 @@ impl Drop for SecretBuffer {
     }
 }
 
+/// Test-only: writes `contents` to `path` and pins its mode to `0o644`,
+/// rather than trusting the umask to leave it non-group/other-writable.
+/// A permissive umask (some distros default to `002`) would otherwise
+/// produce a `664` file that `check_owner_and_mode`'s
+/// `FORBID_GROUP_OTHER_WRITE` correctly refuses -- breaking every fixture
+/// that writes a policy/config file it expects to load successfully.
+#[cfg(test)]
+pub(crate) fn write_world_readable_for_tests(path: &std::path::Path, contents: impl AsRef<[u8]>) {
+    std::fs::write(path, contents).unwrap();
+    std::fs::set_permissions(path, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644)).unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

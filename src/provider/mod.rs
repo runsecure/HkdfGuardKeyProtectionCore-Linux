@@ -635,7 +635,7 @@ mod tests {
     // and everything in it, at the end of that statement).
     fn write_policy(yaml: &str) -> tempfile::TempDir {
         let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("policy.yaml"), yaml).unwrap();
+        crate::secure_file::write_world_readable_for_tests(&dir.path().join("policy.yaml"), yaml);
         std::env::set_var("HKDFGUARD_POLICY_FILE", dir.path().join("policy.yaml"));
         dir
     }

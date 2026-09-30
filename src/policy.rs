@@ -762,11 +762,10 @@ pub(crate) fn pinned_session_salt_key_name() -> Result<Option<Vec<u8>>> {
 pub(crate) fn allow_ephemeral_policy_for_tests() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("policy.yaml");
-    std::fs::write(
+    crate::secure_file::write_world_readable_for_tests(
         &path,
         "selection:\n  mode: prefer\npreferred_order:\n  - external-secret\n  - ephemeral\n",
-    )
-    .unwrap();
+    );
     std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
     dir
 }
@@ -788,11 +787,10 @@ pub(crate) fn allow_ephemeral_policy_for_tests() -> tempfile::TempDir {
 pub(crate) fn require_provider_policy_for_tests(provider: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("policy.yaml");
-    std::fs::write(
+    crate::secure_file::write_world_readable_for_tests(
         &path,
         format!("selection:\n  mode: require\n  provider: {provider}\n"),
-    )
-    .unwrap();
+    );
     std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
     dir
 }
@@ -1149,7 +1147,7 @@ mod tests {
     fn setup_min_delay_helper_reads_the_configured_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
-        std::fs::write(&path, "selection:\n  mode: require\n  provider: tpm2\nstartup_behavior:\n  setup_min_delay_ms: 42\n").unwrap();
+        crate::secure_file::write_world_readable_for_tests(&path, "selection:\n  mode: require\n  provider: tpm2\nstartup_behavior:\n  setup_min_delay_ms: 42\n");
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
         let delay = setup_min_delay();
         std::env::remove_var("HKDFGUARD_POLICY_FILE");
@@ -1163,7 +1161,7 @@ mod tests {
         // (the gated call fails closed on the same policy regardless).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
-        std::fs::write(&path, "selection:\n  mode: require\nstartup_behavior:\n  setup_min_delay_ms: 0\n").unwrap();
+        crate::secure_file::write_world_readable_for_tests(&path, "selection:\n  mode: require\nstartup_behavior:\n  setup_min_delay_ms: 0\n");
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
         let delay = setup_min_delay();
         std::env::remove_var("HKDFGUARD_POLICY_FILE");
@@ -1257,7 +1255,7 @@ mod tests {
         // rather than reporting "nothing pinned".
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
-        std::fs::write(&path, "selection:\n  mode: require\n").unwrap(); // missing `provider`
+        crate::secure_file::write_world_readable_for_tests(&path, "selection:\n  mode: require\n"); // missing `provider`
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
         let required = require_tpm_derivation_secret();
         let pinned = pinned_tpm_name("com.company.orders");
@@ -1271,11 +1269,10 @@ mod tests {
     fn tpm_helpers_read_the_configured_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
-        std::fs::write(
+        crate::secure_file::write_world_readable_for_tests(
             &path,
             format!("selection:\n  mode: require\n  provider: tpm2\ntpm:\n  require_derivation_secret: true\n  pinned_names:\n    com.company.orders: \"{A_NAME}\"\n"),
-        )
-        .unwrap();
+        );
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
         let required = require_tpm_derivation_secret();
         let pinned = pinned_tpm_name("com.company.orders");
@@ -1360,7 +1357,7 @@ mod tests {
         // Broken policy: required (never "off"), and pinning errors.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
-        std::fs::write(&path, "selection:\n  mode: require\ntpm:\n  session_encryption: off\n").unwrap();
+        crate::secure_file::write_world_readable_for_tests(&path, "selection:\n  mode: require\ntpm:\n  session_encryption: off\n");
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
         let mode = tpm_session_encryption();
         let pin = pinned_session_salt_key_name();
@@ -1384,7 +1381,7 @@ mod tests {
     fn load_reads_and_validates_the_configured_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
-        std::fs::write(&path, "selection:\n  mode: require\n  provider: tpm2\n").unwrap();
+        crate::secure_file::write_world_readable_for_tests(&path, "selection:\n  mode: require\n  provider: tpm2\n");
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
 
         match load() {
@@ -1402,7 +1399,7 @@ mod tests {
     fn load_fails_closed_on_a_malformed_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
-        std::fs::write(&path, "selection:\n  mode: require\n").unwrap(); // missing required `provider`
+        crate::secure_file::write_world_readable_for_tests(&path, "selection:\n  mode: require\n"); // missing required `provider`
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
 
         match load() {
@@ -1467,7 +1464,7 @@ mod tests {
     fn load_fails_closed_on_an_oversized_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.yaml");
-        std::fs::write(&path, vec![b'#'; MAX_POLICY_FILE_LEN + 1]).unwrap();
+        crate::secure_file::write_world_readable_for_tests(&path, vec![b'#'; MAX_POLICY_FILE_LEN + 1]);
         assert_load_fails_closed(&path, "an oversized policy must be rejected, not truncated");
     }
 }

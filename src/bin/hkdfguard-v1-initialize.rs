@@ -884,6 +884,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let policy = dir.path().join("policy.yaml");
         fs::write(&policy, "selection:\n  mode: prefer\npreferred_order:\n  - external-secret\n  - ephemeral\n").unwrap();
+        fs::set_permissions(&policy, fs::Permissions::from_mode(0o644)).unwrap(); // not the umask: some distros default to 002 (group-writable), which the policy loader correctly refuses
         std::env::set_var("HKDFGUARD_POLICY_FILE", &policy);
         std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-hkdfguard-cli-test");
         f();

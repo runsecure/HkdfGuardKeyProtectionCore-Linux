@@ -50,6 +50,24 @@ else
     fi
 fi
 
+# ---- tss group membership ----
+# The udev rules shipped by tpm2-tools/libtss2-dev typically grant rw on
+# /dev/tpm* to group 'tss' rather than the world, so this is the intended
+# way to reach the device without root. `usermod -aG` only takes effect on
+# the next login, so a user just added to the group won't see it in their
+# *current* session's group list yet -- check both to catch that case.
+if getent group tss >/dev/null 2>&1; then
+    if id -nG | tr ' ' '\n' | grep -qx tss; then
+        ok "user $(id -un) is in the 'tss' group (active in this session)"
+    elif getent group tss | cut -d: -f4 | tr ',' '\n' | grep -qx "$(id -un)"; then
+        warn "$(id -un) is in the 'tss' group in /etc/group, but this session predates it; log out and back in (or run 'newgrp tss') for it to take effect"
+    else
+        warn "$(id -un) is not in the 'tss' group; if the TPM device isn't otherwise accessible, run 'sudo usermod -aG tss $(id -un)' and log in again"
+    fi
+else
+    warn "no 'tss' group on this system; TPM device access will rely on other permissions (e.g. running as root)"
+fi
+
 # ---- tpm2-tools ----
 if command -v tpm2_getcap >/dev/null 2>&1; then
     ok "tpm2-tools: $(tpm2_getcap --version 2>/dev/null | head -n1 || echo present)"
