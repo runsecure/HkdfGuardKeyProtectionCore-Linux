@@ -7,6 +7,12 @@ use std::os::raw::c_int;
 use std::os::unix::fs::PermissionsExt;
 use HkdfGuardKeyProtectionLinux::{hkdfguard_harden_process, hkdfguard_unwrap_dek, hkdfguard_wrap_dek, status};
 
+// Only this user can write to it, whatever the umask: the library refuses
+// to trust a policy or secret mount in a group-writable directory.
+fn private_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap()
+}
+
 #[test]
 fn hardening_takes_effect_and_the_library_still_works_afterwards() {
     assert_eq!(hkdfguard_harden_process(), status::OK);
@@ -27,13 +33,13 @@ fn hardening_takes_effect_and_the_library_still_works_afterwards() {
     // A non-dumpable process loses some /proc/<pid> access. The
     // external-secret provider re-checks an opened descriptor through
     // /proc/self/fd, so prove a full wrap/unwrap through it still works.
-    let mount = tempfile::tempdir().unwrap();
+    let mount = private_tempdir();
     let service = "com.company.hardened";
     let key_path = mount.path().join(service);
     std::fs::write(&key_path, p256::SecretKey::random(&mut rand_core::OsRng).to_bytes()).unwrap();
     std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-    let policy_dir = tempfile::tempdir().unwrap();
+    let policy_dir = private_tempdir();
     let policy = policy_dir.path().join("policy.toml");
     std::fs::write(&policy, "[selection]\nmode = \"require\"\nprovider = \"external-secret\"\n").unwrap();
     std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o644)).unwrap();

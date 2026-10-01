@@ -414,7 +414,6 @@ pub fn get_by_type(provider_type: ProviderType) -> Result<Arc<dyn KekProvider>> 
 mod tests {
     use super::*; // bring `ProviderType` etc. into scope
     use serial_test::serial;
-    use tempfile::tempdir;
 
     // Points HKDFGUARD_POLICY_FILE somewhere guaranteed not to exist, so
     // tests that don't care about policy behavior aren't accidentally
@@ -518,7 +517,7 @@ mod tests {
 
             let _policy = crate::policy::allow_ephemeral_policy_for_tests(); // the billing fall-through below needs Ephemeral opted in
 
-            let ext_dir = tempdir().unwrap();
+            let ext_dir = crate::secure_file::private_tempdir();
             std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", ext_dir.path());
 
             // Write an external secret for "com.company.orders", owner-only
@@ -597,7 +596,7 @@ mod tests {
             // wins the chain and the assertions below compare the wrong
             // provider.
             let _policy = crate::policy::require_provider_policy_for_tests("external-secret");
-            let ext_dir = tempdir().unwrap();
+            let ext_dir = crate::secure_file::private_tempdir();
             std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", ext_dir.path());
 
             // external-secret never creates a key itself, so both
@@ -659,10 +658,10 @@ mod tests {
     // Writes `doc` to a fresh temp file and points HKDFGUARD_POLICY_FILE
     // at it, returning the owning `TempDir` -- callers must keep that
     // binding alive for as long as the policy file needs to exist (an
-    // unbound `tempdir().unwrap().path().join(...)` drops the directory,
+    // unbound `crate::secure_file::private_tempdir().path().join(...)` drops the directory,
     // and everything in it, at the end of that statement).
     fn write_policy(doc: &str) -> tempfile::TempDir {
-        let dir = tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         crate::secure_file::write_world_readable_for_tests(&dir.path().join("policy.toml"), doc);
         std::env::set_var("HKDFGUARD_POLICY_FILE", dir.path().join("policy.toml"));
         dir
@@ -716,7 +715,7 @@ mod tests {
     fn policy_prefer_mode_falls_through_unreachable_providers_to_a_reachable_one() {
         #[cfg(all(feature = "pkcs11", feature = "external-secret"))]
         {
-            let ext_dir = tempdir().unwrap();
+            let ext_dir = crate::secure_file::private_tempdir();
             std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", ext_dir.path()); // reachable
 
             // Pre-provision the external secret so it's actually usable
@@ -833,7 +832,7 @@ mod tests {
     // a hard provider failure ("permissions too broad"), not a soft decline.
     fn mount_with_untrusted_secret(service: &str) -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         let path = dir.path().join(service);
         std::fs::write(&path, p256::SecretKey::random(&mut rand_core::OsRng).to_bytes()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();

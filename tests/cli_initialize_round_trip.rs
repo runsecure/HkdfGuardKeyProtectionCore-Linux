@@ -31,7 +31,12 @@ use std::os::raw::c_int;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use tempfile::tempdir;
+// Only this user can write to it, whatever the umask: the library refuses
+// to trust a policy or secret mount in a group-writable directory, and
+// `tempfile::tempdir()` creates `0777 & !umask`.
+fn tempdir() -> std::io::Result<tempfile::TempDir> {
+    tempfile::Builder::new().permissions(fs::Permissions::from_mode(0o700)).tempdir()
+}
 use HkdfGuardKeyProtectionLinux::{hkdfguard_unwrap_dek, status};
 
 // Points the external-secret provider at a fresh temp directory, isolated

@@ -28,6 +28,11 @@
 //!   key is refused, and refused loudly: it is reported as an error, never
 //!   as "not provisioned", so a misconfigured mount can't silently fall
 //!   through to a weaker provider.
+//! - **In a mount nobody else can write to.** The mount directory and
+//!   every directory above it must be owned by root or this process's user
+//!   and not writable by group or others (sticky ancestors and read-only
+//!   mounts, such as a Kubernetes Secret volume, are fine). Otherwise
+//!   another user could plant a KEK for a not-yet-provisioned service.
 //! - **A regular file.** Not a directory, device, or FIFO (which would
 //!   block the read forever).
 //! - **Resolves to a path inside the mount.** Symlinks are followed --
@@ -217,6 +222,7 @@ const SECRET_FILE_REQUIREMENTS: FileRequirements = FileRequirements {
     owner: Some(Owner::RootOrCurrentUser),
     forbidden_mode_bits: FORBID_GROUP_OTHER_ACCESS,
     follow_symlinks: false, // applied to the already-resolved path; see below
+    allow_group_read_if_root_owned: false,
 };
 
 /// Resolves `<mount>/<service>` to the real file it names, refuses the
@@ -236,8 +242,10 @@ const SECRET_FILE_REQUIREMENTS: FileRequirements = FileRequirements {
 /// instead of being followed. On Linux the descriptor's own path is then
 /// read back from `/proc/self/fd` and re-checked against the mount, which
 /// also covers an intermediate directory being swapped. (Doing that
-/// requires write access to a root-owned mount directory -- i.e. root --
-/// but the check is one `readlink`, and it turns a race into a detection.)
+/// requires write access to the mount or a directory above it, which
+/// [`crate::secure_file::check_dir_chain`] has already confined to root and
+/// the service's own uid -- but the check is one `readlink`, and it turns a
+/// race into a detection.)
 ///
 /// Only `NotFound` means "nothing provisioned"; every other failure means
 /// "something is there and it is not acceptable".
@@ -245,6 +253,11 @@ fn open_secret_within_mount(mount: &Path, service: &str) -> std::io::Result<File
     use std::io::{Error as IoError, ErrorKind};
 
     let mount_real = std::fs::canonicalize(mount)?;
+    // A mount others can write to would let them plant a KEK for a service
+    // not provisioned yet -- which `create_kek` would then adopt, leaving
+    // them holding the key to everything wrapped under it. The service's
+    // own uid may own it: that uid can read every KEK here anyway.
+    crate::secure_file::check_dir_chain(&mount_real, Owner::RootOrCurrentUser)?;
     let target_real = std::fs::canonicalize(mount.join(service))?; // NotFound if nothing is provisioned; follows a symlink chain
 
     if !target_real.starts_with(&mount_real) {
@@ -325,12 +338,11 @@ mod tests {
     use rand_core::OsRng; // used to generate test keys
     use serial_test::serial; // these tests mutate a shared env var, so they must not run concurrently
     use std::os::unix::fs::PermissionsExt;
-    use tempfile::tempdir; // throwaway directory for each test
 
     // Runs `f` against a provider pointed at a fresh temp directory acting
     // as the "mounted secret" location.
     fn with_dir<F: FnOnce(&ExternalSecretProvider, &Path)>(f: F) {
-        let dir = tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", dir.path()); // redirect this provider at the temp dir
         let provider = ExternalSecretProvider::new();
         f(&provider, dir.path());
@@ -437,7 +449,7 @@ mod tests {
             // mount directory: it would pass every per-file check, so the
             // containment rule is the only thing standing between a
             // planted link and an attacker-chosen KEK.
-            let outside = tempdir().unwrap();
+            let outside = crate::secure_file::private_tempdir();
             let secret_key = SecretKey::random(&mut OsRng);
             let real_path = provision(outside.path(), "real-secret", secret_key.to_bytes());
             std::os::unix::fs::symlink(&real_path, dir.join("com.company.orders")).unwrap();
@@ -478,6 +490,27 @@ mod tests {
                 assert!(provider.kek_exists("com.company.orders").unwrap(), "mode {mode:o}");
                 provider.load_kek("com.company.orders", true).unwrap();
             }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn refuses_a_mount_others_can_write_to() {
+        with_dir(|provider, dir| {
+            let secret_key = SecretKey::random(&mut OsRng);
+            provision(dir, "com.company.orders", secret_key.to_bytes());
+            provider.load_kek("com.company.orders", false).unwrap();
+
+            for mode in [0o777u32, 0o770, 0o1777] {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+                match provider.load_kek("com.company.orders", false) {
+                    Err(Error::Provider(msg)) => assert!(msg.contains("writable by group or others"), "mode {mode:o}: {msg}"),
+                    Err(other) => panic!("mode {mode:o}: expected Provider(..writable..), got {other:?}"),
+                    Ok(_) => panic!("mode {mode:o}: a KEK from a mount others can write to must be refused"),
+                }
+                assert!(provider.kek_exists("com.company.orders").is_err(), "mode {mode:o}: an error, not absence");
+            }
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         });
     }
 
@@ -560,9 +593,9 @@ mod tests {
     #[test]
     #[serial]
     fn policy_dir_wins_over_the_environment_and_has_no_fallback() {
-        let policy_mount = tempdir().unwrap();
-        let env_mount = tempdir().unwrap();
-        let policy_dir = tempdir().unwrap();
+        let policy_mount = crate::secure_file::private_tempdir();
+        let env_mount = crate::secure_file::private_tempdir();
+        let policy_dir = crate::secure_file::private_tempdir();
         let policy = policy_dir.path().join("policy.toml");
         crate::secure_file::write_world_readable_for_tests(
             &policy,

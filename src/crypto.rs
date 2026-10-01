@@ -323,7 +323,6 @@ mod tests {
     use super::*; // bring `wrap`, `unwrap`, `DEK_LEN`, etc. into scope
     use p256::SecretKey; // test-only: stands in for an attacker scalar and for fingerprint fixtures
     use serial_test::serial; // these tests mutate shared env vars, so they must run one at a time
-    use tempfile::tempdir; // throwaway directory for the external-secret provider's mount, in the rotation test
 
     // Disables the external-secret provider and writes a policy that
     // explicitly opts Ephemeral in, so every test in this module
@@ -837,7 +836,7 @@ mod tests {
             // reachable TPM/PKCS#11 device would win the chain and there
             // would be nothing for the rotation below to rotate.
             let _policy = crate::policy::require_provider_policy_for_tests("external-secret");
-            let ext_dir = tempdir().unwrap();
+            let ext_dir = crate::secure_file::private_tempdir();
             std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", ext_dir.path());
             let service = "com.company.rotated";
             let secret_path = ext_dir.path().join(service);

@@ -831,7 +831,7 @@ mod ffi_tests {
         // With the test override cleared, the floor comes from the same
         // policy file that names the providers -- exactly as in production.
         std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-for-tests");
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         let path = dir.path().join("policy.toml");
         crate::secure_file::write_world_readable_for_tests(
             &path,
@@ -1595,7 +1595,7 @@ mod ffi_tests {
         // TPM/PKCS#11 device would win the chain and there would be
         // nothing for the rotation below to rotate.
         let _policy = policy::require_provider_policy_for_tests("external-secret");
-        let ext_dir = tempfile::tempdir().unwrap();
+        let ext_dir = crate::secure_file::private_tempdir();
         std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", ext_dir.path());
         let service_str = "com.company.rotated";
         let secret_path = ext_dir.path().join(service_str);

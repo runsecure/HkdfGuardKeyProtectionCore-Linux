@@ -25,8 +25,9 @@
 //!   builds fall back to common SoftHSM2 install paths; release builds
 //!   don't, because SoftHSM2 is a software token that would otherwise be
 //!   picked up -- and counted as hardware -- just for being installed. The
-//!   (symlink-resolved) module file and its directory must be owned by root
-//!   and not writable by group or others -- see [`validate_module_path`]:
+//!   (symlink-resolved) module file, its directory, and every directory
+//!   above it must be owned by root and not writable by group or others
+//!   (sticky ancestors excepted) -- see [`validate_module_path`]:
 //!   the module is `dlopen`ed into this process.
 //! - `token_label` / `token_serial`: which token to use, among initialized
 //!   ones. Exactly one must match. With neither set, there must be exactly
@@ -34,8 +35,9 @@
 //!   because they can change across reboots and hot-plugging; the debug-only
 //!   [`HKDFGUARD_PKCS11_SLOT`] index remains for tests.
 //! - `pin_file` [`HKDFGUARD_PKCS11_PIN_FILE`]: the user-PIN file (default
-//!   `/etc/hkdfguard/pkcs11.pin`). Owned by root or this process's user,
-//!   no access at all for group or others (e.g. `0600`/`0400`); one
+//!   `/etc/hkdfguard/pkcs11.pin`). Owned by root, no access for others,
+//!   group read allowed (`0400`, or `root:<service-group> 0440` for a
+//!   non-root service), in directories only root can change; one
 //!   trailing newline is ignored. The PIN itself is never read from the
 //!   environment (`/proc/<pid>/environ` is readable by same-user processes
 //!   and inherited by children); the retired `HKDFGUARD_PKCS11_PIN` is
@@ -171,22 +173,24 @@ fn select_token(
 }
 
 /// Checks a PKCS#11 module path before it's ever `dlopen`ed: it must be
-/// absolute, and after resolving symlinks, both the module file and its
-/// containing directory must be owned by root and not writable by group
-/// or others. Returns the canonical (symlink-resolved) path -- the one
-/// that was actually checked -- so that's exactly what gets loaded.
+/// absolute, and after resolving symlinks, the module file must be owned
+/// by root and not writable by group or others, and so must its directory
+/// and every directory above it (see [`crate::secure_file::check_dir_chain`]).
+/// Returns the canonical (symlink-resolved) path -- the one that was
+/// actually checked -- so that's exactly what gets loaded.
 ///
-/// Loading a module runs its code inside this process, so a module (or a
-/// directory it sits in) that a non-root user could write to would let
-/// that user execute arbitrary code in the host application.
+/// Loading a module runs its code inside this process. Checking only the
+/// file and its immediate directory isn't enough: a non-root user who can
+/// write to any ancestor can rename the module's directory away and put
+/// their own in its place between this check and the `dlopen`. With the
+/// whole chain root-controlled, nothing on the path can change in between.
 fn validate_module_path(path: &Path) -> std::result::Result<PathBuf, String> {
-    use crate::secure_file::{check_metadata, check_owner_and_mode, Owner, FORBID_GROUP_OTHER_WRITE};
+    use crate::secure_file::{check_dir_chain, check_metadata, Owner, FORBID_GROUP_OTHER_WRITE};
 
-    let raw = path;
-    if !raw.is_absolute() {
+    if !path.is_absolute() {
         return Err(format!("PKCS#11 module path {path:?} must be absolute"));
     }
-    let canonical = std::fs::canonicalize(raw).map_err(|e| format!("PKCS#11 module {path:?}: {e}"))?;
+    let canonical = std::fs::canonicalize(path).map_err(|e| format!("PKCS#11 module {path:?}: {e}"))?;
 
     let file_meta = std::fs::metadata(&canonical).map_err(|e| format!("PKCS#11 module {}: {e}", canonical.display()))?;
     check_metadata(&file_meta, Some(Owner::Root), FORBID_GROUP_OTHER_WRITE)
@@ -195,9 +199,8 @@ fn validate_module_path(path: &Path) -> std::result::Result<PathBuf, String> {
     let parent = canonical
         .parent()
         .ok_or_else(|| format!("PKCS#11 module {} has no parent directory", canonical.display()))?;
-    let dir_meta = std::fs::metadata(parent).map_err(|e| format!("PKCS#11 module directory {}: {e}", parent.display()))?;
-    check_owner_and_mode(&dir_meta, Some(Owner::Root), FORBID_GROUP_OTHER_WRITE)
-        .map_err(|e| format!("refusing to load PKCS#11 module from directory {}: {e}", parent.display()))?;
+    check_dir_chain(parent, Owner::Root)
+        .map_err(|e| format!("refusing to load PKCS#11 module {}: {e}", canonical.display()))?;
 
     Ok(canonical)
 }
@@ -217,22 +220,28 @@ fn pin_file_path(from_policy: Option<PathBuf>, from_env: Option<std::ffi::OsStri
 }
 
 /// Reads the PKCS#11 user PIN from `path`. The file must be a regular file
-/// owned by root or by this process's user, with no group/other access at
-/// all; symlinks are followed (Kubernetes Secret volumes are symlinks) but
-/// the checks apply to the file actually opened. One trailing `\n` (or
-/// `\r\n`) is stripped. The raw file bytes live in a self-wiping
-/// `SecretBuffer` that is wiped explicitly before this returns -- on every
-/// path -- and the PIN itself comes back as an `AuthPin`, which zeroizes
-/// its own storage on drop.
+/// owned by root (see [`crate::secure_file::config_owner`]), readable by
+/// nobody but its owner and -- since it is root's -- optionally its group,
+/// so a non-root service reads it as `root:<service-group> 0440`. It must
+/// not be one the service can write: a wrong PIN written into it would
+/// burn an HSM login attempt on every call until the token locks the user
+/// out. The directories it lives in are checked the same way. Symlinks are
+/// followed (Kubernetes Secret volumes are symlinks) but the checks apply
+/// to the file actually opened. One trailing `\n` (or `\r\n`) is stripped.
+/// The raw file bytes live in a self-wiping `SecretBuffer` that is wiped
+/// explicitly before this returns -- on every path -- and the PIN itself
+/// comes back as an `AuthPin`, which zeroizes its own storage on drop.
 fn read_pin_file(path: &Path) -> std::result::Result<AuthPin, std::io::Error> {
-    use crate::secure_file::{open_checked, FileRequirements, Owner, SecretBuffer, FORBID_GROUP_OTHER_ACCESS};
+    use crate::secure_file::{check_location, config_owner, open_checked, FileRequirements, SecretBuffer, FORBID_GROUP_OTHER_ACCESS};
     use std::io::{Error as IoError, ErrorKind};
 
     let requirements = FileRequirements {
-        owner: Some(Owner::RootOrCurrentUser),
+        owner: Some(config_owner()),
         forbidden_mode_bits: FORBID_GROUP_OTHER_ACCESS,
         follow_symlinks: true,
+        allow_group_read_if_root_owned: true,
     };
+    check_location(path, config_owner())?;
     let mut file = open_checked(path, &requirements)?;
     let mut raw = SecretBuffer::read_from(&mut file, MAX_PIN_FILE_LEN)?;
 
@@ -265,7 +274,7 @@ fn read_pin_file(path: &Path) -> std::result::Result<AuthPin, std::io::Error> {
 fn open_session() -> Option<OpenSession> {
     if std::env::var_os("HKDFGUARD_PKCS11_PIN").is_some() {
         log::warn!(
-            "hkdfguard: HKDFGUARD_PKCS11_PIN is no longer supported and is ignored; put the PIN in a mode-0600 file named by pkcs11.pin_file in the policy (default {DEFAULT_PIN_FILE}) instead"
+            "hkdfguard: HKDFGUARD_PKCS11_PIN is no longer supported and is ignored; put the PIN in a root-owned mode-0400 (or 0440, group = the service's group) file named by pkcs11.pin_file in the policy (default {DEFAULT_PIN_FILE}) instead"
         );
     }
 
@@ -653,11 +662,34 @@ mod tests {
     use secrecy::ExposeSecret;
     use std::os::unix::fs::PermissionsExt;
 
-    fn pin_file(contents: &[u8], mode: u32) -> tempfile::NamedTempFile {
-        let f = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(f.path(), contents).unwrap();
-        std::fs::set_permissions(f.path(), std::fs::Permissions::from_mode(mode)).unwrap();
-        f
+    // In a private directory of its own: `$TMPDIR` itself is usually
+    // `/tmp`, which anyone can write to, and the PIN's location is checked.
+    struct PinFile {
+        dir: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl PinFile {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    fn pin_file(contents: &[u8], mode: u32) -> PinFile {
+        let dir = crate::secure_file::private_tempdir();
+        let path = dir.path().join("pkcs11.pin");
+        std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        PinFile { dir, path }
+    }
+
+    #[test]
+    fn pin_file_in_a_directory_others_can_write_is_rejected() {
+        let f = pin_file(b"1234\n", 0o600);
+        std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = read_pin_file(f.path()).expect_err("someone else could swap in a wrong PIN");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
@@ -674,7 +706,12 @@ mod tests {
 
     #[test]
     fn pin_file_readable_by_group_or_others_is_rejected() {
-        for mode in [0o640, 0o604, 0o644, 0o660] {
+        // SAFETY: geteuid has no preconditions.
+        let root = unsafe { libc::geteuid() } == 0;
+        // 0640 is the supported layout for a *root-owned* PIN (group = the
+        // service's group); on a file the service owns, it's a leak.
+        let modes: &[u32] = if root { &[0o604, 0o644, 0o660] } else { &[0o640, 0o604, 0o644, 0o660] };
+        for &mode in modes {
             let f = pin_file(b"1234\n", mode);
             let err = read_pin_file(f.path()).expect_err("must be rejected");
             assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "mode {mode:o}");
@@ -800,7 +837,7 @@ mod tests {
         // and export the module path for debug builds; here the module comes
         // from policy instead, as in production.
         let module = std::env::var("HKDFGUARD_PKCS11_MODULE").expect("set by the test harness");
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         let path = dir.path().join("policy.toml");
         let policy_for = |label: &str| {
             format!("[selection]\nmode = \"require\"\nprovider = \"pkcs11\"\n[pkcs11]\nmodule = \"{module}\"\ntoken_label = \"{label}\"\n")

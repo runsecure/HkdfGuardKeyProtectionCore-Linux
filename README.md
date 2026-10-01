@@ -155,11 +155,16 @@ policy (or a policy that never names it), a missing secret mount or
 unavailable TPM makes `hkdfguard_create_kek` fail rather than silently
 degrade to it.
 
-The policy file (`/etc/hkdfguard/policy.toml`)
-must be owned by root or by the process's own user and not writable by
-group or others. Only a *missing* file means "no policy"; a file that
-exists but is unreadable, too broadly writable, or malformed makes every
-operation fail closed.
+The policy file (`/etc/hkdfguard/policy.toml`) must be owned by root and
+not writable by group or others, and so must `/etc/hkdfguard` and every
+directory above it (sticky directories like `/tmp` and read-only mounts
+excepted). The service's own user is deliberately not accepted: any
+process running as that user could otherwise rewrite the policy, or
+delete it to switch policy off. Only a *missing* file in a trusted
+directory means "no policy"; a file that exists but is unreadable, too
+broadly writable, wrongly owned, or malformed -- or one in a directory
+someone untrusted could change -- makes every operation fail closed.
+(Debug builds also accept the process's own user, for tests.)
 
 ### Setup calls are deliberately slow
 
@@ -204,15 +209,22 @@ read. **The TPM provider refuses to run without it**, logging the exact
 command to create it; provision it before first use:
 
 ```sh
-install -d -m 0700 /etc/hkdfguard
+install -d -m 0755 -o root -g root /etc/hkdfguard
 ( umask 077; head -c 32 /dev/urandom > /etc/hkdfguard/tpm.derivation-secret )
+# For a service that doesn't run as root, let its group read it:
+chgrp <service-group> /etc/hkdfguard/tpm.derivation-secret
+chmod 0440 /etc/hkdfguard/tpm.derivation-secret
 ```
 
-The file's bytes are used exactly as they are on disk — no newline
-trimming, because any trimming rule would silently change the derived key
-for a secret ending in that byte. A file that is present but
-untrustworthy (wrong owner, group/other-accessible, a symlink, empty,
-oversized) is a hard error, never silently ignored.
+The secret must be owned by root, never by the service's own user: if
+the service could write it, so could any process running as that user,
+and changing it changes every TPM KEK. Group read is allowed only on a
+root-owned file; nothing for others either way. The file's bytes are used
+exactly as they are on disk — no newline trimming, because any trimming
+rule would silently change the derived key for a secret ending in that
+byte. A file that is present but untrustworthy (wrong owner, group-writable
+or other-accessible, a symlink, empty, oversized, or in a directory
+someone untrusted could change) is a hard error, never silently ignored.
 
 To run without one, set `require_derivation_secret = false` under `[tpm]`
 in the policy. The provider then derives from the TPM seed and service
@@ -456,7 +468,13 @@ derivation secret. `<mount>/<service>` must:
   Kubernetes Secret volumes present every key as a symlink into `..data/`,
   and refusing that would refuse the most common delivery mechanism — but
   only while the resolution stays within the mount directory. A link
-  leading anywhere else is refused.
+  leading anywhere else is refused;
+- sit in a **mount nobody else can write to**: the mount directory and
+  every directory above it must be owned by root or the process's user and
+  not writable by group or others. Sticky ancestors (`/tmp`) and read-only
+  mounts — a Kubernetes Secret volume is `1777` but read-only — are fine. A
+  mount another user could write to would let them plant a KEK for a
+  service that isn't provisioned yet, which `create_kek` would then adopt.
 
 A file that is present but fails a check is reported as an **error**,
 never as "not provisioned": a misconfigured mount must not silently fall
@@ -549,7 +567,7 @@ redirect these. Release is the only supported shipping profile.
 | `HKDFGUARD_PKCS11_SLOT` | PKCS#11 | **Debug builds only.** Token index among initialized tokens. Release builds select by `pkcs11.token_label` / `token_serial`, or require exactly one initialized token -- slot numbers aren't stable across reboots or hot-plugging. |
 | `HKDFGUARD_PKCS11_PIN_FILE` | PKCS#11 | **Debug builds only**, when the policy sets no `pkcs11.pin_file`. Release builds use `pkcs11.pin_file`, or `/etc/hkdfguard/pkcs11.pin`. The retired `HKDFGUARD_PKCS11_PIN` is ignored, with a warning: a PIN is never read from the environment. |
 | `HKDFGUARD_POLICY_FILE` | Policy | **Debug builds only.** Read a different policy file. Release builds always read `/etc/hkdfguard/policy.toml`. |
-| `HKDFGUARD_TPM_DERIVATION_SECRET_FILE` | TPM2 | **Debug builds only.** Read the TPM derivation secret from a different path. Release builds always read `/etc/hkdfguard/tpm.derivation-secret`, which must be owned by root or this process's user with no group/other access (e.g. `0600`), and must not be a symlink. See "Hardening the TPM key" above. |
+| `HKDFGUARD_TPM_DERIVATION_SECRET_FILE` | TPM2 | **Debug builds only.** Read the TPM derivation secret from a different path. Release builds always read `/etc/hkdfguard/tpm.derivation-secret`, which must be owned by root, with no access for others and at most group read (`0400`, or `0440` with the service's group), and must not be a symlink. See "Hardening the TPM key" above. |
 | `TPM2TOOLS_TCTI` / `TCTI` / `TEST_TCTI` | TPM2 | **Debug builds only**, and only when the policy sets no `tpm.tcti`. Standard `tpm2-tools`-style TCTI selector (e.g. `swtpm:host=localhost,port=2321`). Release builds use `tpm.tcti` from the policy, or `device:/dev/tpmrm0`. |
 | `TSS2_LOG` | TPM2 (read by tpm2-tss) | tpm2-tss's own log level. If it sets `debug` or `trace` for any module, the TPM provider **refuses to run**: at those levels tpm2-tss logs raw TPM commands and responses (including ECDH shared secrets), session keys, and plaintext parameters, and `TSS2_LOGFILE` can send that to any path. `info` and below are fine. |
 
@@ -609,13 +627,19 @@ dir = "/var/run/secrets/hkdfguard"  # where <service> KEK files live; when set, 
 
 [pkcs11]
 module = "/usr/lib/vendor/libhsm-pkcs11.so"   # required for PKCS#11 in release builds; root-owned
-pin_file = "/etc/hkdfguard/pkcs11.pin"        # owner-only; this is the default
+pin_file = "/etc/hkdfguard/pkcs11.pin"        # root-owned 0400, or 0440 with the service's group; this is the default
 token_label = "hkdfguard-prod"      # choose the token by label and/or serial; exactly one must match.
 token_serial = "0123456789abcdef"   # with neither, exactly one initialized token must be present
 ```
 
-The file must be owned by root or by the process's user and not writable
-by group or others.
+The policy file must be owned by root and not writable by group or
+others, in directories only root can change. So must the PIN file, which
+additionally may be read by nobody but root and, optionally, the
+service's group: a PIN file the service could write would let any process
+running as that user write a wrong PIN and lock the HSM user out. The
+PKCS#11 module, its directory, and every directory above it must be
+root-owned and not group/other-writable (sticky ancestors excepted), so
+nothing on the module's path can be swapped before it is `dlopen`ed.
 
 Only a *missing* file means "no policy"; a present but
 unreadable, too-broadly-writable, or malformed file makes every operation
@@ -697,7 +721,9 @@ its default.
   external-secret KEK, and the CLI's `--dek-file` all go through the same
   discipline (`src/secure_file.rs`): open, then `fstat` the descriptor for
   regular-file type, ownership, and mode, so nothing can be swapped between
-  the check and the read. Secret contents are read into a single fixed
+  the check and the read. The policy, PIN, and derivation secret must be
+  root-owned in release builds, in directories only root can change, so
+  the service's own uid can't rewrite (or delete) them. Secret contents are read into a single fixed
   allocation that is never grown (so no partially-filled buffer is ever
   freed un-wiped) and zeroed on every exit path.
 - **Service names can never name a file outside their mount.** The C ABI

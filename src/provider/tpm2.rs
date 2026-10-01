@@ -177,24 +177,30 @@ static MISSING_SECRET_WARNED: OnceLock<()> = OnceLock::new();
 
 fn read_derivation_secret() -> Result<Option<Zeroizing<[u8; 32]>>> {
     use crate::secure_file::{
-        open_checked, FileRequirements, Owner, SecretBuffer, FORBID_GROUP_OTHER_ACCESS,
+        check_location, config_owner, open_checked, FileRequirements, SecretBuffer, FORBID_GROUP_OTHER_ACCESS,
     };
 
     let path = derivation_secret_path();
+    // Root-owned, like the policy: if the service could write it, any
+    // process running as the service could change every TPM KEK, making
+    // every DEK already wrapped permanently unopenable.
     let requirements = FileRequirements {
-        owner: Some(Owner::RootOrCurrentUser),
-        forbidden_mode_bits: FORBID_GROUP_OTHER_ACCESS, // owner-only, e.g. 0600/0400
+        owner: Some(config_owner()),
+        forbidden_mode_bits: FORBID_GROUP_OTHER_ACCESS, // 0400, or 0440 when root-owned (see below)
         follow_symlinks: false, // the secret must not be reachable through a link we don't control
+        allow_group_read_if_root_owned: true, // root:<service-group> 0440 for a non-root service
     };
 
-    let mut file = match open_checked(&path, &requirements) {
+    let opened = check_location(&path, config_owner()).and_then(|()| open_checked(&path, &requirements));
+    let mut file = match opened {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             if crate::policy::require_tpm_derivation_secret() {
                 return Err(Error::Provider(format!(
-                    "TPM derivation secret {path} does not exist. Create it, owned by the user this \
-                     service runs as: (umask 077; head -c 32 /dev/urandom > {path}) -- or, to run \
-                     without one, set tpm.require_derivation_secret = false in the policy",
+                    "TPM derivation secret {path} does not exist. Create it as root: (umask 077; \
+                     head -c 32 /dev/urandom > {path}); for a service that doesn't run as root, \
+                     also chgrp <service-group> {path} && chmod 0440 {path} -- or, to run without \
+                     one, set tpm.require_derivation_secret = false in the policy",
                     path = path.display()
                 )));
             }
@@ -1236,7 +1242,7 @@ mod tests {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         let path = dir.path().join("tpm.derivation-secret");
         let mut file = std::fs::File::create(&path).unwrap();
         file.write_all(contents).unwrap();
@@ -1297,7 +1303,7 @@ mod tests {
     #[test]
     #[serial]
     fn absent_secret_is_an_error_when_policy_requires_one() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         let policy = dir.path().join("policy.toml");
         crate::secure_file::write_world_readable_for_tests(
             &policy,
@@ -1345,11 +1351,19 @@ mod tests {
     #[test]
     #[serial]
     fn present_but_untrustworthy_secret_is_an_error_never_silently_skipped() {
-        // Group-readable: rejected rather than used, and rejected rather
-        // than treated as absent (which would quietly swap the strong key
-        // for the weak one).
-        let result = with_secret_file(b"secret", 0o640, |_| read_derivation_secret());
-        assert!(result.is_err(), "a group-readable secret must be rejected");
+        // Readable by others, or group-writable: rejected rather than used,
+        // and rejected rather than treated as absent (which would quietly
+        // swap the strong key for the weak one). These are wrong for any
+        // owner; group *read* is allowed when root owns the file.
+        for mode in [0o604, 0o620] {
+            let result = with_secret_file(b"secret", mode, |_| read_derivation_secret());
+            assert!(result.is_err(), "mode {mode:o} must be rejected");
+        }
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            let result = with_secret_file(b"secret", 0o640, |_| read_derivation_secret());
+            assert!(result.is_err(), "a group-readable secret the service owns itself must be rejected");
+        }
 
         // Empty file.
         let result = with_secret_file(b"", 0o600, |_| read_derivation_secret());
@@ -1362,7 +1376,7 @@ mod tests {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         let target = dir.path().join("real-secret");
         let mut f = std::fs::File::create(&target).unwrap();
         f.write_all(b"secret").unwrap();
@@ -1463,7 +1477,7 @@ mod tests {
 
     // Writes `doc` as the policy for the duration of `f`.
     fn with_policy<T>(doc: &str, f: impl FnOnce() -> T) -> T {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         let path = dir.path().join("policy.toml");
         crate::secure_file::write_world_readable_for_tests(&path, doc);
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
@@ -2105,7 +2119,7 @@ mod tests {
         let policy_for = |name_hex: &str| {
             format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"required\"\npinned_session_salt_key_name = \"{name_hex}\"\n")
         };
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         let path = dir.path().join("policy.toml");
 
         crate::secure_file::write_world_readable_for_tests(&path, policy_for(&real));
@@ -2155,7 +2169,7 @@ mod tests {
             Ok(hex(name.value()))
         })
         .unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         let path = dir.path().join("policy.toml");
         crate::secure_file::write_world_readable_for_tests(
             &path,
@@ -2214,7 +2228,7 @@ mod tests {
     // Writes a policy pinning `service` to `name_hex` and points
     // HKDFGUARD_POLICY_FILE at it for the duration of `f`.
     fn with_pinned_name<T>(service: &str, name_hex: &str, f: impl FnOnce() -> T) -> T {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         let path = dir.path().join("policy.toml");
         crate::secure_file::write_world_readable_for_tests(
             &path,

@@ -24,18 +24,38 @@ use zeroize::{Zeroize, Zeroizing};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Owner {
     /// uid 0 only.
-    #[cfg_attr(not(feature = "pkcs11"), allow(dead_code))] // only the PKCS#11 module-path check requires strictly-root ownership today
     Root,
-    /// uid 0, or this process's effective uid (a process can't meaningfully
-    /// protect a file from its own uid anyway).
+    /// uid 0, or this process's effective uid.
     RootOrCurrentUser,
+}
+
+/// Who must own configuration this process reads but must not be able to
+/// change: the policy file, the PKCS#11 PIN file, the TPM derivation
+/// secret, and the directories they live in.
+///
+/// Release builds require root. Accepting the service's own uid would let
+/// any process running as that uid rewrite them -- and under Yama
+/// `ptrace_scope >= 1` or in a container without `CAP_SYS_PTRACE`, such a
+/// process can rewrite the service's files without being able to read its
+/// memory. Rewriting the policy redirects every future wrap to a KEK the
+/// writer controls; rewriting the PIN locks the HSM user out; rewriting the
+/// derivation secret changes every TPM KEK. Debug builds also accept this
+/// process's own uid, so tests can use temp files.
+pub const fn config_owner() -> Owner {
+    if cfg!(debug_assertions) {
+        Owner::RootOrCurrentUser
+    } else {
+        Owner::Root
+    }
 }
 
 /// Permission bits that must be clear: nobody but the owner may write.
 pub const FORBID_GROUP_OTHER_WRITE: u32 = 0o022;
 /// Permission bits that must be clear: nobody but the owner may read, write, or execute.
-#[cfg_attr(not(feature = "pkcs11"), allow(dead_code))] // only the PKCS#11 PIN file needs owner-only access today (also used by this module's tests)
 pub const FORBID_GROUP_OTHER_ACCESS: u32 = 0o077;
+
+const GROUP_READ: u32 = 0o040;
+const STICKY: u32 = 0o1000;
 
 /// What a file must satisfy before its contents are trusted.
 #[derive(Debug, Clone, Copy)]
@@ -47,6 +67,11 @@ pub struct FileRequirements {
     /// `false` opens with `O_NOFOLLOW`: a symlink as the final path
     /// component fails the open (ELOOP) instead of being followed.
     pub follow_symlinks: bool,
+    /// Exempts group read from `forbidden_mode_bits` when the file is owned
+    /// by root. `root:<service-group> 0440` is how a root-owned secret is
+    /// made readable by a non-root service; on a file the service owns
+    /// itself, group read would only leak it to other group members.
+    pub allow_group_read_if_root_owned: bool,
 }
 
 /// Opens `path` read-only and validates it against `req` using the opened
@@ -61,8 +86,95 @@ pub fn open_checked(path: &Path, req: &FileRequirements) -> io::Result<File> {
         opts.custom_flags(libc::O_NOFOLLOW);
     }
     let file = opts.open(path)?;
-    check_metadata(&file.metadata()?, req.owner, req.forbidden_mode_bits)?;
+    let meta = file.metadata()?;
+    let mut forbidden = req.forbidden_mode_bits;
+    if req.allow_group_read_if_root_owned && meta.uid() == 0 {
+        forbidden &= !GROUP_READ;
+    }
+    check_metadata(&meta, req.owner, forbidden)?;
     Ok(file)
+}
+
+/// Checks that nobody `owner` doesn't cover can rename, replace, or delete
+/// anything beneath `dir`: `dir` and every ancestor up to `/` must be a
+/// directory owned per `owner`. `dir` itself must not be writable by group
+/// or others. An ancestor may be, if it is sticky (`/tmp`-style): the
+/// kernel then lets only an entry's owner or the directory's owner rename
+/// or remove it, and the entry beneath was itself just checked. Write bits
+/// are ignored on a read-only mount (e.g. a Kubernetes Secret or ConfigMap
+/// volume, which is `1777` but mounted read-only).
+///
+/// With the target file's own ownership also checked, this means nobody
+/// untrusted can swap the path between this check and a later open or
+/// `dlopen` of it by path.
+///
+/// `dir` must be canonical (no symlinks). Every failure, including one
+/// from a directory vanishing mid-walk, is `PermissionDenied` -- never
+/// `NotFound`, which callers reserve for "the file isn't there".
+pub fn check_dir_chain(dir: &Path, owner: Owner) -> io::Result<()> {
+    for (i, d) in dir.ancestors().enumerate() {
+        let fail = |what: String| io::Error::new(io::ErrorKind::PermissionDenied, format!("directory {}: {what}", d.display()));
+        let meta = std::fs::metadata(d).map_err(|e| fail(e.to_string()))?;
+        if !meta.is_dir() {
+            return Err(fail("not a directory".to_string()));
+        }
+        check_owner_and_mode(&meta, Some(owner), 0).map_err(|e| fail(e.to_string()))?;
+
+        let mode = meta.mode();
+        let writable = mode & FORBID_GROUP_OTHER_WRITE != 0;
+        let protected_by_sticky = i > 0 && mode & STICKY != 0;
+        if writable && !protected_by_sticky && !on_read_only_mount(d) {
+            return Err(fail(format!(
+                "writable by group or others (mode {:o}), so its entries can be replaced",
+                mode & 0o7777
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn on_read_only_mount(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: c_path is a valid NUL-terminated string; `st` is a properly
+    // sized out-parameter that statvfs fully initializes on success.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
+        return false;
+    }
+    st.f_flag & libc::ST_RDONLY != 0
+}
+
+/// Checks that nobody `owner` doesn't cover can delete, rename, or replace
+/// `path` or make it resolve elsewhere: the directory `path` is named in
+/// (or, while that doesn't exist, its nearest existing ancestor), and the
+/// directory of whatever `path` currently resolves to, must each pass
+/// [`check_dir_chain`].
+///
+/// Checking where a file *would* be, not just where it is, matters for
+/// files whose absence is meaningful: a missing policy means "no policy",
+/// so if an untrusted user could delete it, they could switch policy off.
+pub fn check_location(path: &Path, owner: Owner) -> io::Result<()> {
+    let denied = |what: String| io::Error::new(io::ErrorKind::PermissionDenied, what);
+
+    let named_in = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let existing = named_in
+        .ancestors()
+        .find(|d| !d.as_os_str().is_empty() && d.exists())
+        .unwrap_or(Path::new("."));
+    let existing = std::fs::canonicalize(existing).map_err(|e| denied(format!("{}: {e}", existing.display())))?;
+    check_dir_chain(&existing, owner)?;
+
+    match std::fs::canonicalize(path) {
+        Ok(target) => match target.parent() {
+            Some(target_dir) if target_dir != existing => check_dir_chain(target_dir, owner),
+            _ => Ok(()),
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()), // absent, or a dangling link: the open reports it
+        Err(e) => Err(denied(format!("{}: {e}", path.display()))),
+    }
 }
 
 /// Validates already-obtained metadata: must be a regular file (never a
@@ -168,6 +280,19 @@ pub(crate) fn write_world_readable_for_tests(path: &std::path::Path, contents: i
     std::fs::set_permissions(path, <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644)).unwrap();
 }
 
+/// Test-only: a temp directory nobody but this user can write to, whatever
+/// the umask. `tempfile::tempdir()` creates `0777 & !umask`, which under a
+/// `002` umask is group-writable -- a directory [`check_dir_chain`] rightly
+/// refuses to trust a policy or secret in.
+#[cfg(test)]
+pub(crate) fn private_tempdir() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,7 +311,101 @@ mod tests {
         owner: Some(Owner::RootOrCurrentUser),
         forbidden_mode_bits: FORBID_GROUP_OTHER_ACCESS,
         follow_symlinks: true,
+        allow_group_read_if_root_owned: false,
     };
+
+    fn chmod(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn is_root() -> bool {
+        // SAFETY: geteuid has no preconditions.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[test]
+    fn group_read_is_allowed_only_on_a_root_owned_file_when_requested() {
+        let f = temp_file_with(b"x", 0o640);
+        let req = FileRequirements { allow_group_read_if_root_owned: true, ..OWNER_ONLY };
+        let result = open_checked(f.path(), &req);
+        if is_root() {
+            result.unwrap(); // root:<group> 0640 is the supported layout for a non-root service
+        } else {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied, "a self-owned secret must stay owner-only");
+        }
+        // Never group write, and never anything for others, root-owned or not.
+        for mode in [0o660, 0o644] {
+            chmod(f.path(), mode);
+            assert_eq!(open_checked(f.path(), &req).unwrap_err().kind(), io::ErrorKind::PermissionDenied, "mode {mode:o}");
+        }
+    }
+
+    #[test]
+    fn dir_chain_accepts_a_private_dir_and_refuses_a_shared_writable_one() {
+        let base = crate::secure_file::private_tempdir();
+        let dir = std::fs::canonicalize(base.path()).unwrap();
+        check_dir_chain(&dir, Owner::RootOrCurrentUser).unwrap();
+
+        for mode in [0o770, 0o707, 0o1777] {
+            chmod(&dir, mode);
+            let err = check_dir_chain(&dir, Owner::RootOrCurrentUser).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "mode {mode:o}");
+        }
+        chmod(&dir, 0o700);
+    }
+
+    #[test]
+    fn dir_chain_allows_a_sticky_ancestor_but_not_a_plain_writable_one() {
+        let base = crate::secure_file::private_tempdir();
+        let outer = std::fs::canonicalize(base.path()).unwrap();
+        let inner = outer.join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        chmod(&inner, 0o700);
+
+        chmod(&outer, 0o1777);
+        check_dir_chain(&inner, Owner::RootOrCurrentUser).expect("sticky: nobody else can rename `inner`");
+
+        chmod(&outer, 0o777);
+        assert!(check_dir_chain(&inner, Owner::RootOrCurrentUser).is_err(), "anyone could rename `inner` away");
+        chmod(&outer, 0o700);
+    }
+
+    #[test]
+    fn dir_chain_with_root_owner_refuses_a_user_owned_dir() {
+        if is_root() {
+            return;
+        }
+        let base = crate::secure_file::private_tempdir();
+        let err = check_dir_chain(&std::fs::canonicalize(base.path()).unwrap(), Owner::Root).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn location_is_checked_even_when_the_file_is_absent() {
+        let base = crate::secure_file::private_tempdir();
+        let missing = base.path().join("not-yet").join("policy.toml");
+        check_location(&missing, Owner::RootOrCurrentUser).unwrap();
+
+        chmod(base.path(), 0o777);
+        let err = check_location(&missing, Owner::RootOrCurrentUser).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "its absence must not be trusted either");
+        chmod(base.path(), 0o700);
+    }
+
+    #[test]
+    fn location_checks_where_a_symlink_points_too() {
+        let trusted = crate::secure_file::private_tempdir();
+        let shared = crate::secure_file::private_tempdir();
+        let target = shared.path().join("policy.toml");
+        std::fs::write(&target, b"x").unwrap();
+        let link = trusted.path().join("policy.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        check_location(&link, Owner::RootOrCurrentUser).unwrap();
+
+        chmod(shared.path(), 0o777);
+        assert!(check_location(&link, Owner::RootOrCurrentUser).is_err(), "the target's directory is writable by others");
+        chmod(shared.path(), 0o700);
+    }
 
     #[test]
     fn reads_contents_within_limit() {
@@ -239,8 +458,7 @@ mod tests {
 
     #[test]
     fn root_only_owner_rejects_non_root_file() {
-        // SAFETY: geteuid has no preconditions.
-        if unsafe { libc::geteuid() } == 0 {
+        if is_root() {
             return; // running as root, so any temp file is root-owned; nothing to reject
         }
         let f = temp_file_with(b"x", 0o600);
@@ -250,8 +468,8 @@ mod tests {
 
     #[test]
     fn rejects_directories() {
-        let dir = tempfile::tempdir().unwrap();
-        let req = FileRequirements { owner: None, forbidden_mode_bits: 0, follow_symlinks: true };
+        let dir = crate::secure_file::private_tempdir();
+        let req = FileRequirements { owner: None, forbidden_mode_bits: 0, ..OWNER_ONLY };
         assert_eq!(open_checked(dir.path(), &req).unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
@@ -264,7 +482,7 @@ mod tests {
     #[test]
     fn no_follow_rejects_symlink_but_follow_accepts_it() {
         let target = temp_file_with(b"x", 0o600);
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(target.path(), &link).unwrap();
 

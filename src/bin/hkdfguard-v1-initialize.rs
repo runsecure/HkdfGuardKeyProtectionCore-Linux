@@ -786,6 +786,12 @@ mod tests {
     use serial_test::serial;
     use tempfile::NamedTempFile;
 
+    // Only this user can write to it, whatever the umask: the library refuses
+    // to trust a policy or secret mount in a group-writable directory.
+    fn private_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new().permissions(fs::Permissions::from_mode(0o700)).tempdir().unwrap()
+    }
+
     fn argv(parts: &[&str]) -> impl Iterator<Item = String> {
         parts.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
     }
@@ -990,7 +996,7 @@ mod tests {
     // external-secret mount. Ephemeral keys are per-process, which is
     // exactly right for an in-process test of the provision flow.
     fn with_ephemeral_policy<F: FnOnce()>(f: F) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let policy = dir.path().join("policy.toml");
         fs::write(&policy, "preferred_order = [\"external-secret\", \"ephemeral\"]\n[selection]\nmode = \"prefer\"\n").unwrap();
         fs::set_permissions(&policy, fs::Permissions::from_mode(0o644)).unwrap(); // not the umask: some distros default to 002 (group-writable), which the policy loader correctly refuses
@@ -1018,7 +1024,7 @@ mod tests {
     #[serial]
     fn wrap_without_a_provisioned_kek_fails_with_the_provision_hint_and_touches_nothing() {
         with_ephemeral_policy(|| {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = private_tempdir();
             let key_path = dir.path().join("wrapped.key");
             fs::write(&key_path, b"the key file that was already here").unwrap();
 
@@ -1047,7 +1053,7 @@ mod tests {
             let service = "com.hkdfguard.clitest.roundtrip".to_string();
             run_provision(service.clone()).unwrap();
 
-            let dir = tempfile::tempdir().unwrap();
+            let dir = private_tempdir();
             let key_path = dir.path().join("wrapped.key");
             let dek_path = dir.path().join("dek.b64");
             fs::write(&dek_path, STANDARD.encode([0x5au8; DEK_LEN])).unwrap();
@@ -1141,7 +1147,7 @@ mod tests {
 
     #[test]
     fn dek_file_accepts_an_owner_only_regular_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let path = write_mode(dir.path(), "dek", valid_b64().as_bytes(), 0o600);
         let text = read_dek_file(path.to_str().unwrap()).unwrap();
         assert_eq!(*decode_dek(&text).unwrap(), vec![0x5au8; DEK_LEN]);
@@ -1149,7 +1155,7 @@ mod tests {
 
     #[test]
     fn dek_file_rejects_group_or_world_accessible_permissions() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         for mode in [0o640, 0o604, 0o644, 0o660] {
             let path = write_mode(dir.path(), &format!("dek{mode:o}"), valid_b64().as_bytes(), mode);
             assert!(
@@ -1161,7 +1167,7 @@ mod tests {
 
     #[test]
     fn dek_file_rejects_a_symlink() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let target = write_mode(dir.path(), "real-dek", valid_b64().as_bytes(), 0o600);
         let link = dir.path().join("link-dek");
         std::os::unix::fs::symlink(&target, &link).unwrap();
@@ -1172,21 +1178,21 @@ mod tests {
 
     #[test]
     fn dek_file_rejects_a_directory_and_a_missing_path() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         assert!(read_dek_file(dir.path().to_str().unwrap()).is_err());
         assert!(read_dek_file("/nonexistent-hkdfguard-dek-for-tests").is_err());
     }
 
     #[test]
     fn dek_file_rejects_an_oversized_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let path = write_mode(dir.path(), "big", &[b'A'; MAX_DEK_INPUT_LEN + 1], 0o600);
         assert!(read_dek_file(path.to_str().unwrap()).is_err());
     }
 
     #[test]
     fn load_dek_reads_from_a_file_end_to_end() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let path = write_mode(dir.path(), "dek", format!("{}\n", valid_b64()).as_bytes(), 0o400);
         let dek = load_dek(&DekSource::File(path.to_str().unwrap().to_string())).unwrap();
         assert_eq!(*dek, vec![0x5au8; DEK_LEN]);

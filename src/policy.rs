@@ -767,15 +767,16 @@ impl PolicyEvaluator for Policy {
 /// a huge (or endless) file can't be used to exhaust memory.
 const MAX_POLICY_FILE_LEN: usize = 64 * 1024;
 
-/// What the policy file must satisfy before it's trusted: owned by root or
-/// by this process's own user, and not writable by anyone else -- a
-/// policy anyone else could edit wouldn't be a policy. Symlinks are
-/// followed (e.g. Kubernetes ConfigMap mounts are symlinks), but the
-/// checks apply to the file actually opened, not the link.
+/// What the policy file must satisfy before it's trusted: owned by root
+/// (see [`crate::secure_file::config_owner`]) and not writable by anyone
+/// else -- a policy the service itself could edit wouldn't be a policy.
+/// Symlinks are followed (e.g. Kubernetes ConfigMap mounts are symlinks),
+/// but the checks apply to the file actually opened, not the link.
 const POLICY_FILE_REQUIREMENTS: crate::secure_file::FileRequirements = crate::secure_file::FileRequirements {
-    owner: Some(crate::secure_file::Owner::RootOrCurrentUser),
+    owner: Some(crate::secure_file::config_owner()),
     forbidden_mode_bits: crate::secure_file::FORBID_GROUP_OTHER_WRITE,
     follow_symlinks: true,
+    allow_group_read_if_root_owned: false, // already allowed: only write bits are forbidden
 };
 
 /// Reads and parses the configured policy file, if one is present.
@@ -789,10 +790,11 @@ const POLICY_FILE_REQUIREMENTS: crate::secure_file::FileRequirements = crate::se
 /// - `Some(Err(_))` in every other case -- the file exists but can't be
 ///   read (permission denied, it's a directory, an I/O error), is owned by
 ///   someone untrusted or writable by group/others, is too large, isn't
-///   UTF-8, or is malformed or self-contradictory. This **fails closed**:
-///   every wrap/unwrap/create/exists call fails rather than falling back
-///   to the unrestricted default. Making the file unreadable must never be
-///   a way to switch policy off.
+///   UTF-8, or is malformed or self-contradictory; or the directory it
+///   lives in (or would live in) is one someone untrusted could change.
+///   This **fails closed**: every wrap/unwrap/create/exists call fails
+///   rather than falling back to the unrestricted default. Making the file
+///   unreadable, or deleting it, must never be a way to switch policy off.
 ///
 /// Re-read from disk on every call (no caching), so an operator can update
 /// the policy without restarting the process.
@@ -800,6 +802,9 @@ pub fn load() -> Option<Result<Policy>> {
     let path = policy_file_path();
     let fail = |what: String| Some(Err(Error::Provider(format!("hkdfguard policy file {}: {what}", path.display()))));
 
+    if let Err(e) = crate::secure_file::check_location(&path, crate::secure_file::config_owner()) {
+        return fail(format!("refusing to trust its location ({e})"));
+    }
     let mut file = match crate::secure_file::open_checked(&path, &POLICY_FILE_REQUIREMENTS) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
@@ -965,7 +970,7 @@ pub(crate) fn pinned_session_salt_key_name() -> Result<Option<Vec<u8>>> {
 /// owns the file; keep it alive for as long as the policy should apply.
 #[cfg(test)]
 pub(crate) fn allow_ephemeral_policy_for_tests() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::secure_file::private_tempdir();
     let path = dir.path().join("policy.toml");
     crate::secure_file::write_world_readable_for_tests(
         &path,
@@ -990,7 +995,7 @@ pub(crate) fn allow_ephemeral_policy_for_tests() -> tempfile::TempDir {
 /// the first time the suite ran under `--features tpm2` against swtpm.
 #[cfg(test)]
 pub(crate) fn require_provider_policy_for_tests(provider: &str) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::secure_file::private_tempdir();
     let path = dir.path().join("policy.toml");
     crate::secure_file::write_world_readable_for_tests(
         &path,
@@ -1356,7 +1361,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn setup_min_delay_helper_reads_the_configured_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         let path = dir.path().join("policy.toml");
         crate::secure_file::write_world_readable_for_tests(&path, "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[startup_behavior]\nsetup_min_delay_ms = 42\n");
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
@@ -1370,7 +1375,7 @@ mod tests {
     fn setup_min_delay_helper_keeps_the_default_when_the_policy_is_broken() {
         // A malformed policy must not become a way to remove the floor
         // (the gated call fails closed on the same policy regardless).
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         let path = dir.path().join("policy.toml");
         crate::secure_file::write_world_readable_for_tests(&path, "[selection]\nmode = \"require\"\n[startup_behavior]\nsetup_min_delay_ms = 0\n");
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
@@ -1564,7 +1569,7 @@ mod tests {
         // A policy that can't be parsed must not be the reason a security
         // control is skipped: requiring becomes true, and pinning errors
         // rather than reporting "nothing pinned".
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         let path = dir.path().join("policy.toml");
         crate::secure_file::write_world_readable_for_tests(&path, "[selection]\nmode = \"require\"\n"); // missing `provider`
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
@@ -1580,7 +1585,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn tpm_helpers_read_the_configured_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         let path = dir.path().join("policy.toml");
         crate::secure_file::write_world_readable_for_tests(
             &path,
@@ -1668,7 +1673,7 @@ mod tests {
         assert_eq!(pin.unwrap(), None);
 
         // Broken policy: required (never "off"), and pinning errors.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         let path = dir.path().join("policy.toml");
         crate::secure_file::write_world_readable_for_tests(&path, "[selection]\nmode = \"require\"\n[tpm]\nsession_encryption = \"off\"\n");
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
@@ -1692,7 +1697,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn load_reads_and_validates_the_configured_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         let path = dir.path().join("policy.toml");
         crate::secure_file::write_world_readable_for_tests(&path, "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n");
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
@@ -1710,7 +1715,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn load_fails_closed_on_a_malformed_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         let path = dir.path().join("policy.toml");
         crate::secure_file::write_world_readable_for_tests(&path, "[selection]\nmode = \"require\"\n"); // missing required `provider`
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
@@ -1743,7 +1748,7 @@ mod tests {
             return; // root can read a mode-000 file, so this scenario can't be set up
         }
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         let path = dir.path().join("policy.toml");
         std::fs::write(&path, "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -1753,7 +1758,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn load_fails_closed_when_path_is_a_directory() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         assert_load_fails_closed(dir.path(), "a directory at the policy path must not disable policy");
     }
 
@@ -1761,7 +1766,7 @@ mod tests {
     #[serial_test::serial]
     fn load_fails_closed_on_a_group_or_world_writable_file() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         let path = dir.path().join("policy.toml");
         std::fs::write(&path, "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n").unwrap();
 
@@ -1774,8 +1779,29 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn load_fails_closed_when_others_could_replace_or_delete_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::secure_file::private_tempdir();
+        let path = dir.path().join("policy.toml");
+        crate::secure_file::write_world_readable_for_tests(&path, "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_load_fails_closed(&path, "a policy in a world-writable directory could be swapped out");
+
+        // Absent is "no policy" only where nobody untrusted could have deleted it.
+        std::fs::remove_file(&path).unwrap();
+        assert_load_fails_closed(&path, "deleting the policy must not be a way to switch it off");
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
+        let absent = load();
+        std::env::remove_var("HKDFGUARD_POLICY_FILE");
+        assert!(absent.is_none(), "in a trusted directory, a missing policy is just no policy");
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn load_fails_closed_on_an_oversized_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::secure_file::private_tempdir();
         let path = dir.path().join("policy.toml");
         crate::secure_file::write_world_readable_for_tests(&path, vec![b'#'; MAX_POLICY_FILE_LEN + 1]);
         assert_load_fails_closed(&path, "an oversized policy must be rejected, not truncated");
