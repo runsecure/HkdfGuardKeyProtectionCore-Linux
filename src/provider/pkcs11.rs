@@ -5,7 +5,7 @@
 //! | HARDWARE/MODULE-DEPENDENT CODE                                        |
 //! |                                                                        |
 //! | Verified (see docker/): natively built against real `cryptoki` 0.6.2  |
-//! | on Debian bookworm/aarch64, and the `#[ignore]`d test below passed    |
+//! | on Ubuntu 24.04 (x86_64 and aarch64), and the `#[ignore]`d tests pass |
 //! | against a real SoftHSM2 token -- C_GenerateKeyPair + CKM_ECDH1_DERIVE |
 //! | executed for real and produced the same key deterministically across |
 //! | two calls. Not yet exercised against a hardware HSM/YubiHSM; re-run  |

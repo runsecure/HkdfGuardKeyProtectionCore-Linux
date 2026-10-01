@@ -20,13 +20,18 @@
 #   6. Learns the salt-key and service-key Names from the TPM (the operator
 #      helpers in src/provider/tpm2.rs) and writes a policy that REQUIRES
 #      encrypted sessions with both Names pinned.
-#   7. C ABI round trip (examples/wrap_unwrap.c) against the release .so
+#   7. C ABI round trip (examples/wrap_unwrap.c) against the .so
 #      with the KEK on the TPM -- once under `auto`, once under that
 #      `required` + pinned policy.
 #   8. CLI -> separate C consumer: hkdfguard-v1-initialize wraps via stdin,
 #      cli_unwrap_check unwraps through the .so. Cross-process persistence
 #      on the real TPM.
 #   9. If SoftHSM2 is present: the pkcs11 conformance suite.
+#
+# Everything is built in the debug profile, including the .so and CLI the
+# C examples use: release builds deliberately ignore the TCTI, policy-file
+# and derivation-secret environment variables this script steers them with
+# (they take those settings only from root-owned configuration).
 #
 # Nothing under /etc/hkdfguard is read or written: every policy and secret
 # file this script uses lives in a temp dir it removes on exit, and the
@@ -97,9 +102,12 @@ learn() { # learn <test-name> <KEY>
         | awk -F= -v k="$2" '$1==k {print $2; exit}'
 }
 
-# Builds a C example against the release library.
+# Debug profile: see the note at the top on why not --release.
+BIN=target/debug
+
+# Builds a C example against the library.
 build_c() { # build_c <source.c> <out>
-    cc -I include "$1" -L target/release -lHkdfGuardKeyProtectionLinux -o "$2"
+    cc -I include "$1" -L "$BIN" -lHkdfGuardKeyProtectionLinux -o "$2"
 }
 
 # ---------------------------------------------------------------------
@@ -110,8 +118,8 @@ if [ "$MODE" = "reboot" ]; then
     SERVICE="com.hkdfguard.nativetest.reboot"
     use_policy $'[selection]\nmode = "require"\nprovider = "tpm2"\n'
 
-    section "build (release, --features tpm2)"
-    cargo build --release --features tpm2
+    section "build (--features tpm2)"
+    cargo build --features tpm2
     build_c examples/cli_unwrap_check.c "$WORK/cli_unwrap_check"
 
     case "$PHASE" in
@@ -124,8 +132,8 @@ if [ "$MODE" = "reboot" ]; then
             # On a TPM the KEK is derived on demand, so `provision` reports
             # it as already present; it is still the one command that makes
             # the setup calls, so run it as a real deployment would.
-            target/release/hkdfguard-v1-initialize provision --service-name "$SERVICE"
-            base64 -w0 < "$STATE/dek.bin" | target/release/hkdfguard-v1-initialize wrap \
+            "$BIN"/hkdfguard-v1-initialize provision --service-name "$SERVICE"
+            base64 -w0 < "$STATE/dek.bin" | "$BIN"/hkdfguard-v1-initialize wrap \
                 --key-file-path "$STATE/wrapped.key" --service-name "$SERVICE" --dek-stdin --force
             note "service key Name: $(cat "$STATE/service-name.hex")"
             note "wrapped DEK saved. Now REBOOT this machine, then run: scripts/native-tpm-test.sh reboot verify"
@@ -144,7 +152,7 @@ if [ "$MODE" = "reboot" ]; then
                 exit 1
             fi
             note "service key Name identical across reboot: $after"
-            LD_LIBRARY_PATH=target/release "$WORK/cli_unwrap_check" "$STATE/wrapped.key" "$SERVICE" "$STATE/dek.bin"
+            LD_LIBRARY_PATH="$BIN" "$WORK/cli_unwrap_check" "$STATE/wrapped.key" "$SERVICE" "$STATE/dek.bin"
             echo "PASS: the DEK wrapped before the reboot unwraps under the re-derived TPM KEK"
             exit 0
             ;;
@@ -220,18 +228,18 @@ printf '%s\n' "$REQUIRED_POLICY" > "$WORK/required-policy.example.toml"
 # ---------------------------------------------------------------------
 # 7. C ABI round trip on the TPM, under both policies
 # ---------------------------------------------------------------------
-section "cargo build --release --features tpm2"
-cargo build --release --features tpm2
+section "cargo build --features tpm2 (debug: the env overrides this script uses are debug-only)"
+cargo build --features tpm2
 build_c examples/wrap_unwrap.c "$WORK/wrap_unwrap"
 build_c examples/cli_unwrap_check.c "$WORK/cli_unwrap_check"
 
 section "C ABI round trip (examples/wrap_unwrap.c) -- KEK on the TPM, policy: require tpm2, session_encryption auto"
 use_policy $'[selection]\nmode = "require"\nprovider = "tpm2"\n'
-LD_LIBRARY_PATH=target/release "$WORK/wrap_unwrap"
+LD_LIBRARY_PATH="$BIN" "$WORK/wrap_unwrap"
 
 section "C ABI round trip -- policy: session_encryption REQUIRED with both Names pinned"
 use_policy "$REQUIRED_POLICY"
-LD_LIBRARY_PATH=target/release "$WORK/wrap_unwrap"
+LD_LIBRARY_PATH="$BIN" "$WORK/wrap_unwrap"
 note "every ECDH in that run went through a salted, AES-128-CFB-encrypted session against a pinned salt key"
 
 # ---------------------------------------------------------------------
@@ -240,10 +248,10 @@ note "every ECDH in that run went through a salted, AES-128-CFB-encrypted sessio
 section "hkdfguard-v1-initialize (stdin) -> cli_unwrap_check via the .so, KEK on the TPM"
 CLI_SERVICE=com.hkdfguard.nativetest.cli
 ( umask 077; head -c 32 /dev/urandom > "$WORK/dek.bin" )
-target/release/hkdfguard-v1-initialize provision --service-name "$CLI_SERVICE"
-base64 -w0 < "$WORK/dek.bin" | target/release/hkdfguard-v1-initialize wrap \
+"$BIN"/hkdfguard-v1-initialize provision --service-name "$CLI_SERVICE"
+base64 -w0 < "$WORK/dek.bin" | "$BIN"/hkdfguard-v1-initialize wrap \
     --key-file-path "$WORK/wrapped.key" --service-name "$CLI_SERVICE" --dek-stdin --force
-LD_LIBRARY_PATH=target/release "$WORK/cli_unwrap_check" "$WORK/wrapped.key" "$CLI_SERVICE" "$WORK/dek.bin"
+LD_LIBRARY_PATH="$BIN" "$WORK/cli_unwrap_check" "$WORK/wrapped.key" "$CLI_SERVICE" "$WORK/dek.bin"
 no_policy
 
 # ---------------------------------------------------------------------

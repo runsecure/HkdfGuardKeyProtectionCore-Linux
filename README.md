@@ -155,7 +155,7 @@ policy (or a policy that never names it), a missing secret mount or
 unavailable TPM makes `hkdfguard_create_kek` fail rather than silently
 degrade to it.
 
-The policy file (`/etc/hkdfguard/policy.toml`, or `HKDFGUARD_POLICY_FILE`)
+The policy file (`/etc/hkdfguard/policy.toml`)
 must be owned by root or by the process's own user and not writable by
 group or others. Only a *missing* file means "no policy"; a file that
 exists but is unreadable, too broadly writable, or malformed makes every
@@ -351,14 +351,17 @@ persistent P-256 KEK's private key lives and who performs the ECDH.
 
 ### Build & verification matrix
 
-All of the below has actually been run, in Docker on Debian bookworm/aarch64
-(`docker/run-tests.sh` -- see that section below), not just reasoned about:
+All of the below has actually been run, in Docker on Ubuntu 24.04 (glibc
+2.39, tpm2-tss 4.0.1; `docker/run-tests.sh` -- see that section below),
+not just reasoned about. Because the release binaries are built in that
+same image, they need glibc 2.39 or newer: Ubuntu 24.04+, Debian 13, RHEL
+10. Debian 12 is not a target -- its tpm2-tss is 3.2.1, even in backports.
 
 | Feature | Builds on macOS (this repo's dev env) | Builds & links natively on Linux | Hardware/module test |
 |---|---|---|---|
 | `external-secret`, `ephemeral` (default) | yes | yes -- verified | unit tests pass; full wrap/unwrap round trip through the compiled C ABI (`examples/wrap_unwrap.c`) verified |
 | `pkcs11` | yes (build-only; no module to talk to) | yes -- verified, linked against real `cryptoki` 0.6.2 + `libsofthsm2.so` | `#[ignore]`d tests pass against a real SoftHSM2 token: `C_GenerateKeyPair` + `CKM_ECDH1_DERIVE` executed for real, same key reproduced deterministically, and `CKM_ECDH1_DERIVE` against hashed per-payload points accepted |
-| `tpm2` | **no** -- `tss-esapi-sys` ships pregenerated bindings only for specific Linux target tuples and hard-fails on macOS/aarch64 | yes -- verified, linked against real `libtss2-esys` 3.2.1 | The `#[ignore]`d conformance suite passes against a real `swtpm` instance: `TPM2_CreatePrimary` determinism and per-service uniqueness, the client-side Name formula matching the TPM's own, `TPM2_ECDH_ZGen` against hashed per-payload points, the derivation secret genuinely changing the derived key, and salted/parameter-encrypted sessions producing the same `Z` as plain ones. The same suite, plus the reboot-persistence check, has also been run via `scripts/native-tpm-test.sh` against real firmware TPMs: **Intel PTT** and **AMD fTPM** |
+| `tpm2` | **no** -- `tss-esapi-sys` ships pregenerated bindings only for specific Linux target tuples and hard-fails on macOS/aarch64 | yes -- verified, linked against real `libtss2-esys` 4.0.1 | The `#[ignore]`d conformance suite passes against a real `swtpm` instance: `TPM2_CreatePrimary` determinism and per-service uniqueness, the client-side Name formula matching the TPM's own, `TPM2_ECDH_ZGen` against hashed per-payload points, the derivation secret genuinely changing the derived key, and salted/parameter-encrypted sessions producing the same `Z` as plain ones. The same suite, plus the reboot-persistence check, has also been run via `scripts/native-tpm-test.sh` against real firmware TPMs: **Intel PTT** and **AMD fTPM** |
 
 The TPM provider has been verified against `swtpm` and against two real
 firmware TPMs, Intel PTT and AMD fTPM. It has **not** been exercised
@@ -526,15 +529,25 @@ secret. One trailing newline is ignored on both paths.
 
 ## Configuration
 
+Settings that decide *which* policy, TPM, or derivation secret is used come
+only from root-owned configuration in release builds. Their environment
+variables, marked **debug builds only** below, exist so tests and
+development can point at scratch files and simulators; a release build
+that sees one set ignores it and logs a warning. The environment is often
+set by lower-trust configuration than `/etc/hkdfguard` (a unit drop-in, a
+pod spec), and must not be able to redirect these. Release is the only
+supported shipping profile.
+
 | Env var | Used by | Purpose |
 |---|---|---|
 | `HKDFGUARD_EXTERNAL_SECRET_DIR` | External Secret | Override the mount directory searched for `<dir>/<service>` secret files (default: first of `/var/run/secrets/hkdfguard`, `/run/secrets/hkdfguard`, `/vault/secrets/hkdfguard`, `/mnt/secrets-store/hkdfguard` that exists). Each file must be owner-only (`0400`/`0600`), owned by root or the process's user, and resolve to a path inside the mount — see "External-secret file requirements". |
 | `HKDFGUARD_PKCS11_MODULE` | PKCS#11 | Absolute path to the PKCS#11 module `.so` (default: common SoftHSM2 install paths). The resolved file and its directory must be root-owned and not group/other-writable, or the module is refused. |
 | `HKDFGUARD_PKCS11_SLOT` | PKCS#11 | Slot index (default: first slot with a token present) |
 | `HKDFGUARD_PKCS11_PIN_FILE` | PKCS#11 | Path to a file holding the user PIN (default: `/etc/hkdfguard/pkcs11.pin`). Must be owned by root or the process's user with no group/other access (e.g. `0600`). The former `HKDFGUARD_PKCS11_PIN` env var is no longer read. |
-| `HKDFGUARD_POLICY_FILE` | Policy | Override the policy file path (default: `/etc/hkdfguard/policy.toml`) |
-| `HKDFGUARD_TPM_DERIVATION_SECRET_FILE` | TPM2 | Path to the optional host secret mixed into TPM key derivation (default: `/etc/hkdfguard/tpm.derivation-secret`). Must be owned by root or this process's user with no group/other access (e.g. `0600`), and must not be a symlink. See "Hardening the TPM key" above. |
-| `TPM2TOOLS_TCTI` / `TCTI` / `TEST_TCTI` | TPM2 | Standard `tpm2-tools`-style TCTI selector (e.g. `device:/dev/tpmrm0`, `swtpm:host=localhost,port=2321`); falls back to `device:/dev/tpmrm0` if unset |
+| `HKDFGUARD_POLICY_FILE` | Policy | **Debug builds only.** Read a different policy file. Release builds always read `/etc/hkdfguard/policy.toml`. |
+| `HKDFGUARD_TPM_DERIVATION_SECRET_FILE` | TPM2 | **Debug builds only.** Read the TPM derivation secret from a different path. Release builds always read `/etc/hkdfguard/tpm.derivation-secret`, which must be owned by root or this process's user with no group/other access (e.g. `0600`), and must not be a symlink. See "Hardening the TPM key" above. |
+| `TPM2TOOLS_TCTI` / `TCTI` / `TEST_TCTI` | TPM2 | **Debug builds only**, and only when the policy sets no `tpm.tcti`. Standard `tpm2-tools`-style TCTI selector (e.g. `swtpm:host=localhost,port=2321`). Release builds use `tpm.tcti` from the policy, or `device:/dev/tpmrm0`. |
+| `TSS2_LOG` | TPM2 (read by tpm2-tss) | tpm2-tss's own log level. If it sets `debug` or `trace` for any module, the TPM provider **refuses to run**: at those levels tpm2-tss logs raw TPM commands and responses (including ECDH shared secrets), session keys, and plaintext parameters, and `TSS2_LOGFILE` can send that to any path. `info` and below are fine. |
 
 Secrets are never read from environment variables (`/proc/<pid>/environ`
 is readable by same-user processes and inherited by children); every
@@ -581,13 +594,16 @@ require_derivation_secret = false   # refuse the TPM without /etc/hkdfguard/tpm.
 require_pinned_names = false        # true: only services in pinned_names exist on the TPM (provisioning allowlist)
 session_encryption = "auto"         # auto | required | off  (see "Session parameter encryption")
 pinned_session_salt_key_name = "000b<64 hex>"   # mandatory under `required`
+tcti = "device:/dev/tpmrm0"         # which TPM: device:<path> | tabrmd:<conf> | mssim:<conf> | swtpm:<conf>
 
 [tpm.pinned_names]                  # per-service expected TPM Name; refuse any other key
 "com.company.orders" = "000b<64 hex>"
 ```
 
 The file must be owned by root or by the process's user and not writable
-by group or others. Only a *missing* file means "no policy"; a present but
+by group or others.
+
+Only a *missing* file means "no policy"; a present but
 unreadable, too-broadly-writable, or malformed file makes every operation
 fail closed -- and resolves each hardening knob to its strictest setting
 (`session_encryption = "required"`, derivation secret required) rather than

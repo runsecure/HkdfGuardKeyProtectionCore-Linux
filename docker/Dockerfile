@@ -6,15 +6,21 @@
 # built or tested on the macOS host this crate was originally written on --
 # can be exercised for real. See docker/README.md for usage.
 
+# Ubuntu 24.04 LTS: tpm2-tss 4.x (4.0.1) from distro packages, and glibc
+# 2.39, so the release binaries built here run on Ubuntu 24.04+, Debian 13
+# and RHEL 10. (Debian 12 only offers tpm2-tss 3.2.1, even in backports.)
+#
 # Pinned by digest so a rebuild never silently picks up a different base
-# image. To take a Debian update, re-resolve deliberately:
-#   docker pull debian:bookworm-slim
-#   docker inspect --format='{{index .RepoDigests 0}}' debian:bookworm-slim
-# apt package versions below are intentionally not pinned: Debian mirrors
-# drop superseded point releases, so exact `pkg=version` pins would make
-# this build start failing on its own. The base digest bounds which
-# package set apt resolves against; Cargo.lock pins the Rust dependencies.
-FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
+# image. To take an update, re-resolve deliberately (and update
+# docker/Dockerfile.swtpm to match):
+#   docker pull ubuntu:24.04
+#   docker inspect --format='{{index .RepoDigests 0}}' ubuntu:24.04
+# apt package versions below are intentionally not pinned: the archive
+# drops superseded versions as updates land, so exact `pkg=version` pins
+# would make this build start failing on its own. The base digest bounds
+# which package set apt resolves against; Cargo.lock pins the Rust
+# dependencies.
+FROM ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CARGO_HOME=/usr/local/cargo \

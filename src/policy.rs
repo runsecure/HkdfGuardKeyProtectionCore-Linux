@@ -34,15 +34,15 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Default location of the policy file. Overridable with
-/// `HKDFGUARD_POLICY_FILE` (used by every test in this module and by
-/// deployments that keep configuration elsewhere).
+/// Location of the policy file. Release builds read only this path; debug
+/// builds (tests, development) may redirect it with `HKDFGUARD_POLICY_FILE`
+/// -- see [`crate::debug_only_env`] for why that is debug-only.
 const DEFAULT_POLICY_FILE: &str = "/etc/hkdfguard/policy.toml";
 
 fn policy_file_path() -> PathBuf {
-    std::env::var("HKDFGUARD_POLICY_FILE")
+    crate::debug_only_env("HKDFGUARD_POLICY_FILE")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_POLICY_FILE))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_POLICY_FILE))
 }
 
 /// Security assurance level a provider offers, independent of the specific
@@ -184,6 +184,29 @@ struct TpmPolicy {
     /// refuses to load without one. Under `auto` it is optional and its
     /// absence is logged once: passive sniffing is still defeated.
     pinned_session_salt_key_name: Option<String>,
+    /// Which TPM to talk to, as a tpm2-tss TCTI string:
+    /// `device:/dev/tpmrm0` (the default when unset), `tabrmd:...`,
+    /// `mssim:...` or `swtpm:...`. Set here, by root, because it decides
+    /// whose TPM derives the keys: a TCTI pointed at an attacker-run
+    /// simulator hands them a TPM whose seed they know.
+    tcti: Option<String>,
+}
+
+/// TCTI kinds tss-esapi can open; anything else is rejected at load time.
+const TCTI_KINDS: &[&str] = &["device", "tabrmd", "mssim", "swtpm"];
+
+// Checks that a policy TCTI names a supported kind. The rest of the string
+// (device path, host/port) is parsed by the TPM provider, which treats a
+// value it can't parse as "TPM unavailable", never as "use the default".
+fn validate_tcti(tcti: &str) -> Result<()> {
+    let kind = tcti.split(':').next().unwrap_or("");
+    if TCTI_KINDS.contains(&kind) {
+        return Ok(());
+    }
+    Err(Error::Provider(format!(
+        "hkdfguard policy: tpm.tcti \"{tcti}\" must start with one of: {}",
+        TCTI_KINDS.join(", ")
+    )))
 }
 
 /// Policy for TPM session parameter encryption (`tpm.session_encryption`).
@@ -362,6 +385,7 @@ pub struct Policy {
     pinned_tpm_names: BTreeMap<String, Vec<u8>>,
     tpm_session_encryption: SessionEncryption,
     pinned_session_salt_key_name: Option<Vec<u8>>,
+    tpm_tcti: Option<String>,
 }
 
 impl Policy {
@@ -507,6 +531,10 @@ impl Policy {
             ));
         }
 
+        if let Some(tcti) = &raw.tpm.tcti {
+            validate_tcti(tcti)?;
+        }
+
         Ok(Policy {
             selection,
             minimum_protection,
@@ -517,12 +545,18 @@ impl Policy {
             pinned_tpm_names,
             tpm_session_encryption: raw.tpm.session_encryption,
             pinned_session_salt_key_name,
+            tpm_tcti: raw.tpm.tcti,
         })
     }
 
     /// TPM session parameter-encryption mode (`tpm.session_encryption`).
     pub fn tpm_session_encryption(&self) -> SessionEncryption {
         self.tpm_session_encryption
+    }
+
+    /// The TCTI the TPM provider must use (`tpm.tcti`), if policy sets one.
+    pub fn tpm_tcti(&self) -> Option<&str> {
+        self.tpm_tcti.as_deref()
     }
 
     /// The administrator-pinned Name of the session salt key, if any.
@@ -771,6 +805,18 @@ pub(crate) fn tpm_session_encryption() -> SessionEncryption {
         Some(Ok(policy)) => policy.tpm_session_encryption(),
         Some(Err(_)) => SessionEncryption::Required,
         None => SessionEncryption::Auto,
+    }
+}
+
+/// The TCTI policy requires (`tpm.tcti`), if any. `Err` on a policy file
+/// that exists but can't be trusted: the TPM is then unavailable rather
+/// than opened at a default the administrator may have meant to avoid.
+#[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
+pub(crate) fn tpm_tcti() -> Result<Option<String>> {
+    match load() {
+        Some(Ok(policy)) => Ok(policy.tpm_tcti().map(str::to_owned)),
+        Some(Err(e)) => Err(e),
+        None => Ok(None),
     }
 }
 
@@ -1305,6 +1351,21 @@ mod tests {
             "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm.pinned_names]\n\"com.company.orders\" = \"{A_NAME}\"\n\"com.company.ORDERS\" = \"{A_NAME}\"\n"
         );
         assert!(Policy::from_toml_str(&doc).is_err(), "two keys differing only in case must be rejected");
+    }
+
+    #[test]
+    fn tpm_tcti_is_read_and_validated() {
+        let base = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n";
+        assert_eq!(Policy::from_toml_str(base).unwrap().tpm_tcti(), None, "unset by default");
+
+        for ok in ["device:/dev/tpmrm0", "device", "tabrmd:bus_type=system", "mssim:host=localhost,port=2321", "swtpm:port=2321"] {
+            let doc = format!("{base}[tpm]\ntcti = \"{ok}\"\n");
+            assert_eq!(Policy::from_toml_str(&doc).unwrap().tpm_tcti(), Some(ok), "{ok}");
+        }
+        for bad in ["", "libtss2-tcti-evil.so", "/tmp/evil.so", "cmd:sh", "devices:/dev/tpm0"] {
+            let doc = format!("{base}[tpm]\ntcti = \"{bad}\"\n");
+            assert!(Policy::from_toml_str(&doc).is_err(), "{bad:?} must be rejected");
+        }
     }
 
     #[test]

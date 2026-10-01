@@ -1,8 +1,9 @@
 # Builds and tests HKDFGuard for linux/x86_64 and linux/aarch64, each on a
 # *native* runner (no QEMU), inside the same docker/Dockerfile image that
 # docker/run-tests.sh and docker/build-dist.sh use locally -- so CI builds
-# exactly what a developer builds, against Debian bookworm's glibc 2.36 and
-# libtss2-esys.
+# exactly what a developer builds: Ubuntu 24.04, glibc 2.39, tpm2-tss 4.0.1.
+# The binaries therefore need glibc >= 2.39 (Ubuntu 24.04+, Debian 13,
+# RHEL 10) and libtss2-esys at runtime.
 #
 # Per architecture:
 #   1. docker/entrypoint-test.sh  -- the full matrix, including the TPM

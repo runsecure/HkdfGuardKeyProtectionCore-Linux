@@ -29,7 +29,7 @@
 # docker/Dockerfile, or docker/docker-compose.yml's `swtpm` service for a
 # containerized alternative). Exact tpm2-tools flag names/output can vary
 # slightly by version; this was written against the tpm2-tools release in
-# docker/Dockerfile (Debian bookworm) and not independently re-verified
+# docker/Dockerfile (Ubuntu 24.04) and not independently re-verified
 # against every other version.
 #
 # Usage: scripts/tpm-reboot-test.sh

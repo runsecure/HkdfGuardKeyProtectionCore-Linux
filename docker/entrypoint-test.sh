@@ -151,6 +151,50 @@ echo "--dek correctly rejected; unprovisioned wrap correctly refused; stdin and 
 rm -f "$DEK_FILE" "$WRAPPED_FILE" "$WRAPPED_FILE2" "$DEK_B64_FILE"
 unset HKDFGUARD_EXTERNAL_SECRET_DIR
 
+section "release builds take policy, TCTI and derivation secret only from root-owned config"
+# Debug builds (everything above) honor HKDFGUARD_POLICY_FILE, the TCTI
+# variables and HKDFGUARD_TPM_DERIVATION_SECRET_FILE so tests can redirect
+# them. Release builds must not. Install a real root policy that reaches
+# swtpm through `tpm.tcti`, then set all three variables to values that
+# would break anything that read them. The release binaries must ignore
+# them and work; the debug CLI, as a control, must read the bad policy and
+# fail -- proving this check would catch a release build that honored it.
+cargo build --release --features tpm2
+mkdir -p /etc/hkdfguard
+cat > /etc/hkdfguard/policy.toml <<'TOML'
+[selection]
+mode = "require"
+provider = "tpm2"
+
+[tpm]
+tcti = "swtpm:host=127.0.0.1,port=2321"
+TOML
+chmod 0644 /etc/hkdfguard/policy.toml
+
+BAD_DIR=$(mktemp -d)
+printf 'this is not = valid [toml' > "$BAD_DIR/policy.toml"
+printf 'group-readable, so refused if read' > "$BAD_DIR/secret"; chmod 0640 "$BAD_DIR/secret"
+export HKDFGUARD_POLICY_FILE="$BAD_DIR/policy.toml"
+export TCTI="device:/dev/nonexistent-tpm" TPM2TOOLS_TCTI="device:/dev/nonexistent-tpm"
+export HKDFGUARD_TPM_DERIVATION_SECRET_FILE="$BAD_DIR/secret"
+
+LD_LIBRARY_PATH=target/release /tmp/wrap_unwrap
+RELEASE_STDERR=$(target/release/hkdfguard-v1-initialize provision --service-name com.hkdfguard.dockertest.release 2>&1 >/dev/null) \
+    || { echo "FAIL: release CLI did not ignore the debug-only overrides: $RELEASE_STDERR" >&2; exit 1; }
+for var in HKDFGUARD_POLICY_FILE TPM2TOOLS_TCTI HKDFGUARD_TPM_DERIVATION_SECRET_FILE; do
+    grep -q "$var is set but ignored" <<<"$RELEASE_STDERR" \
+        || { echo "FAIL: release CLI did not warn that $var was ignored: $RELEASE_STDERR" >&2; exit 1; }
+done
+echo "release: wrap/unwrap on the TPM named by /etc/hkdfguard/policy.toml; all three overrides ignored, with warnings."
+
+if target/debug/hkdfguard-v1-initialize provision --service-name com.hkdfguard.dockertest.release >/dev/null 2>&1; then
+    echo "FAIL: control: the debug CLI should have read the malformed HKDFGUARD_POLICY_FILE and failed" >&2; exit 1
+fi
+echo "control: the debug CLI honored the malformed override and failed, as designed."
+
+unset HKDFGUARD_POLICY_FILE TCTI TPM2TOOLS_TCTI HKDFGUARD_TPM_DERIVATION_SECRET_FILE
+rm -rf /etc/hkdfguard "$BAD_DIR"
+
 section "hkdfguard-v1-initialize locks its memory when it can"
 # docker/run-tests.sh and CI grant CAP_IPC_LOCK, so the CLI must take the
 # mlockall path; it exits non-zero if that fails, so a clean exit with no

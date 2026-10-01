@@ -39,6 +39,28 @@ use zeroize::Zeroize; // scrub sensitive stack buffers before returning
 
 const MAX_SERVICE_LEN: usize = 128; // spec-mandated maximum service-name length in bytes
 
+/// Reads an environment variable that redirects security configuration
+/// (which policy file, which TPM, which derivation secret). Honored only in
+/// debug builds -- `cargo test`, `cargo build` -- so tests and development
+/// can point at scratch files and simulators. Release builds never read
+/// it: the environment is often set by lower-trust configuration than the
+/// root-owned files these settings otherwise come from, and must not be
+/// able to redirect them. A release build that finds one set logs a
+/// warning once per variable and carries on as if it were unset.
+pub(crate) fn debug_only_env(name: &'static str) -> Option<std::ffi::OsString> {
+    let value = std::env::var_os(name)?;
+    if cfg!(debug_assertions) {
+        return Some(value);
+    }
+    static WARNED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let mut warned = WARNED.lock().unwrap_or_else(|p| p.into_inner());
+    if !warned.contains(&name) {
+        warned.push(name);
+        log::warn!("hkdfguard: {name} is set but ignored: release builds take this setting only from root-owned configuration");
+    }
+    None
+}
+
 /// Serializes every setup call (`hkdfguard_create_kek`,
 /// `hkdfguard_kek_exists`) so that, combined with the latency floor in
 /// `gated_setup`, their aggregate rate is capped at one per

@@ -4,14 +4,12 @@
 //!  ______________________________________________________________________
 //! | HARDWARE-DEPENDENT CODE                                                |
 //! |                                                                        |
-//! | Verified (see docker/): natively built and linked against real        |
-//! | `libtss2-esys` 3.2.1 on Debian bookworm/aarch64, and the              |
-//! | `#[ignore]`d test below passed against a real `swtpm` instance --     |
-//! | TPM2_CreatePrimary + TPM2_ECDH_ZGen executed for real and produced    |
-//! | the same key deterministically across two calls. Not yet exercised   |
-//! | against a physical/discrete TPM chip or a TPM firmware TPM (fTPM);    |
-//! | re-run `docker/run-tests.sh` (or the steps in `docker/README.md`      |
-//! | for passing through a real `/dev/tpmrm0`) after any change here.      |
+//! | Verified: built and linked against real `libtss2-esys` 4.0.1 on       |
+//! | Ubuntu 24.04, with the `#[ignore]`d conformance suite passing against |
+//! | swtpm (docker/run-tests.sh) and against real firmware TPMs -- Intel   |
+//! | PTT and AMD fTPM (scripts/native-tpm-test.sh). Not yet exercised      |
+//! | against a discrete TPM chip (e.g. Infineon, Nuvoton). Re-run both     |
+//! | after any change here.                                                |
 //! |______________________________________________________________________|
 //! ```
 //!
@@ -107,8 +105,9 @@ use tss_esapi::{Context, TctiNameConf}; // the ESAPI connection handle and its c
 // wrapped before the secret was provisioned will fail their fingerprint
 // check (status -16) rather than decrypt to garbage. See README.
 
-/// Default location of the TPM derivation secret. Overridable with
-/// `HKDFGUARD_TPM_DERIVATION_SECRET_FILE`.
+/// Location of the TPM derivation secret. Debug builds may redirect it with
+/// `HKDFGUARD_TPM_DERIVATION_SECRET_FILE`; release builds read only this
+/// path (see [`crate::debug_only_env`]).
 const DEFAULT_DERIVATION_SECRET_FILE: &str = "/etc/hkdfguard/tpm.derivation-secret";
 
 /// Upper bound on the derivation-secret file's size. It only ever gets
@@ -120,9 +119,41 @@ const MAX_DERIVATION_SECRET_LEN: usize = 4096;
 const DERIVATION_SECRET_DOMAIN: &[u8] = b"hkdfguard-tpm2-derivation-secret-v1:";
 
 fn derivation_secret_path() -> PathBuf {
-    std::env::var("HKDFGUARD_TPM_DERIVATION_SECRET_FILE")
+    crate::debug_only_env("HKDFGUARD_TPM_DERIVATION_SECRET_FILE")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_DERIVATION_SECRET_FILE))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DERIVATION_SECRET_FILE))
+}
+
+/// The TCTI used when neither policy nor (in debug builds) the environment
+/// names one: the kernel's TPM resource manager.
+const DEFAULT_TCTI: &str = "device:/dev/tpmrm0";
+
+/// Which TPM to open, in order: `tpm.tcti` from the root-owned policy; in
+/// debug builds only, the tpm2-tools variables (`TPM2TOOLS_TCTI`, `TCTI`,
+/// `TEST_TCTI`, first set wins) so tests can reach swtpm; otherwise
+/// [`DEFAULT_TCTI`]. Release builds never take the TCTI from the
+/// environment: whoever chooses the TPM chooses who knows its seed.
+///
+/// A policy TCTI that can't be parsed, or a policy file that can't be
+/// trusted, is an error -- the TPM is then unavailable rather than opened
+/// at a default the administrator may have meant to avoid.
+fn resolve_tcti() -> Result<TctiNameConf> {
+    // Read every variable even when policy decides, so a release build
+    // warns about each one that is set rather than ignoring it silently.
+    let from_env: Vec<(&str, String)> = ["TPM2TOOLS_TCTI", "TCTI", "TEST_TCTI"]
+        .into_iter()
+        .filter_map(|name| crate::debug_only_env(name).map(|v| (name, v.to_string_lossy().into_owned())))
+        .collect();
+
+    if let Some(tcti) = crate::policy::tpm_tcti()? {
+        return TctiNameConf::from_str(&tcti)
+            .map_err(|e| Error::Provider(format!("tpm.tcti \"{tcti}\" in policy is not a usable TCTI: {e}")));
+    }
+    if let Some((name, value)) = from_env.first() {
+        return TctiNameConf::from_str(value)
+            .map_err(|e| Error::Provider(format!("{name}=\"{value}\" is not a usable TCTI: {e}")));
+    }
+    TctiNameConf::from_str(DEFAULT_TCTI).map_err(|e| Error::Provider(format!("default TCTI: {e}")))
 }
 
 /// Reads the optional derivation secret and condenses it to the fixed 32
@@ -233,9 +264,26 @@ impl Default for Tpm2Provider {
 // report this provider as unavailable rather than silently producing KEKs
 // this crate's persistence model can't actually rely on.
 fn open_context() -> Option<Context> {
-    let tcti = TctiNameConf::from_environment_variable() // e.g. TPM2TOOLS_TCTI / TCTI / TEST_TCTI, useful for pointing at swtpm
-        .or_else(|_| TctiNameConf::from_str("device:/dev/tpmrm0")) // otherwise assume a real, kernel-managed TPM device
-        .ok()?; // if neither resolves to a valid config, there's no TPM to use
+    // Checked before the TCTI is even opened: tpm2-tss starts logging from
+    // the first command.
+    if let Some(level) = std::env::var_os("TSS2_LOG") {
+        if tss2_log_exposes_secrets(&level.to_string_lossy()) {
+            log::error!(
+                "hkdfguard: TPM unavailable: TSS2_LOG enables debug/trace logging in tpm2-tss, which \
+                 writes raw TPM commands and responses (including ECDH shared secrets), session keys \
+                 and plaintext parameters to its log; unset TSS2_LOG or lower it to info or below"
+            );
+            return None;
+        }
+    }
+
+    let tcti = match resolve_tcti() {
+        Ok(tcti) => tcti,
+        Err(e) => {
+            log::error!("hkdfguard: TPM unavailable: {e}");
+            return None;
+        }
+    };
     let mut ctx = Context::new(tcti).ok()?; // actually establish the ESAPI connection; `None` on any failure
 
     // Resolve the derivation secret before the self-test, purely so a
@@ -293,6 +341,24 @@ fn open_context() -> Option<Context> {
     }
 
     Some(ctx)
+}
+
+/// Whether a `TSS2_LOG` value turns on tpm2-tss logging at `debug` or
+/// `trace` for any module. At those levels its TCTI layer logs raw command
+/// and response bytes -- `TPM2_ECDH_ZGen`'s response is the shared secret,
+/// and `TPM2_CreatePrimary`'s command carries the derivation-secret-derived
+/// template label -- and its ESAPI layer logs session keys and parameters
+/// before encryption. `TSS2_LOGFILE` can send all of that to any path.
+///
+/// Mirrors tpm2-tss's own parser (src/util/log.c, `getLogLevel`): every `+`
+/// introduces a level, matched case-insensitively by prefix. The module
+/// before the `+` is deliberately ignored: any module at these levels
+/// leaks.
+fn tss2_log_exposes_secrets(value: &str) -> bool {
+    value.split('+').skip(1).any(|after_plus| {
+        let lower = after_plus.to_ascii_lowercase();
+        lower.starts_with("debug") || lower.starts_with("trace")
+    })
 }
 
 /// Once-per-process result of [`validate_derivation_secret_is_honored`].
@@ -1827,6 +1893,95 @@ mod tests {
     }
 
     // ---- session parameter encryption ----
+
+    // ---- TCTI selection: policy, then (debug builds) environment, then default ----
+
+    // Runs `f` with the three tpm2-tools TCTI variables cleared, except
+    // `TCTI` set to `tcti_env` when given, then restores their previous
+    // values -- the swtpm-backed tests in this module rely on TCTI.
+    fn with_tcti_env<T>(tcti_env: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let saved: Vec<_> = ["TPM2TOOLS_TCTI", "TCTI", "TEST_TCTI"].iter().map(|n| (*n, std::env::var_os(n))).collect();
+        for (n, _) in &saved {
+            std::env::remove_var(n);
+        }
+        if let Some(v) = tcti_env {
+            std::env::set_var("TCTI", v);
+        }
+        let result = f();
+        for (n, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(n, v),
+                None => std::env::remove_var(n),
+            }
+        }
+        result
+    }
+
+    fn tcti_of(result: Result<TctiNameConf>) -> String {
+        format!("{:?}", result.expect("a TCTI should resolve"))
+    }
+
+    #[test]
+    #[serial]
+    fn tcti_defaults_to_the_kernel_resource_manager() {
+        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
+        let resolved = with_tcti_env(None, resolve_tcti);
+        std::env::remove_var("HKDFGUARD_POLICY_FILE");
+        assert_eq!(tcti_of(resolved), tcti_of(TctiNameConf::from_str(DEFAULT_TCTI).map_err(|e| Error::Provider(e.to_string()))));
+    }
+
+    #[test]
+    #[serial]
+    fn policy_tcti_wins_over_the_environment() {
+        let doc = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\ntcti = \"swtpm:host=127.0.0.1,port=9999\"\n";
+        let resolved = with_policy(doc, || with_tcti_env(Some("device:/dev/somewhere-else"), resolve_tcti));
+        let shown = tcti_of(resolved);
+        assert!(shown.contains("9999"), "policy TCTI must be used, got {shown}");
+    }
+
+    #[test]
+    #[serial]
+    fn environment_tcti_is_used_in_debug_builds_when_policy_sets_none() {
+        // This test binary is a debug build, so the variable is honored;
+        // release builds ignore it (crate::debug_only_env), which the
+        // Docker suite checks against the release library.
+        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
+        let resolved = with_tcti_env(Some("swtpm:host=127.0.0.1,port=7777"), resolve_tcti);
+        std::env::remove_var("HKDFGUARD_POLICY_FILE");
+        assert!(tcti_of(resolved).contains("7777"));
+    }
+
+    #[test]
+    #[serial]
+    fn an_unusable_policy_tcti_makes_the_tpm_unavailable_not_the_default() {
+        // Passes the policy's kind check but can't be parsed as a TCTI.
+        let doc = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\ntcti = \"mssim:port=notaport\"\n";
+        let resolved = with_policy(doc, || with_tcti_env(None, resolve_tcti));
+        assert!(resolved.is_err(), "a bad policy TCTI must not fall back to the default device");
+
+        // And a broken policy file is an error too, not the default.
+        let resolved = with_policy("[selection]\nmode = \"require\"\n", || with_tcti_env(None, resolve_tcti));
+        assert!(resolved.is_err());
+    }
+
+    #[test]
+    fn tss2_log_at_debug_or_trace_is_refused_and_lower_levels_are_not() {
+        for leaky in [
+            "all+debug",
+            "all+trace",
+            "all+DEBUG",
+            "tcti+debug",
+            "esys+Trace",
+            "all+warning,tcti+debug",
+            "esys+info,all+trace",
+            "all+debugging", // tpm2-tss matches levels by prefix
+        ] {
+            assert!(tss2_log_exposes_secrets(leaky), "{leaky:?} must be refused");
+        }
+        for safe in ["", "all+none", "all+error", "all+warning", "all+info", "esys+info,tcti+warning", "debug", "trace"] {
+            assert!(!tss2_log_exposes_secrets(safe), "{safe:?} must be allowed");
+        }
+    }
 
     #[test]
     fn manufacturer_classification_skips_only_known_internal_tpms() {
