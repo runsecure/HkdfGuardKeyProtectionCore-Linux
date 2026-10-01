@@ -34,6 +34,14 @@ export TPM2TOOLS_TCTI="$TCTI"
 tpm2_startup -c -T "$TCTI"
 echo "swtpm is up and started (TCTI=$TCTI)."
 
+# The TPM provider requires a derivation secret by default. Debug builds
+# (the test suites below) take its path from this variable; tests that
+# exercise running without one set tpm.require_derivation_secret = false
+# in their own policy.
+TPM_SECRET_DIR=$(mktemp -d)
+( umask 077; head -c 32 /dev/urandom > "$TPM_SECRET_DIR/tpm.derivation-secret" )
+export HKDFGUARD_TPM_DERIVATION_SECRET_FILE="$TPM_SECRET_DIR/tpm.derivation-secret"
+
 # The tpm2 feature's non-hardware tests -- derivation-secret file
 # handling, template attributes, client-side Name computation -- need the
 # feature to compile but no TPM, and are therefore not #[ignore]d. They
@@ -50,6 +58,8 @@ if [ -z "$SOFTHSM_MODULE" ]; then
     echo "libsofthsm2.so not found" >&2
     exit 1
 fi
+# Same label and PINs as scripts/native-tpm-test.sh; the pkcs11 tests select
+# this token by label (SOFTHSM_TEST_TOKEN_LABEL in src/provider/pkcs11.rs).
 softhsm2-util --init-token --free --label hkdfguard-test --pin 1234 --so-pin 5678
 export HKDFGUARD_PKCS11_MODULE="$SOFTHSM_MODULE"
 # The PIN is read from an owner-only file, never an environment variable
@@ -161,6 +171,7 @@ section "release builds take security settings only from root-owned config, not 
 cargo build --release --features tpm2,pkcs11
 cargo build --features tpm2,pkcs11   # the debug CLI used as the control below
 mkdir -p /etc/hkdfguard
+( umask 077; head -c 32 /dev/urandom > /etc/hkdfguard/tpm.derivation-secret )  # required by default
 cat > /etc/hkdfguard/policy.toml <<'TOML'
 [selection]
 mode = "require"

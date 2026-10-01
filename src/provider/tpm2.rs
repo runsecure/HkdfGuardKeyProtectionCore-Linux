@@ -156,12 +156,15 @@ fn resolve_tcti() -> Result<TctiNameConf> {
     TctiNameConf::from_str(DEFAULT_TCTI).map_err(|e| Error::Provider(format!("default TCTI: {e}")))
 }
 
-/// Reads the optional derivation secret and condenses it to the fixed 32
-/// bytes handed to `TPM2_CreatePrimary` as `inSensitive.data`.
+/// Reads the derivation secret and condenses it to the 32 bytes folded into
+/// the primary template's `unique` field (see this module's extra-entropy
+/// note).
 ///
-/// - Absent, and policy doesn't require one: `Ok(None)` -- derivation
-///   falls back to seed + service label, exactly as before.
-/// - Absent, with `tpm.require_derivation_secret = true`: `Err`.
+/// - Absent: `Err`, naming the file and how to create it. The secret is
+///   required unless policy sets `tpm.require_derivation_secret = false`.
+/// - Absent, with that set to `false`: `Ok(None)` -- the derivation then
+///   uses the TPM seed and service label alone -- plus a warning, once per
+///   process, that any local process with TPM access can reproduce the keys.
 /// - Present but untrustworthy (wrong owner, group/other-accessible, a
 ///   symlink, oversized, empty): always `Err`. A secret that exists but
 ///   can't be trusted is never silently skipped, since that would quietly
@@ -169,6 +172,9 @@ fn resolve_tcti() -> Result<TctiNameConf> {
 ///
 /// Read fresh on every call, like the policy file and for the same reason
 /// -- there is no cached copy of it anywhere in the process.
+/// Logged once: running without a derivation secret because policy allows it.
+static MISSING_SECRET_WARNED: OnceLock<()> = OnceLock::new();
+
 fn read_derivation_secret() -> Result<Option<Zeroizing<[u8; 32]>>> {
     use crate::secure_file::{
         open_checked, FileRequirements, Owner, SecretBuffer, FORBID_GROUP_OTHER_ACCESS,
@@ -186,10 +192,20 @@ fn read_derivation_secret() -> Result<Option<Zeroizing<[u8; 32]>>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             if crate::policy::require_tpm_derivation_secret() {
                 return Err(Error::Provider(format!(
-                    "TPM derivation secret is required by policy but {} does not exist",
-                    path.display()
+                    "TPM derivation secret {path} does not exist. Create it, owned by the user this \
+                     service runs as: (umask 077; head -c 32 /dev/urandom > {path}) -- or, to run \
+                     without one, set tpm.require_derivation_secret = false in the policy",
+                    path = path.display()
                 )));
             }
+            MISSING_SECRET_WARNED.get_or_init(|| {
+                log::warn!(
+                    "hkdfguard: no TPM derivation secret at {} and tpm.require_derivation_secret = false: \
+                     TPM keys are derived from the TPM seed and the service name alone, so any local \
+                     process that can open the TPM can reproduce them",
+                    path.display()
+                );
+            });
             return Ok(None);
         }
         Err(e) => {
@@ -1227,30 +1243,55 @@ mod tests {
         file.flush().unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
 
-        std::env::set_var("HKDFGUARD_TPM_DERIVATION_SECRET_FILE", &path);
-        let result = f(&path);
-        std::env::remove_var("HKDFGUARD_TPM_DERIVATION_SECRET_FILE");
-        result
+        with_secret_path(&path, || f(&path))
+    }
+
+    // Points HKDFGUARD_TPM_DERIVATION_SECRET_FILE at `path` for the
+    // duration of `f`, then restores whatever was there before. Restoring,
+    // not removing, matters: the test harness exports a real secret, and
+    // the TPM refuses to run without one, so a helper that cleared the
+    // variable would make every later TPM test in the process fail.
+    fn with_secret_path<T>(path: impl AsRef<std::ffi::OsStr>, f: impl FnOnce() -> T) -> T {
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("HKDFGUARD_TPM_DERIVATION_SECRET_FILE", v),
+                    None => std::env::remove_var("HKDFGUARD_TPM_DERIVATION_SECRET_FILE"),
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("HKDFGUARD_TPM_DERIVATION_SECRET_FILE"));
+        std::env::set_var("HKDFGUARD_TPM_DERIVATION_SECRET_FILE", path);
+        f()
     }
 
     // Points the env var at a path that doesn't exist.
     fn with_no_secret_file<T>(f: impl FnOnce() -> T) -> T {
-        std::env::set_var(
-            "HKDFGUARD_TPM_DERIVATION_SECRET_FILE",
-            "/nonexistent-hkdfguard-tpm-secret-for-tests",
-        );
-        let result = f();
-        std::env::remove_var("HKDFGUARD_TPM_DERIVATION_SECRET_FILE");
-        result
+        with_secret_path("/nonexistent-hkdfguard-tpm-secret-for-tests", f)
     }
 
     #[test]
     #[serial]
-    fn absent_secret_is_none_when_policy_does_not_require_one() {
+    fn absent_secret_is_an_error_by_default() {
+        // No policy file at all: the secret is still required.
         std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
         let result = with_no_secret_file(read_derivation_secret);
         std::env::remove_var("HKDFGUARD_POLICY_FILE");
-        assert!(result.unwrap().is_none(), "no secret and no policy must derive as before");
+        match result {
+            Err(Error::Provider(msg)) => assert!(msg.contains("head -c 32 /dev/urandom"), "the error must say how to create it: {msg}"),
+            other => panic!("a missing secret must be an error by default, got {:?}", other.map(|v| v.is_some())),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn absent_secret_is_allowed_only_when_policy_turns_the_requirement_off() {
+        let result = with_policy(
+            "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nrequire_derivation_secret = false\n",
+            || with_no_secret_file(read_derivation_secret),
+        );
+        assert!(result.unwrap().is_none(), "with the requirement off, a missing secret derives without one");
     }
 
     #[test]
@@ -1331,9 +1372,7 @@ mod tests {
         let link = dir.path().join("link-to-secret");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        std::env::set_var("HKDFGUARD_TPM_DERIVATION_SECRET_FILE", &link);
-        let result = read_derivation_secret();
-        std::env::remove_var("HKDFGUARD_TPM_DERIVATION_SECRET_FILE");
+        let result = with_secret_path(&link, read_derivation_secret);
         assert!(result.is_err(), "the secret must not be reachable through a symlink");
     }
 
@@ -1841,7 +1880,11 @@ mod tests {
     #[serial]
     fn derivation_secret_self_test_reports_a_verdict_when_a_secret_is_configured() {
         // With no secret there is nothing to verify and nothing to cache.
-        let verdict = with_no_secret_file(|| with_tpm_context(validate_derivation_secret_is_honored)).unwrap();
+        let verdict = with_policy(
+            "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nrequire_derivation_secret = false\n",
+            || with_no_secret_file(|| with_tpm_context(validate_derivation_secret_is_honored)),
+        )
+        .unwrap();
         assert_eq!(verdict, None, "no secret configured must yield no verdict");
 
         // With one, a conformant TPM must return a positive verdict.
@@ -2189,51 +2232,54 @@ mod tests {
     #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
     #[serial]
     fn require_pinned_names_makes_provisioning_a_real_gate() {
-        std::env::set_var("HKDFGUARD_TPM_DERIVATION_SECRET_FILE", "/nonexistent-hkdfguard-tpm-secret-for-tests");
-        let service = "com.company.allowlisted";
-        let allowlist_only = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nrequire_pinned_names = true\n";
+        with_no_secret_file(|| {
+            let service = "com.company.allowlisted";
+            let allowlist_only = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nrequire_pinned_names = true\nrequire_derivation_secret = false\n";
 
-        // Unpinned: not provisioned, wrap/unwrap decline softly, and
-        // "create" is refused with the exact Name to pin.
-        let message = with_policy(allowlist_only, || {
-            let provider = Tpm2Provider::new();
-            assert!(provider.probe(), "no TPM available");
-            assert!(!provider.kek_exists(service).unwrap(), "an unpinned service must not exist");
+            // Unpinned: not provisioned, wrap/unwrap decline softly, and
+            // "create" is refused with the exact Name to pin.
+            let message = with_policy(allowlist_only, || {
+                let provider = Tpm2Provider::new();
+                assert!(provider.probe(), "no TPM available");
+                assert!(!provider.kek_exists(service).unwrap(), "an unpinned service must not exist");
+                assert!(
+                    matches!(provider.load_kek(service, false), Err(Error::KeyNotProvisioned(_))),
+                    "loading an unpinned service must decline"
+                );
+                match provider.load_kek(service, true) {
+                    Err(Error::Provider(msg)) => msg,
+                    Err(other) => panic!("expected Provider error with pinning instructions, got {other:?}"),
+                    Ok(_) => panic!("creating an unpinned service must be refused"),
+                }
+            });
+
+            // The Name in the message is the one this TPM actually derives
+            // (under the same policy: no derivation secret).
+            let actual = with_policy(allowlist_only, || {
+                with_tpm_context(|ctx| {
+                    let (_public, name) = create_and_read_primary(ctx, service, None)?;
+                    Ok(hex(name.value()))
+                })
+            })
+            .unwrap();
             assert!(
-                matches!(provider.load_kek(service, false), Err(Error::KeyNotProvisioned(_))),
-                "loading an unpinned service must decline"
+                message.contains(&format!("\"{service}\" = \"{actual}\"")),
+                "the refusal must carry a paste-ready pin for the real Name; got: {message}"
             );
-            match provider.load_kek(service, true) {
-                Err(Error::Provider(msg)) => msg,
-                Err(other) => panic!("expected Provider error with pinning instructions, got {other:?}"),
-                Ok(_) => panic!("creating an unpinned service must be refused"),
-            }
-        });
 
-        // The Name in the message is the one this TPM actually derives.
-        let actual = with_tpm_context(|ctx| {
-            let (_public, name) = create_and_read_primary(ctx, service, None)?;
-            Ok(hex(name.value()))
-        })
-        .unwrap();
-        assert!(
-            message.contains(&format!("\"{service}\" = \"{actual}\"")),
-            "the refusal must carry a paste-ready pin for the real Name; got: {message}"
-        );
-
-        // Pinned (as the operator would, from that message): now it exists,
-        // loads, and works end to end.
-        let pinned = format!("{allowlist_only}[tpm.pinned_names]\n\"{service}\" = \"{actual}\"\n");
-        with_policy(&pinned, || {
-            let provider = Tpm2Provider::new();
-            assert!(provider.kek_exists(service).unwrap(), "a pinned service must exist");
-            let handle = provider.load_kek(service, false).unwrap();
-            let h = crate::crypto::payload_ecdh_point(&[0x42u8; 32]).unwrap();
-            assert_ne!(*handle.ecdh(&h).unwrap(), [0u8; 32]);
-            // Other services are still refused.
-            assert!(!provider.kek_exists("com.company.notpinned").unwrap());
+            // Pinned (as the operator would, from that message): now it exists,
+            // loads, and works end to end.
+            let pinned = format!("{allowlist_only}[tpm.pinned_names]\n\"{service}\" = \"{actual}\"\n");
+            with_policy(&pinned, || {
+                let provider = Tpm2Provider::new();
+                assert!(provider.kek_exists(service).unwrap(), "a pinned service must exist");
+                let handle = provider.load_kek(service, false).unwrap();
+                let h = crate::crypto::payload_ecdh_point(&[0x42u8; 32]).unwrap();
+                assert_ne!(*handle.ecdh(&h).unwrap(), [0u8; 32]);
+                // Other services are still refused.
+                assert!(!provider.kek_exists("com.company.notpinned").unwrap());
+            });
         });
-        std::env::remove_var("HKDFGUARD_TPM_DERIVATION_SECRET_FILE");
     }
 
     #[test]

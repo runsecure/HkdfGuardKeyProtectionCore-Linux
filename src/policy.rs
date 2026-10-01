@@ -209,16 +209,15 @@ fn token_field(field: &str, value: &str, max: usize) -> Result<String> {
 /// TPM2-provider-specific administrative controls. Parsed and validated
 /// on every build (so a policy file is portable across builds with and
 /// without the `tpm2` feature) but only consulted by the TPM2 provider.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TpmPolicy {
     /// Refuse to use the TPM provider at all unless the derivation-secret
-    /// file is present and trustworthy. Default `false`, which means "mix
-    /// the secret into the key derivation if the file is there, otherwise
-    /// derive from the TPM seed and service label alone" -- so enabling
-    /// the secret on an existing deployment doesn't silently become
-    /// mandatory everywhere.
-    #[serde(default)]
+    /// file is present and trustworthy. Default `true`: without the secret
+    /// the derivation depends only on the TPM seed and a public label, so
+    /// any local process that can open the TPM reproduces every key.
+    /// Setting it `false` allows running without one, with a warning.
+    #[serde(default = "default_true")]
     require_derivation_secret: bool,
     /// Expected TPM Name, per service, as lowercase hex. When a service
     /// has an entry here, the Name the TPM reports for its key must match
@@ -269,6 +268,22 @@ fn validate_tcti(tcti: &str) -> Result<()> {
         "hkdfguard policy: tpm.tcti \"{tcti}\" must start with one of: {}",
         TCTI_KINDS.join(", ")
     )))
+}
+
+// Manual rather than derived: `require_derivation_secret` must default to
+// true when the `[tpm]` table is absent, exactly as when it is present
+// without the key.
+impl Default for TpmPolicy {
+    fn default() -> Self {
+        TpmPolicy {
+            require_derivation_secret: true,
+            pinned_names: BTreeMap::new(),
+            require_pinned_names: false,
+            session_encryption: SessionEncryption::default(),
+            pinned_session_salt_key_name: None,
+            tcti: None,
+        }
+    }
 }
 
 /// Policy for TPM session parameter encryption (`tpm.session_encryption`).
@@ -835,18 +850,15 @@ pub(crate) fn setup_min_delay() -> Duration {
 /// Whether the TPM2 provider may only be used with a derivation-secret
 /// file present (`tpm.require_derivation_secret`).
 ///
-/// Defaults to `false` with no policy file -- the secret is an opt-in
-/// hardening step, and defaulting it on would make every TPM deployment
-/// that hasn't provisioned one stop working. A policy file that exists
-/// but is *invalid* returns `true`, because a broken policy must never be
-/// the thing that relaxes a security control (the surrounding operation
-/// fails closed on that same policy anyway).
+/// `true` unless a valid policy explicitly sets it `false`: with no policy
+/// file, with a policy that doesn't mention it, and with a policy file
+/// that exists but is invalid (a broken policy must never be the thing
+/// that relaxes a security control).
 #[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
 pub(crate) fn require_tpm_derivation_secret() -> bool {
     match load() {
         Some(Ok(policy)) => policy.require_tpm_derivation_secret(),
-        Some(Err(_)) => true,
-        None => false,
+        Some(Err(_)) | None => true,
     }
 }
 
@@ -1372,11 +1384,20 @@ mod tests {
     const A_NAME: &str = "000b0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
 
     #[test]
-    fn tpm_section_defaults_to_no_requirement_and_no_pins() {
-        let policy = Policy::from_toml_str("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n").unwrap();
-        assert!(!policy.require_tpm_derivation_secret());
+    fn tpm_section_defaults_to_requiring_the_secret_and_no_pins() {
+        let base = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n";
+        let policy = Policy::from_toml_str(base).unwrap();
+        assert!(policy.require_tpm_derivation_secret(), "required by default with no [tpm] table");
         assert!(!policy.require_tpm_pinned_names(), "the allowlist must be opt-in");
         assert_eq!(policy.pinned_tpm_name("com.company.orders"), None);
+
+        // A [tpm] table that doesn't mention it gets the same default.
+        let doc = format!("{base}[tpm]\nsession_encryption = \"auto\"\n");
+        assert!(Policy::from_toml_str(&doc).unwrap().require_tpm_derivation_secret());
+
+        // Only an explicit `false` turns it off.
+        let doc = format!("{base}[tpm]\nrequire_derivation_secret = false\n");
+        assert!(!Policy::from_toml_str(&doc).unwrap().require_tpm_derivation_secret());
     }
 
     #[test]
@@ -1526,13 +1547,13 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn tpm_helpers_default_permissively_without_a_policy_file() {
+    fn tpm_helpers_without_a_policy_file() {
         std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
         let required = require_tpm_derivation_secret();
         let allowlist = require_tpm_pinned_names();
         let pinned = pinned_tpm_name("com.company.orders");
         std::env::remove_var("HKDFGUARD_POLICY_FILE");
-        assert!(!required, "no policy must not silently mandate a derivation secret");
+        assert!(required, "the derivation secret is required by default, policy or not");
         assert!(!allowlist, "no policy must not silently make the TPM refuse every service");
         assert_eq!(pinned.unwrap(), None);
     }

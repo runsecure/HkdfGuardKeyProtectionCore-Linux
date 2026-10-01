@@ -788,12 +788,17 @@ mod tests {
         assert_eq!(h1.ecdh(&eph_pub).unwrap().as_slice(), via_reported.raw_secret_bytes().as_slice());
     }
 
+    /// The SoftHSM2 token label both test harnesses create --
+    /// docker/entrypoint-test.sh and scripts/native-tpm-test.sh. Change all
+    /// three together.
+    const SOFTHSM_TEST_TOKEN_LABEL: &str = "hkdfguard-test";
+
     #[test]
-    #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token labelled hkdfguard-test"]
+    #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + the harness token (SOFTHSM_TEST_TOKEN_LABEL)"]
     fn policy_selects_the_module_and_the_token_by_label() {
-        // docker/entrypoint-test.sh initializes a token labelled
-        // "hkdfguard-test" and exports the module path for debug builds;
-        // here the module comes from policy instead, as in production.
+        // Both harnesses initialize a token labelled SOFTHSM_TEST_TOKEN_LABEL
+        // and export the module path for debug builds; here the module comes
+        // from policy instead, as in production.
         let module = std::env::var("HKDFGUARD_PKCS11_MODULE").expect("set by the test harness");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.toml");
@@ -801,7 +806,7 @@ mod tests {
             format!("[selection]\nmode = \"require\"\nprovider = \"pkcs11\"\n[pkcs11]\nmodule = \"{module}\"\ntoken_label = \"{label}\"\n")
         };
 
-        crate::secure_file::write_world_readable_for_tests(&path, policy_for("hkdfguard-test"));
+        crate::secure_file::write_world_readable_for_tests(&path, policy_for(SOFTHSM_TEST_TOKEN_LABEL));
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
         let matched = Pkcs11Provider::new().probe();
 
@@ -809,7 +814,7 @@ mod tests {
         let unmatched = Pkcs11Provider::new().probe();
         std::env::remove_var("HKDFGUARD_POLICY_FILE");
 
-        assert!(matched, "the token labelled hkdfguard-test must be selected");
+        assert!(matched, "the token labelled {SOFTHSM_TEST_TOKEN_LABEL} must be selected");
         assert!(!unmatched, "a label that matches no token must leave PKCS#11 unavailable, not pick another token");
     }
 

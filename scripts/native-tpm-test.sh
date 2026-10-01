@@ -14,9 +14,12 @@
 #   3. Unit tests for the tpm2 feature (no device needed).
 #   4. The #[ignore]d conformance suite against the REAL TPM: CreatePrimary
 #      determinism, per-service uniqueness, Name formula, acceptance of the
-#      hashed per-payload ECDH points, salted/encrypted session correctness, auto-mode.
-#   5. The same suite again with a TPM derivation secret provisioned, which
-#      exercises the runtime "does this TPM honor the secret" self-test.
+#      hashed per-payload ECDH points, salted/encrypted session correctness,
+#      auto-mode, and the runtime "does this TPM honor the derivation
+#      secret" self-test. A derivation secret is required by default, so
+#      the script provisions one (see Environment below).
+#   5. The same suite again under a second, different derivation secret:
+#      every service key changes, and everything must still pass.
 #   6. Learns the salt-key and service-key Names from the TPM (the operator
 #      helpers in src/provider/tpm2.rs) and writes a policy that REQUIRES
 #      encrypted sessions with both Names pinned.
@@ -43,8 +46,10 @@
 #   HKDFGUARD_NATIVE_TEST_STATE  where `reboot capture` saves its state
 #                                (default: ${XDG_STATE_HOME:-~/.local/state}/hkdfguard-native-tpm-test)
 #   HKDFGUARD_TPM_DERIVATION_SECRET_FILE
-#                                if set, honored throughout (and required
-#                                to be set identically for reboot verify)
+#                                the derivation secret to use throughout. If
+#                                unset, the script creates one: in its temp
+#                                dir for a full run, and in the state dir for
+#                                `reboot`, where capture and verify must share it.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -87,6 +92,14 @@ trap 'rm -rf "$WORK"' EXIT
 export HKDFGUARD_POLICY_FILE="$WORK/no-policy"
 export HKDFGUARD_EXTERNAL_SECRET_DIR="$WORK/no-external-secret"
 
+# The TPM provider refuses to run without a derivation secret unless policy
+# says otherwise. Provision a throwaway one for a full run; `reboot` keeps
+# its own in the state dir (below) so it survives the reboot.
+if [ -z "${HKDFGUARD_TPM_DERIVATION_SECRET_FILE:-}" ] && [ "$MODE" != "reboot" ]; then
+    ( umask 077; head -c 32 /dev/urandom > "$WORK/tpm.derivation-secret" )
+    export HKDFGUARD_TPM_DERIVATION_SECRET_FILE="$WORK/tpm.derivation-secret"
+fi
+
 # Writes $1 as the active policy file (root-or-self owned, 0600 -- the
 # library refuses anything looser).
 use_policy() {
@@ -117,6 +130,9 @@ if [ "$MODE" = "reboot" ]; then
     STATE="${HKDFGUARD_NATIVE_TEST_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/hkdfguard-native-tpm-test}"
     SERVICE="com.hkdfguard.nativetest.reboot"
     use_policy $'[selection]\nmode = "require"\nprovider = "tpm2"\n'
+    # The secret must be identical before and after the reboot, or the key
+    # can't be re-derived: keep it with the rest of the captured state.
+    export HKDFGUARD_TPM_DERIVATION_SECRET_FILE="${HKDFGUARD_TPM_DERIVATION_SECRET_FILE:-$STATE/tpm.derivation-secret}"
 
     section "build (--features tpm2)"
     cargo build --features tpm2
@@ -126,6 +142,8 @@ if [ "$MODE" = "reboot" ]; then
         capture)
             section "reboot capture -> $STATE"
             mkdir -p "$STATE"; chmod 700 "$STATE"
+            [ -f "$HKDFGUARD_TPM_DERIVATION_SECRET_FILE" ] \
+                || ( umask 077; head -c 32 /dev/urandom > "$HKDFGUARD_TPM_DERIVATION_SECRET_FILE" )
             ( umask 077; head -c 32 /dev/urandom > "$STATE/dek.bin" )
             HKDFGUARD_PIN_SERVICE="$SERVICE" learn print_service_key_name_for_pinning SERVICE_KEY_NAME > "$STATE/service-name.hex"
             [ -s "$STATE/service-name.hex" ] || { echo "could not learn the service key Name" >&2; exit 1; }
@@ -137,14 +155,14 @@ if [ "$MODE" = "reboot" ]; then
                 --key-file-path "$STATE/wrapped.key" --service-name "$SERVICE" --dek-stdin --force
             note "service key Name: $(cat "$STATE/service-name.hex")"
             note "wrapped DEK saved. Now REBOOT this machine, then run: scripts/native-tpm-test.sh reboot verify"
-            if [ -n "${HKDFGUARD_TPM_DERIVATION_SECRET_FILE:-}" ]; then
-                note "a derivation secret was in use; export HKDFGUARD_TPM_DERIVATION_SECRET_FILE identically before verify"
-            fi
+            note "derivation secret: $HKDFGUARD_TPM_DERIVATION_SECRET_FILE -- verify must use the same one"
             exit 0
             ;;
         verify)
             section "reboot verify <- $STATE"
             [ -f "$STATE/wrapped.key" ] || { echo "no captured state in $STATE; run 'reboot capture' first" >&2; exit 1; }
+            [ -f "$HKDFGUARD_TPM_DERIVATION_SECRET_FILE" ] \
+                || { echo "derivation secret $HKDFGUARD_TPM_DERIVATION_SECRET_FILE is missing; capture's secret is needed to re-derive the key" >&2; exit 1; }
             before=$(cat "$STATE/service-name.hex")
             after=$(HKDFGUARD_PIN_SERVICE="$SERVICE" learn print_service_key_name_for_pinning SERVICE_KEY_NAME)
             if [ "$before" != "$after" ]; then
@@ -194,11 +212,11 @@ cargo test --features tpm2 -- --ignored --test-threads=1 "${SKIP[@]}"
 # ---------------------------------------------------------------------
 # 5. Same suite with a derivation secret provisioned
 # ---------------------------------------------------------------------
-section "conformance suite again with a TPM derivation secret (exercises the runtime honor check)"
-( umask 077; head -c 32 /dev/urandom > "$WORK/tpm.derivation-secret" )
-HKDFGUARD_TPM_DERIVATION_SECRET_FILE="$WORK/tpm.derivation-secret" \
+section "conformance suite again under a second, different derivation secret"
+( umask 077; head -c 32 /dev/urandom > "$WORK/tpm.derivation-secret.2" )
+HKDFGUARD_TPM_DERIVATION_SECRET_FILE="$WORK/tpm.derivation-secret.2" \
     cargo test --features tpm2 -- --ignored --test-threads=1 "${SKIP[@]}"
-note "the derivation secret changed every service key; the suite still passed, so this TPM honors it"
+note "a different secret changed every service key; the suite still passed"
 
 # ---------------------------------------------------------------------
 # 6. Learn pins from the TPM, write a `required` policy
@@ -262,7 +280,9 @@ if [ "$HAVE_SOFTHSM" -eq 1 ]; then
     export SOFTHSM2_CONF="$WORK/softhsm2.conf"
     mkdir -p "$WORK/tokens"
     printf 'directories.tokendir = %s\nobjectstore.backend = file\n' "$WORK/tokens" > "$SOFTHSM2_CONF"
-    softhsm2-util --init-token --free --label hkdfguard-native --pin 1234 --so-pin 5678 >/dev/null
+    # Same label and PINs as docker/entrypoint-test.sh; the pkcs11 tests
+    # select this token by label (SOFTHSM_TEST_TOKEN_LABEL in src/provider/pkcs11.rs).
+    softhsm2-util --init-token --free --label hkdfguard-test --pin 1234 --so-pin 5678 >/dev/null
     ( umask 077; printf '1234\n' > "$WORK/pkcs11.pin" )
     export HKDFGUARD_PKCS11_MODULE="$SOFTHSM_MODULE" HKDFGUARD_PKCS11_PIN_FILE="$WORK/pkcs11.pin"
     cargo test --features pkcs11 -- --ignored --test-threads=1

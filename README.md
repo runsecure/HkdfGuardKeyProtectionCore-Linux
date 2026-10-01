@@ -188,19 +188,20 @@ environment-variable override.
 
 ### Hardening the TPM key
 
-By default the TPM provider derives each service's KEK with a
-deterministic `TPM2_CreatePrimary` from the TPM's own primary seed plus a
-per-service label. That makes the key unexportable and machine-bound, but
-it also means **any process that can open `/dev/tpmrm0` can issue the
-same command and reproduce the same key.** An `authValue` cannot fix
+The TPM provider derives each service's KEK with a deterministic
+`TPM2_CreatePrimary` from the TPM's own primary seed plus a per-service
+label. That makes the key unexportable and machine-bound, but on its own
+it would also mean **any process that can open `/dev/tpmrm0` could issue
+the same command and reproduce the same key.** An `authValue` cannot fix
 that, because the authValue is not an input to the derivation — an
 attacker simply re-derives the key with an authValue of their own.
 
-Two optional controls close that gap:
+Two controls close that gap:
 
-**1. A host derivation secret.** Provision a root-owned secret and the
-derived key depends on the TPM seed *and* a file the attacker must also
-be able to read:
+**1. A host derivation secret (required by default).** The derived key
+depends on the TPM seed *and* a file the attacker must also be able to
+read. **The TPM provider refuses to run without it**, logging the exact
+command to create it; provision it before first use:
 
 ```sh
 install -d -m 0700 /etc/hkdfguard
@@ -212,6 +213,13 @@ trimming, because any trimming rule would silently change the derived key
 for a secret ending in that byte. A file that is present but
 untrustworthy (wrong owner, group/other-accessible, a symlink, empty,
 oversized) is a hard error, never silently ignored.
+
+To run without one, set `require_derivation_secret = false` under `[tpm]`
+in the policy. The provider then derives from the TPM seed and service
+name alone and logs a warning that any local process able to open the TPM
+can reproduce the keys. Adding or removing the secret changes every TPM
+KEK, so DEKs wrapped before the change fail their fingerprint check
+(`-16`) -- decide before wrapping anything.
 
 > **This changes the KEK.** Adding, removing, or altering the secret
 > derives a different key, so DEKs wrapped beforehand will fail their
@@ -238,9 +246,6 @@ area that anyone could recompute), this compares against a value held in
 the root-owned policy file, so substitution is detectable.
 
 ```toml
-[tpm]
-require_derivation_secret = true       # refuse the TPM without the secret file
-
 [tpm.pinned_names]
 "com.company.orders" = "000b<64 hex chars>"   # quote service names: unquoted dots make nested tables
 ```
@@ -249,12 +254,9 @@ Get the values to pin from the TPM itself with the two operator-helper
 tests (see "Testing on a native Linux TPM" below; `scripts/native-tpm-test.sh`
 runs them for you). They go through the production derivation, so a pin
 learned *before* provisioning a derivation secret will not match after --
-provision the secret first, then pin. `require_derivation_secret`
-defaults to `false` so that enabling the secret on one host doesn't
-silently make it mandatory fleet-wide; set it `true` once every host has
-one. Both settings fail closed: a policy file that exists but can't be
-parsed is treated as requiring the secret, and pinning errors rather than
-reporting "nothing pinned".
+provision the secret first, then pin. Both controls fail closed: a policy
+file that exists but can't be parsed is treated as requiring the secret,
+and pinning errors rather than reporting "nothing pinned".
 
 **Pinned Names as the provisioning allowlist.** A TPM has no stored
 per-service state: `TPM2_CreatePrimary` derives a key for *any* service
@@ -592,7 +594,7 @@ fail_if_requirement_unmet = true    # accepted for schema parity; the library al
 max_ephemeral_lifetime_seconds = 3600   # accepted and validated (> 0); not enforced by an internal timer
 
 [tpm]
-require_derivation_secret = false   # refuse the TPM without /etc/hkdfguard/tpm.derivation-secret
+require_derivation_secret = true    # refuse the TPM without /etc/hkdfguard/tpm.derivation-secret; false warns instead
 require_pinned_names = false        # true: only services in pinned_names exist on the TPM (provisioning allowlist)
 session_encryption = "auto"         # auto | required | off  (see "Session parameter encryption")
 pinned_session_salt_key_name = "000b<64 hex>"   # mandatory under `required`
