@@ -176,9 +176,11 @@ int hkdfguard_wrap_dek(
  *                     on HKDFGUARD_ERR_BUFFER_TOO_SMALL, the required
  *                     capacity (HKDFGUARD_DEK_LEN).
  *
- * On ANY non-OK return, every byte of the caller's originally-declared
- * `out` capacity is zeroed before returning -- no partial or stale key
- * material is ever left in `out`.
+ * On ANY non-OK return -- including HKDFGUARD_ERR_INTERNAL_ERROR -- every
+ * byte of the caller's originally-declared `out` capacity is zeroed before
+ * returning, so no partial or stale key material is ever left in `out`.
+ * The one exception is `out_len == NULL`: with no declared capacity there
+ * is nothing that can safely be written, so `out` is left untouched.
  *
  * Returns HKDFGUARD_OK on success, or a negative HKDFGUARD_ERR_* code.
  */

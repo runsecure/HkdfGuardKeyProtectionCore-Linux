@@ -182,8 +182,10 @@ pub extern "C" fn hkdfguard_wrap_dek(
 /// - `wrapped` / `wrapped_len`: the wrapped payload bytes.
 /// - `out` / `out_len`: on input, `*out_len` is the capacity of `out`. On
 ///   success, the 32-byte DEK is written to `out` and `*out_len` is set to
-///   32. On any failure, every byte of the caller's original buffer
-///   capacity is zeroed and no key material is left in `out`.
+///   32. On any failure, including a caught panic, every byte of the
+///   caller's original buffer capacity is zeroed and no key material is
+///   left in `out` -- unless `out_len` is NULL, in which case there is no
+///   declared capacity and `out` is left untouched.
 ///
 /// # Returns
 /// One of the status codes in [`status`]. Never throws/unwinds.
@@ -199,19 +201,39 @@ pub extern "C" fn hkdfguard_unwrap_dek(
     out: *mut u8,
     out_len: *mut c_int,
 ) -> c_int {
+    // Captured before any work, so even a caught panic can honor the
+    // "zeroed on every failure" contract. Reading through a raw pointer
+    // can't panic; a NULL `out_len` just means there's no known capacity.
+    let capacity = declared_capacity(out_len);
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        unwrap_impl(service, wrapped, wrapped_len, out, out_len)
+        unwrap_impl(service, wrapped, wrapped_len, out, out_len, capacity)
     })) {
         Ok(code) => code,
         Err(_) => {
             log::error!("hkdfguard: internal panic caught at hkdfguard_unwrap_dek boundary");
-            // Best-effort: we don't know *out_len here without re-deref
-            // (which is exactly what panicked, possibly), so we do not
-            // attempt to zero `out` in the panic path -- this indicates a
-            // bug in this crate, not a normal failure, and is reported at
-            // ERROR level above.
+            zero_caller_buffer(out, capacity);
             status::INTERNAL_ERROR
         }
+    }
+}
+
+// `*out_len` as the caller declared it, or 0 when `out_len` is NULL.
+fn declared_capacity(out_len: *const c_int) -> c_int {
+    if out_len.is_null() {
+        return 0;
+    }
+    // SAFETY: non-null; caller contract guarantees a valid, initialized `int`.
+    unsafe { *out_len }
+}
+
+// Zeroes the caller's whole declared `out` buffer, for every unwrap
+// failure path. A no-op when there is no buffer or no positive capacity
+// (a NULL `out_len` gives 0), since then nothing can be safely written.
+fn zero_caller_buffer(out: *mut u8, capacity: c_int) {
+    if !out.is_null() && capacity > 0 {
+        // SAFETY: out is non-null and, per caller contract, writable for
+        // the `capacity` bytes the caller declared on entry.
+        unsafe { ptr::write_bytes(out, 0u8, capacity as usize) };
     }
 }
 
@@ -573,25 +595,19 @@ fn unwrap_impl(
     wrapped_len: c_int,
     out: *mut u8,
     out_len: *mut c_int,
+    capacity: c_int, // *out_len as declared on entry (0 if out_len is NULL), read by the caller
 ) -> c_int {
-    if wrapped.is_null() || out_len.is_null() {
+    // Every failure path below zeroes the caller's buffer using the
+    // capacity declared on entry, before *out_len is ever overwritten.
+    let zero_out_buffer = || zero_caller_buffer(out, capacity);
+
+    if out_len.is_null() {
+        return status::INVALID_ARGUMENT; // no declared capacity, so nothing can be safely zeroed
+    }
+    if wrapped.is_null() {
+        zero_out_buffer();
         return status::INVALID_ARGUMENT;
     }
-
-    // SAFETY: out_len is non-null; caller contract guarantees it points
-    // at a valid, initialized `int`.
-    let capacity = unsafe { *out_len }; // the caller's declared output buffer size, captured before we might overwrite *out_len
-
-    // Closure so every failure path below can zero the caller's buffer
-    // with one call, using the *original* capacity captured above.
-    let zero_out_buffer = || {
-        if !out.is_null() && capacity > 0 {
-            // SAFETY: out is non-null and, per caller contract, writable
-            // for at least `capacity` bytes (the original capacity the
-            // caller declared before this call).
-            unsafe { ptr::write_bytes(out, 0u8, capacity as usize) }; // overwrite the entire declared buffer with zeros
-        }
-    };
 
     if wrapped_len < 0 || capacity < 0 {
         zero_out_buffer();
@@ -1095,6 +1111,40 @@ mod ffi_tests {
             ),
             status::INVALID_ARGUMENT
         );
+    }
+
+    #[test]
+    fn unwrap_zeroes_the_buffer_on_every_failure_with_a_known_capacity() {
+        let service = CString::new("com.company.orders").unwrap();
+        let wrapped = [0u8; 64];
+
+        // NULL `wrapped`: capacity is known, so the buffer must be zeroed.
+        let mut out = [0xAAu8; 32];
+        let mut out_len: c_int = 32;
+        assert_eq!(
+            hkdfguard_unwrap_dek(service.as_ptr(), std::ptr::null(), 64, out.as_mut_ptr(), &mut out_len),
+            status::INVALID_ARGUMENT
+        );
+        assert_eq!(out, [0u8; 32], "a NULL wrapped pointer must still leave out zeroed");
+
+        // Invalid service name, then a payload that fails to parse.
+        for svc in [std::ptr::null(), service.as_ptr()] {
+            let mut out = [0xAAu8; 32];
+            let mut out_len: c_int = 32;
+            assert_ne!(
+                hkdfguard_unwrap_dek(svc, wrapped.as_ptr(), 64, out.as_mut_ptr(), &mut out_len),
+                status::OK
+            );
+            assert_eq!(out, [0u8; 32]);
+        }
+
+        // NULL `out_len`: no declared capacity, so nothing may be written.
+        let mut out = [0xAAu8; 32];
+        assert_eq!(
+            hkdfguard_unwrap_dek(service.as_ptr(), wrapped.as_ptr(), 64, out.as_mut_ptr(), std::ptr::null_mut()),
+            status::INVALID_ARGUMENT
+        );
+        assert_eq!(out, [0xAAu8; 32], "with no declared capacity the buffer must be left untouched");
     }
 
     #[test]
