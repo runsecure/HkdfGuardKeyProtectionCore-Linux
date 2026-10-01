@@ -560,10 +560,11 @@ fn validate_derivation_secret_is_honored(ctx: &mut Context) -> Result<Option<boo
 // ---------------------------------------------------------------------
 //
 // A discrete TPM sits on an LPC or SPI bus that an interposer can read
-// byte-for-byte. `TPM2_ECDH_ZGen`'s response is the shared point Z, and
-// since the wrapping protocol derives every payload's key from a Z that
-// is constant per service, one captured response is every payload for
-// that service. A firmware TPM (Intel PTT, AMD fTPM) or a virtual TPM has
+// byte-for-byte. `TPM2_ECDH_ZGen`'s response is the shared point Z for
+// one payload; a captured response opens that payload (the per-payload
+// hashed point in crypto.rs keeps it from opening any other), and an
+// interposer that stays on the bus captures every subsequent one. A
+// firmware TPM (Intel PTT, AMD fTPM) or a virtual TPM has
 // no external bus, so this is pure overhead there -- hence the `auto`
 // policy mode, which skips it only for known-internal manufacturers.
 //
@@ -1621,36 +1622,37 @@ mod tests {
     #[test]
     #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
     #[serial]
-    fn tpm_accepts_the_fixed_static_ecdh_point() {
+    fn tpm_accepts_hashed_payload_points() {
         // The forgery-resistant protocol derives the wrapping key from
-        // ECDH(KEK_priv, H) for a fixed H with no known discrete log. If
-        // a backend refused to do ECDH against a caller-supplied fixed
-        // point, the entire construction would be unusable there -- so
-        // confirm it against a real TPM before building on it, rather
-        // than assuming as happened with inSensitive.data.
+        // ECDH(KEK_priv, H_salt) for a point hashed from the payload
+        // salt, whose discrete log nobody knows. If a backend refused to
+        // do ECDH against such a caller-supplied point, the entire
+        // construction would be unusable there -- so confirm it against
+        // a real TPM before building on it, rather than assuming as
+        // happened with inSensitive.data.
         //
         // Note what cannot be checked here: the *value* of Z can't be
-        // independently recomputed, because that would need H's discrete
-        // log, which is precisely what nobody has. What is checkable is
-        // that the TPM accepts the point, and that the result behaves
-        // like a real per-KEK shared secret.
-        let h = crate::crypto::static_ecdh_point().unwrap();
+        // independently recomputed, because that would need the point's
+        // discrete log, which is precisely what nobody has. What is
+        // checkable is that the TPM accepts the point, and that the
+        // result behaves like a real per-KEK, per-salt shared secret.
+        let h = crate::crypto::payload_ecdh_point(&[0x42u8; 32]).unwrap();
 
         let z1 = create_ecdh_secret("com.company.orders", &h).unwrap();
         let z2 = create_ecdh_secret("com.company.orders", &h).unwrap();
-        assert_eq!(z1, z2, "static-point ECDH must be repeatable for the same service");
+        assert_eq!(z1, z2, "ECDH against the same point must be repeatable for the same service");
         assert_ne!(z1, [0u8; 32], "shared secret must not be all zeroes");
 
-        // Each service's KEK must produce its own Z against the same H --
-        // this is what gives each service a distinct wrapping key.
+        // Each service's KEK must produce its own Z against the same point
+        // -- this is what gives each service a distinct wrapping key.
         let z_billing = create_ecdh_secret("com.company.billing", &h).unwrap();
-        assert_ne!(z1, z_billing, "different KEKs must yield different Z against the same H");
+        assert_ne!(z1, z_billing, "different KEKs must yield different Z against the same point");
 
-        // H must not be special-cased by the stack: a random point gives
-        // a different secret for the same KEK.
-        let random_peer = p256::SecretKey::random(&mut rand_core::OsRng).public_key();
-        let z_random = create_ecdh_secret("com.company.orders", &random_peer).unwrap();
-        assert_ne!(z1, z_random);
+        // And each salt's point must produce its own Z for the same KEK --
+        // this is what makes a captured Z worth one payload, not all.
+        let h2 = crate::crypto::payload_ecdh_point(&[0x43u8; 32]).unwrap();
+        let z_other_salt = create_ecdh_secret("com.company.orders", &h2).unwrap();
+        assert_ne!(z1, z_other_salt, "different salts must yield different Z for the same KEK");
     }
 
     // ---- session parameter encryption ----
@@ -1688,7 +1690,7 @@ mod tests {
         // an acceptable `tpmKey`, or the attributes were wrong, this is
         // where it would fail.
         std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
-        let h = crate::crypto::static_ecdh_point().unwrap();
+        let h = crate::crypto::payload_ecdh_point(&[0x42u8; 32]).unwrap();
         let peer = encode_peer_point(&h).unwrap();
 
         let (plain, encrypted) = with_tpm_context(|ctx| {
@@ -1793,7 +1795,7 @@ mod tests {
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
         let required = with_tpm_context(session_encryption_enabled).unwrap();
         // And the full production path -- load_kek + ecdh -- works under it.
-        let h = crate::crypto::static_ecdh_point().unwrap();
+        let h = crate::crypto::payload_ecdh_point(&[0x42u8; 32]).unwrap();
         let z = create_ecdh_secret("com.company.orders", &h);
         std::env::remove_var("HKDFGUARD_POLICY_FILE");
         assert!(required, "required must encrypt regardless of manufacturer");

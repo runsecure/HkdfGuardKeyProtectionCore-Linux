@@ -14,7 +14,7 @@
 #   3. Unit tests for the tpm2 feature (no device needed).
 #   4. The #[ignore]d conformance suite against the REAL TPM: CreatePrimary
 #      determinism, per-service uniqueness, Name formula, acceptance of the
-#      fixed ECDH point H, salted/encrypted session correctness, auto-mode.
+#      hashed per-payload ECDH points, salted/encrypted session correctness, auto-mode.
 #   5. The same suite again with a TPM derivation secret provisioned, which
 #      exercises the runtime "does this TPM honor the secret" self-test.
 #   6. Learns the salt-key and service-key Names from the TPM (the operator

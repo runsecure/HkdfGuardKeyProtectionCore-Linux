@@ -111,7 +111,7 @@ impl KekHandle for ExternalSecretHandle {
     fn ecdh(&self, peer_public_key: &PublicKey) -> Result<SharedSecret> {
         let shared = p256::ecdh::diffie_hellman(
             self.secret_key.to_nonzero_scalar(), // our private scalar
-            peer_public_key.as_affine(),         // the protocol's fixed point H (see crypto.rs)
+            peer_public_key.as_affine(),         // the payload's hashed point H_salt (see crypto.rs)
         );
         let mut out = [0u8; 32];
         out.copy_from_slice(shared.raw_secret_bytes().as_slice()); // copy the shared secret's raw bytes

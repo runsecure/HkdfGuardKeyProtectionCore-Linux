@@ -5,7 +5,7 @@
  * per-service Key Encryption Key (KEK), using the strongest available
  * provider on the host (TPM2 > PKCS#11 > external secret > ephemeral).
  * See the crate's provider/ module docs for the protocol
- * (ECDH P-256 against a fixed point -> HKDF-SHA512 -> AES-256-GCM) and
+ * (ECDH P-256 against a per-payload hashed point -> HKDF-SHA512 -> AES-256-GCM) and
  * provider details. A wrapped payload can only be created, and only be
  * opened, on the host holding the KEK: it is not possible to pre-wrap a
  * DEK for a host from elsewhere.

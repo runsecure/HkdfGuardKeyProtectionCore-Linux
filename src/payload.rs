@@ -15,7 +15,7 @@
 //!                                   4 was SOFTWARE, retired -- see `ProviderType`)
 //! 2       2     key_id_len (u16)
 //! 4       N     key_id             (provider-specific opaque identifier)
-//! 4+N     32    salt               (per-payload random HKDF salt)
+//! 4+N     32    salt               (per-payload random salt: hashed to the ECDH point, and HKDF's salt)
 //! 36+N    12    nonce              (AES-256-GCM 96-bit nonce)
 //! 48+N    4     ciphertext_len (u32)
 //! 52+N    M     ciphertext         (AES-256-GCM ciphertext, includes 16-byte tag)
@@ -31,9 +31,10 @@
 //! The leading version byte exists so the layout can evolve without a
 //! future parser ever misreading an old blob as a new one; `from_bytes`
 //! rejects any value other than [`VERSION`] outright. Note the `salt`
-//! field is deliberately a random HKDF salt and *not* an ephemeral ECDH
-//! public key -- see [`crate::crypto`] for why the protocol derives the
-//! wrapping key from a fixed point rather than an ephemeral one.
+//! field is deliberately a random salt and *not* an ephemeral ECDH public
+//! key: it is hashed to the payload's ECDH point and also salts HKDF --
+//! see [`crate::crypto`] for why the protocol derives the wrapping key
+//! from a hashed point rather than an ephemeral key.
 //!
 //! Every field here except the ciphertext is authenticated, both as the
 //! AEAD's associated data and as part of the HKDF `info` -- see
@@ -53,7 +54,7 @@ pub const FINGERPRINT_LEN: usize = 32; // SHA-256 digest size
 pub struct Payload {
     pub provider_type: ProviderType, // which provider produced (and must later reload) the KEK
     pub key_id: Vec<u8>,             // provider-specific opaque tag, variable length
-    pub salt: [u8; SALT_LEN],        // per-payload random HKDF salt; what makes each payload's wrapping key unique
+    pub salt: [u8; SALT_LEN],        // per-payload random salt; selects the ECDH point and salts HKDF, so each payload's wrapping key is unique
     pub nonce: [u8; NONCE_LEN],      // the AES-GCM nonce used for this one encryption
     pub ciphertext: Vec<u8>,         // AES-GCM ciphertext, tag included at the end
     pub fingerprint: [u8; FINGERPRINT_LEN], // SHA-256 of the persistent KEK's public key at wrap time

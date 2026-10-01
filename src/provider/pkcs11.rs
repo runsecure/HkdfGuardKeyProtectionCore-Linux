@@ -661,30 +661,31 @@ mod tests {
 
     #[test]
     #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token"]
-    fn token_accepts_the_fixed_static_ecdh_point() {
+    fn token_accepts_hashed_payload_points() {
         // Same check as the TPM2 provider's own version: the
         // forgery-resistant protocol needs CKM_ECDH1_DERIVE against a
-        // fixed, caller-supplied point H, so confirm this module accepts
-        // it rather than assuming. A module that rejected H would make
-        // the construction unusable on that HSM.
+        // caller-supplied point hashed from the payload salt, so confirm
+        // this module accepts such points rather than assuming. A module
+        // that rejected them would make the construction unusable on
+        // that HSM.
         let provider = Pkcs11Provider::new();
         assert!(provider.probe(), "no PKCS#11 session available");
 
-        let h = crate::crypto::static_ecdh_point().unwrap();
+        let h = crate::crypto::payload_ecdh_point(&[0x42u8; 32]).unwrap();
 
         let handle = provider.load_kek("com.company.orders", true).unwrap();
         let z1 = handle.ecdh(&h).unwrap();
         let z2 = handle.ecdh(&h).unwrap();
-        assert_eq!(*z1, *z2, "static-point ECDH must be repeatable for the same key");
+        assert_eq!(*z1, *z2, "ECDH against the same point must be repeatable for the same key");
         assert_ne!(z1.as_slice(), [0u8; 32], "shared secret must not be all zeroes");
 
         // A different service's key must yield a different Z against the
-        // same H.
+        // same point.
         let other = provider.load_kek("com.company.billing", true).unwrap();
-        assert_ne!(*z1, *other.ecdh(&h).unwrap(), "different keys must yield different Z against the same H");
+        assert_ne!(*z1, *other.ecdh(&h).unwrap(), "different keys must yield different Z against the same point");
 
-        // H must not be special-cased: a random point differs.
-        let random_peer = p256::SecretKey::random(&mut rand_core::OsRng).public_key();
-        assert_ne!(*z1, *handle.ecdh(&random_peer).unwrap());
+        // A different salt's point yields a different Z for the same key.
+        let h2 = crate::crypto::payload_ecdh_point(&[0x43u8; 32]).unwrap();
+        assert_ne!(*z1, *handle.ecdh(&h2).unwrap(), "different salts must yield different Z");
     }
 }

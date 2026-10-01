@@ -1,17 +1,18 @@
 //! The provider-agnostic wrap/unwrap protocol:
-//! `ECDH(P-256, fixed point) -> HKDF-SHA512 -> AES-256-GCM`.
+//! `ECDH(P-256, hashed per-payload point) -> HKDF-SHA512 -> AES-256-GCM`.
 //!
 //! Every provider (TPM2, PKCS#11, external secret, ephemeral) implements
 //! the same [`crate::provider::KekHandle::ecdh`] contract, so
 //! this module is the *only* place the actual wrap/unwrap algorithm is
 //! implemented -- providers never see plaintext DEKs or derived keys.
 //!
-//! ## Why a fixed point rather than an ephemeral key
+//! ## Why a hashed point rather than an ephemeral key
 //!
-//! The wrapping key comes from `ECDH(KEK_priv, H)`, where `H` is a fixed
-//! P-256 point with no known discrete log (see
-//! [`STATIC_ECDH_POINT_COMPRESSED`]). Computing it requires the KEK's
-//! private key, which never leaves the TPM/HSM/secret file.
+//! The wrapping key comes from `Z = ECDH(KEK_priv, H_salt)`, where
+//! `H_salt` is a P-256 point derived from the payload's random salt by
+//! hashing (see [`payload_ecdh_point`]). Nobody knows the discrete log of
+//! a hash output, so computing `Z` requires the KEK's private key, which
+//! never leaves the TPM/HSM/secret file.
 //!
 //! This replaced an ECIES-style construction that used a fresh ephemeral
 //! keypair per wrap. That version was forgeable: the KEK's *public* key
@@ -29,14 +30,23 @@
 //! server and are wrapped locally, and a wrapped payload is never meant
 //! to be produced or read anywhere else.
 //!
+//! ## Why the point is per payload rather than one fixed `H`
+//!
+//! An earlier revision used a single fixed point `H` for every payload.
+//! That made `Z` a constant per service: a single capture of `Z` -- from
+//! a core dump, swap, a debugger attached by the same uid, or the bus of
+//! a discrete TPM -- was enough to open every payload that service had
+//! ever wrapped or would ever wrap, because the only other inputs to the
+//! wrapping key are public. Hashing the salt to the curve instead makes
+//! `Z` unique per payload, so a captured `Z` is worth exactly the one
+//! payload it belongs to. Forgery resistance is unchanged: an attacker
+//! holding `KEK_pub` still cannot compute `KEK_priv · H_salt` for any
+//! salt. The salt is public, so the (non-constant-time) hashing is fine.
+//!
 //! ## What is bound
 //!
-//! Per-payload key separation comes from a random 32-byte HKDF salt in
-//! the payload header. This is load-bearing: the ECDH secret is constant
-//! for a given service, so without the salt every payload for a service
-//! would share one AES-GCM key.
-//!
-//! Both the derived key and the AEAD are bound to
+//! The salt does double duty: it selects the ECDH point, and it is the
+//! HKDF salt. Both the derived key and the AEAD are bound to
 //! [`crate::payload::Payload::authenticated_bytes`] -- every byte of the
 //! payload except the ciphertext -- plus the length-framed service name.
 //! That authenticates the `provider_type` tag (so a payload cannot be
@@ -74,96 +84,54 @@ const TAG_LEN: usize = 16; // AES-GCM's standard 128-bit authentication tag size
 const UNCOMPRESSED_POINT_LEN: usize = 65; // SEC1 uncompressed P-256 point: 1 tag byte (0x04) + 32-byte X + 32-byte Y
 
 // ---------------------------------------------------------------------
-// The fixed static-ECDH point `H`.
+// The per-payload ECDH point `H_salt`.
 // ---------------------------------------------------------------------
 //
-// The wrapping key is derived from `Z = ECDH(KEK_priv, H)` where `H` is a
-// fixed P-256 point whose discrete logarithm nobody knows. That single
-// property is what makes a wrapped payload unforgeable: computing `Z`
-// requires either the KEK's private key (which never leaves the
-// TPM/HSM/secret file) or `H`'s discrete log (which nobody has). Knowing
-// the KEK's *public* key -- which is not secret, and on a TPM is
-// recomputable by anyone who can reach the device -- is not enough.
+// The wrapping key is derived from `Z = ECDH(KEK_priv, H_salt)`, where
+// `H_salt` is a P-256 point obtained by hashing the payload's salt to the
+// curve. Nobody knows the discrete logarithm of a hash output, which is
+// what makes a wrapped payload unforgeable: computing `Z` requires the
+// KEK's private key (which never leaves the TPM/HSM/secret file). Knowing
+// the KEK's *public* key -- not secret, and on a TPM recomputable by
+// anyone who can reach the device -- is not enough. This is deliberately
+// *not* ECIES; see the module doc for why an ephemeral key was forgeable.
 //
-// This is deliberately *not* an ECIES construction. An ephemeral-key
-// ECIES lets anyone holding the KEK public key derive the same shared
-// secret the provider would (`ECDH(eph_priv, KEK_pub)` equals
-// `ECDH(KEK_priv, eph_pub)`), and therefore mint a payload that unwraps
-// to a DEK of their choosing. Binding more context into the AAD or the
-// KDF does not help, because the forger controls those inputs too. The
-// ephemeral key also bought no forward secrecy here: its public half was
-// stored in the payload, so anyone who ever obtained `KEK_priv` could
-// recompute the shared secret for every payload ever written.
+// Deriving the point from the salt, rather than using one fixed point for
+// every payload, keeps `Z` unique per payload: capturing one `Z` opens
+// one payload, not the whole service's history. The salt is also HKDF's
+// salt, so a single 32-byte header field provides both separations.
 //
-// Per-payload key separation comes from a random HKDF salt carried in the
-// payload header instead. That matters more than it did with an ephemeral
-// key: `Z` is now constant for a given service, so the salt is what makes
-// the AES-GCM key unique per payload and nonce reuse structurally
-// impossible.
-//
-// `H` is generated by try-and-increment from a fixed seed string so that
-// anyone can rederive and audit it -- see `derive_static_ecdh_point`,
-// which the test suite runs against the constant below on every build.
-// A hash output has no known discrete log, which is the whole
-// "nothing up my sleeve" argument. P-256 has cofactor 1, so any point
-// that decompresses successfully is in the prime-order group; there is no
-// small-subgroup concern.
+// The hash-to-curve is simple try-and-increment: `X = SHA-256(domain ||
+// salt || counter)`, taking the first counter whose `X` is a valid P-256
+// x-coordinate, with the even-`Y` sign byte. Roughly half of all
+// candidates are on the curve, so the loop terminates within a few
+// iterations and 256 attempts failing has probability 2^-256. It is not
+// constant-time, and need not be: the salt is public. P-256 has cofactor
+// 1, so any point that decompresses is in the prime-order group; there
+// is no small-subgroup concern.
 
-/// Seed string from which [`STATIC_ECDH_POINT_COMPRESSED`] is derived.
-/// Changing this changes every wrapping key, on every platform.
-#[cfg(test)] // production reads the hardcoded point; only the derivation check needs the seed
-const STATIC_POINT_SEED: &[u8] = b"HkdfGuard-P256-static-ECDH-point-v1";
+/// Domain-separation prefix for the salt-to-point hash.
+const PAYLOAD_POINT_DOMAIN: &[u8] = b"HkdfGuard-P256-payload-ECDH-point-v1:";
 
-/// The fixed point `H`, as a compressed SEC1 encoding (`0x02 || X`).
-///
-/// Must be byte-identical across the Linux, macOS, and Windows
-/// implementations of this protocol -- it is part of the wire format in
-/// the same way the KDF labels are.
-/// Derived with counter 8 (see [`derive_static_ecdh_point`]); counters
-/// 0..=7 produced x-coordinates that are not on the curve.
-const STATIC_ECDH_POINT_COMPRESSED: [u8; 33] = [
-    0x02, 0x2e, 0x73, 0xb6, 0x5b, 0x38, 0x97, 0x9e, 0xf3, 0x16, 0x22, 0x1e, 0xa0, 0xb1, 0x10,
-    0xe8, 0x33, 0x6c, 0x53, 0xae, 0x37, 0xc3, 0xbe, 0xe4, 0x9b, 0xe1, 0x56, 0x8c, 0x2d, 0xeb,
-    0xca, 0x2b, 0x14,
-];
+/// Upper bound on try-and-increment attempts; see the note above.
+const PAYLOAD_POINT_MAX_ATTEMPTS: u8 = u8::MAX;
 
-/// Parses [`STATIC_ECDH_POINT_COMPRESSED`] into a usable public key.
-///
-/// Infallible in practice -- the constant is verified against
-/// `derive_static_ecdh_point` by the test suite -- but surfaced as a
-/// `Result` rather than a panic so a corrupted build fails the operation
-/// instead of aborting the host application.
-pub(crate) fn static_ecdh_point() -> Result<PublicKey> {
-    PublicKey::from_sec1_bytes(&STATIC_ECDH_POINT_COMPRESSED)
-        .map_err(|_| Error::Crypto("the fixed static-ECDH point is not a valid P-256 point"))
-}
-
-/// Rederives `H` from [`STATIC_POINT_SEED`] by try-and-increment:
-/// `X = SHA-256(seed || counter_be)`, taking the first counter whose `X`
-/// is a valid P-256 x-coordinate, with the even-`Y` sign byte. Returns
-/// the point and the counter that produced it.
-///
-/// Test-only: production reads the hardcoded constant instead, and the
-/// test suite asserts the two agree. Kept in the source (rather than in a
-/// comment or an external script) so the constant can never drift from a
-/// documented, executable derivation.
-#[cfg(test)]
-fn derive_static_ecdh_point() -> (PublicKey, u32, [u8; 33]) {
-    for counter in 0u32..10_000 {
+/// Hashes `salt` to a P-256 point. Deterministic, so `unwrap` recovers the
+/// same point `wrap` used from the salt carried in the payload header.
+pub(crate) fn payload_ecdh_point(salt: &[u8; SALT_LEN]) -> Result<PublicKey> {
+    let mut compressed = [0u8; 33];
+    compressed[0] = 0x02; // the even-Y candidate of the two points sharing this X
+    for counter in 0..PAYLOAD_POINT_MAX_ATTEMPTS {
         let mut hasher = Sha256::new();
-        hasher.update(STATIC_POINT_SEED);
-        hasher.update(counter.to_be_bytes());
-        let x = hasher.finalize();
-
-        let mut compressed = [0u8; 33];
-        compressed[0] = 0x02; // even-Y of the two candidate points
-        compressed[1..].copy_from_slice(&x);
-
+        hasher.update(PAYLOAD_POINT_DOMAIN);
+        hasher.update(salt);
+        hasher.update([counter]);
+        compressed[1..].copy_from_slice(&hasher.finalize());
         if let Ok(point) = PublicKey::from_sec1_bytes(&compressed) {
-            return (point, counter, compressed);
+            return Ok(point);
         }
     }
-    panic!("no valid P-256 point found for the static-ECDH seed; the seed or curve is wrong");
+    Err(Error::Crypto("no P-256 point found for this payload salt"))
 }
 
 pub const DEK_LEN: usize = 32; // the mandated, fixed DEK size in bytes
@@ -178,7 +146,8 @@ pub fn wrap(service: &str, dek: &[u8; DEK_LEN]) -> Result<Vec<u8>> {
     let fingerprint = kek_fingerprint(&handle.public_key()?); // identifies *which* KEK this payload is wrapped under, for `unwrap` to check before any ECDH/AES-GCM
 
     let mut salt = [0u8; SALT_LEN];
-    OsRng.fill_bytes(&mut salt); // per-payload HKDF salt: what makes this payload's wrapping key unique
+    OsRng.fill_bytes(&mut salt); // per-payload salt: selects this payload's ECDH point and salts its HKDF
+    let point = payload_ecdh_point(&salt)?;
     let mut nonce_bytes = [0u8; NONCE_LEN];
     OsRng.fill_bytes(&mut nonce_bytes); // fresh random nonce for this one AES-GCM encryption
 
@@ -202,7 +171,7 @@ pub fn wrap(service: &str, dek: &[u8; DEK_LEN]) -> Result<Vec<u8>> {
     // identity is committed to by the key itself, not only checked).
     let authenticated = payload.authenticated_bytes();
 
-    let mut shared_secret = handle.ecdh(&static_ecdh_point()?)?; // ECDH against the fixed point H -- only the KEK's holder can compute this (already stack-only: see `provider::SharedSecret`)
+    let mut shared_secret = handle.ecdh(&point)?; // ECDH against this payload's hashed point -- only the KEK's holder can compute this (already stack-only: see `provider::SharedSecret`)
     let mut wrapping_key = derive_wrapping_key(&shared_secret, service, &salt, &authenticated)?; // HKDF-SHA512 turns the shared secret into a 32-byte AES key (also stack-only)
     shared_secret.zeroize(); // the raw ECDH shared secret is no longer needed; scrub it now rather than waiting for scope exit
 
@@ -265,7 +234,7 @@ pub fn unwrap(service: &str, wrapped: &[u8]) -> Result<[u8; DEK_LEN]> {
     // data -- the decryption below then fails authentication.
     let authenticated = payload.authenticated_bytes();
 
-    let mut shared_secret = handle.ecdh(&static_ecdh_point()?)?; // re-derive the same ECDH shared secret used during wrap
+    let mut shared_secret = handle.ecdh(&payload_ecdh_point(&payload.salt)?)?; // re-derive the same ECDH shared secret used during wrap, from the same salt
     let mut wrapping_key = derive_wrapping_key(&shared_secret, service, &payload.salt, &authenticated)?; // re-derive the same AES key
     shared_secret.zeroize(); // scrub the shared secret as soon as we've derived the key from it
 
@@ -311,12 +280,10 @@ fn derive_wrapping_key(
     salt: &[u8; SALT_LEN],
     authenticated: &[u8],
 ) -> Result<Zeroizing<[u8; 32]>> {
-    // HKDF-Extract *with* the payload's random salt. This is load-bearing
-    // now in a way it wasn't under the old ephemeral-key protocol: the
-    // ECDH secret is constant for a given service, so the salt is the
-    // only thing making each payload's wrapping key distinct. Without it,
-    // every payload for a service would share one AES key and reuse would
-    // come down to nonce collisions alone.
+    // HKDF-Extract with the payload's random salt. The shared secret is
+    // already unique per payload (the salt selected its ECDH point), so
+    // this is belt-and-braces separation rather than the only thing
+    // keeping two payloads' AES keys apart.
     let hk = Hkdf::<Sha512>::new(Some(salt), shared_secret);
 
     // `info` = prefix || len(service) || service || every non-ciphertext
@@ -456,80 +423,141 @@ mod tests {
             let dek = [0x77u8; DEK_LEN];
             let a = wrap("com.company.orders", &dek).unwrap();
             let b = wrap("com.company.orders", &dek).unwrap(); // same DEK, same service, wrapped again
-            assert_ne!(a, b, "ephemeral ECDH + random nonce must randomize output"); // must not be deterministic
+            assert_ne!(a, b, "random salt + random nonce must randomize output"); // must not be deterministic
         });
     }
 
-    // ---- the fixed static-ECDH point `H` ----
+    // ---- the per-payload hashed ECDH point `H_salt` ----
+
+    #[test]
+    fn payload_point_is_deterministic_and_salt_dependent() {
+        let salt_a = [0x11u8; SALT_LEN];
+        let salt_b = [0x12u8; SALT_LEN];
+
+        assert_eq!(
+            payload_ecdh_point(&salt_a).unwrap(),
+            payload_ecdh_point(&salt_a).unwrap(),
+            "the same salt must always hash to the same point, or unwrap could never follow wrap"
+        );
+        assert_ne!(
+            payload_ecdh_point(&salt_a).unwrap(),
+            payload_ecdh_point(&salt_b).unwrap(),
+            "different salts must hash to different points"
+        );
+
+        // A single flipped bit anywhere in the salt moves the point.
+        let base = payload_ecdh_point(&salt_a).unwrap();
+        for i in 0..SALT_LEN {
+            let mut flipped = salt_a;
+            flipped[i] ^= 0x80;
+            assert_ne!(base, payload_ecdh_point(&flipped).unwrap(), "salt byte {i} must reach the point");
+        }
+    }
+
+    #[test]
+    fn payload_point_is_a_valid_usable_curve_point_for_many_salts() {
+        // Try-and-increment must land on the curve for arbitrary salts,
+        // including degenerate ones, and the result must be a real point
+        // usable for ECDH from the scalar side.
+        let mut salts: Vec<[u8; SALT_LEN]> = vec![[0u8; SALT_LEN], [0xffu8; SALT_LEN]];
+        for _ in 0..64 {
+            let mut s = [0u8; SALT_LEN];
+            OsRng.fill_bytes(&mut s);
+            salts.push(s);
+        }
+
+        let k = SecretKey::random(&mut OsRng);
+        let other = SecretKey::random(&mut OsRng);
+        for salt in salts {
+            let h = payload_ecdh_point(&salt).unwrap();
+
+            let encoded = h.to_encoded_point(false);
+            assert_eq!(encoded.as_bytes().len(), UNCOMPRESSED_POINT_LEN);
+            assert_eq!(encoded.as_bytes()[0], 0x04);
+            assert_eq!(PublicKey::from_sec1_bytes(encoded.as_bytes()).unwrap(), h);
+
+            let z1 = p256::ecdh::diffie_hellman(k.to_nonzero_scalar(), h.as_affine());
+            let z2 = p256::ecdh::diffie_hellman(k.to_nonzero_scalar(), h.as_affine());
+            assert_eq!(z1.raw_secret_bytes(), z2.raw_secret_bytes());
+
+            // Different KEKs still yield different Z against the same point.
+            let z_other = p256::ecdh::diffie_hellman(other.to_nonzero_scalar(), h.as_affine());
+            assert_ne!(z1.raw_secret_bytes(), z_other.raw_secret_bytes());
+        }
+    }
 
     #[test]
     #[serial]
-    fn software_providers_accept_the_fixed_static_ecdh_point() {
+    fn software_providers_accept_hashed_payload_points() {
         // The hardware backends get their own #[ignore]d versions of this
         // (see the tpm2 and pkcs11 provider tests); this covers the
         // providers that need no device, so the check runs on every build
         // rather than only where swtpm/SoftHSM2 are available.
         with_isolated_ephemeral_provider(|| {
-            let h = static_ecdh_point().unwrap();
+            let h = payload_ecdh_point(&[0x42u8; SALT_LEN]).unwrap();
 
-            let service = "com.company.orders.staticpoint";
+            let service = "com.company.orders.payloadpoint";
             crate::provider::create_kek(service).unwrap();
             let (_provider, handle) = crate::provider::select_existing(service).unwrap();
 
             let z1 = handle.ecdh(&h).unwrap();
             let z2 = handle.ecdh(&h).unwrap();
-            assert_eq!(*z1, *z2, "static-point ECDH must be repeatable");
+            assert_eq!(*z1, *z2, "ECDH against the same point must be repeatable");
             assert_ne!(*z1, [0u8; 32], "shared secret must not be all zeroes");
 
-            let other_service = "com.company.billing.staticpoint";
+            let other_service = "com.company.billing.payloadpoint";
             crate::provider::create_kek(other_service).unwrap();
             let (_provider, other) = crate::provider::select_existing(other_service).unwrap();
             assert_ne!(
                 *z1,
                 *other.ecdh(&h).unwrap(),
-                "different KEKs must yield different Z against the same H"
+                "different KEKs must yield different Z against the same point"
             );
         });
     }
 
     #[test]
-    fn hardcoded_static_point_matches_its_documented_derivation() {
-        // The constant is the authority at runtime; this asserts it is
-        // exactly what the documented try-and-increment derivation
-        // produces, so the two can never drift apart. If this fails,
-        // either the constant or the seed was edited -- and changing
-        // either one silently changes every wrapping key on every
-        // platform.
-        let (derived, counter, compressed) = derive_static_ecdh_point();
-        assert_eq!(counter, 8, "the seed must still resolve at the documented counter");
-        assert_eq!(compressed, STATIC_ECDH_POINT_COMPRESSED);
-        assert_eq!(derived, static_ecdh_point().unwrap());
-    }
+    #[serial]
+    fn a_captured_shared_secret_opens_only_its_own_payload() {
+        // The reason the point is per payload. Assume the worst: an
+        // attacker captured the raw ECDH secret Z for one payload (core
+        // dump, swap, discrete-TPM bus). Under a fixed point that Z was
+        // constant per service and opened every payload; now it must be
+        // useless against any other payload for the same service.
+        with_isolated_ephemeral_provider(|| {
+            let service = "com.company.capture";
+            crate::provider::create_kek(service).unwrap();
+            let dek_a = [0xA1u8; DEK_LEN];
+            let dek_b = [0xB2u8; DEK_LEN];
+            let wrapped_a = wrap(service, &dek_a).unwrap();
+            let wrapped_b = wrap(service, &dek_b).unwrap();
+            let payload_a = Payload::from_bytes(&wrapped_a).unwrap();
+            let payload_b = Payload::from_bytes(&wrapped_b).unwrap();
 
-    #[test]
-    fn static_point_is_a_valid_usable_curve_point() {
-        let h = static_ecdh_point().unwrap();
+            let (_provider, handle) = crate::provider::select_existing(service).unwrap();
+            let z_a = handle.ecdh(&payload_ecdh_point(&payload_a.salt).unwrap()).unwrap();
+            let z_b = handle.ecdh(&payload_ecdh_point(&payload_b.salt).unwrap()).unwrap();
+            assert_ne!(*z_a, *z_b, "two payloads for one service must not share a shared secret");
 
-        // Not the identity, and a real point we can actually do ECDH
-        // against from the scalar side.
-        let encoded = h.to_encoded_point(false);
-        assert_eq!(encoded.as_bytes().len(), UNCOMPRESSED_POINT_LEN);
-        assert_eq!(encoded.as_bytes()[0], 0x04);
+            // Z_A genuinely opens payload A (so the capture is "real")...
+            let open = |z: &[u8; 32], p: &Payload| -> std::result::Result<[u8; DEK_LEN], ()> {
+                let aad = p.authenticated_bytes();
+                let key = derive_wrapping_key(z, service, &p.salt, &aad).unwrap();
+                let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*key));
+                let (ct, tag) = p.ciphertext.split_at(DEK_LEN);
+                let mut buf = [0u8; DEK_LEN];
+                buf.copy_from_slice(ct);
+                cipher
+                    .decrypt_in_place_detached(Nonce::from_slice(&p.nonce), &aad, &mut buf, Tag::from_slice(tag))
+                    .map(|_| buf)
+                    .map_err(|_| ())
+            };
+            assert_eq!(open(&z_a, &payload_a).unwrap(), dek_a);
 
-        // Round-trips through the uncompressed form the providers use.
-        assert_eq!(PublicKey::from_sec1_bytes(encoded.as_bytes()).unwrap(), h);
-
-        // ECDH against it succeeds and is deterministic.
-        let k = SecretKey::random(&mut OsRng);
-        let z1 = p256::ecdh::diffie_hellman(k.to_nonzero_scalar(), h.as_affine());
-        let z2 = p256::ecdh::diffie_hellman(k.to_nonzero_scalar(), h.as_affine());
-        assert_eq!(z1.raw_secret_bytes(), z2.raw_secret_bytes());
-
-        // Different KEKs must yield different Z against the same H --
-        // this is what gives each service its own wrapping key.
-        let other = SecretKey::random(&mut OsRng);
-        let z_other = p256::ecdh::diffie_hellman(other.to_nonzero_scalar(), h.as_affine());
-        assert_ne!(z1.raw_secret_bytes(), z_other.raw_secret_bytes());
+            // ...and does nothing for payload B, even with B's public
+            // salt, nonce, and header all in hand.
+            assert!(open(&z_a, &payload_b).is_err(), "a captured Z must not open a different payload");
+        });
     }
 
     // A payload with distinctive, easily-perturbed field values.
@@ -632,7 +660,7 @@ mod tests {
 
             let (provider, handle) = crate::provider::select_existing(service).unwrap();
             let _ = provider;
-            let mut shared_secret = handle.ecdh(&static_ecdh_point().unwrap()).unwrap();
+            let mut shared_secret = handle.ecdh(&payload_ecdh_point(&payload.salt).unwrap()).unwrap();
             let correct_aad = payload.authenticated_bytes();
             let wrapping_key =
                 derive_wrapping_key(&shared_secret, service, &payload.salt, &correct_aad).unwrap();
@@ -685,8 +713,9 @@ mod tests {
         // would (ECDH(eph_priv, KEK_pub) == ECDH(KEK_priv, eph_pub)),
         // derive the wrapping key, and mint a payload that unwrapped to a
         // DEK of their choosing. Now the shared secret is ECDH(KEK_priv,
-        // H), so reproducing it needs the KEK's private key or H's
-        // discrete log -- neither of which a public-key holder has.
+        // H_salt), so reproducing it needs the KEK's private key or the
+        // discrete log of a hash output -- neither of which a public-key
+        // holder has.
         with_isolated_ephemeral_provider(|| {
             let service = "com.company.forgery";
             crate::provider::create_kek(service).unwrap();
@@ -696,10 +725,11 @@ mod tests {
 
             // Everything the attacker is assumed to know: the KEK's public
             // key (not secret -- on a TPM anyone reaching the device can
-            // recompute it), the wire format, and the fixed point H.
+            // recompute it), the wire format, the salt, and therefore the
+            // exact point H_salt the host will use.
             let (_provider, handle) = crate::provider::select_existing(service).unwrap();
             let kek_public = handle.public_key().unwrap();
-            let h = static_ecdh_point().unwrap();
+            let h = payload_ecdh_point(&payload.salt).unwrap();
 
             // The old attack, attempted: pick an ephemeral scalar, do ECDH
             // against the KEK's public key, and try to derive the wrapping

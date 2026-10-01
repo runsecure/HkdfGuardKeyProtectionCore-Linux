@@ -7,14 +7,18 @@ host. Same cryptographic protocol and `service`-based key identity as the
 macOS Secure Enclave and Windows TPM/CNG implementations of HKDFGuard.
 
 ```
-ECDH (P-256, fixed point)  ->  HKDF-SHA512  ->  AES-256-GCM
+ECDH (P-256, per-payload hashed point)  ->  HKDF-SHA512  ->  AES-256-GCM
 ```
 
 A wrapped payload can only be **created** and **opened** on the host that
-holds the KEK. The wrapping key is `ECDH(KEK_priv, H)` for a fixed P-256
-point `H` with no known discrete log, so producing a valid payload
-requires the KEK's private key — which never leaves the TPM, HSM, or
-root-owned secret file.
+holds the KEK. The wrapping key is `ECDH(KEK_priv, H_salt)`, where
+`H_salt` is a P-256 point hashed from the payload's random 32-byte salt
+(try-and-increment; no one knows the discrete log of a hash output), so
+producing a valid payload requires the KEK's private key — which never
+leaves the TPM, HSM, or root-owned secret file. Because the point is
+different for every payload, so is the raw ECDH secret `Z`: capturing
+one `Z` (core dump, swap, a discrete TPM's bus) opens exactly that one
+payload, not every payload the service has ever wrapped.
 
 This is deliberately *not* ECIES. An ephemeral-key scheme would let
 anyone holding the KEK's public key (not a secret — on a TPM, anyone who
@@ -225,9 +229,10 @@ reporting "nothing pinned".
 
 **3. Session parameter encryption (bus protection).** On a *discrete*
 TPM — a separate chip on the LPC/SPI bus — an interposer can read
-`TPM2_ECDH_ZGen`'s response, the shared secret, in cleartext; and since
-the wrapping key is derived from a per-service constant, one capture is
-every payload for that service. The provider can run that command inside
+`TPM2_ECDH_ZGen`'s response, the shared secret, in cleartext. Each
+response opens one payload (the per-payload hashed point keeps a
+captured `Z` from opening any other), but an interposer that stays on
+the bus captures every subsequent one. The provider can run that command inside
 a salted HMAC session with parameter encryption (TPM 2.0 Part 1 §19.6;
 the cryptography is tpm2-tss's ESAPI, not this crate's), so the secret
 crosses the bus AES-128-CFB encrypted.
@@ -276,8 +281,8 @@ All of the below has actually been run, in Docker on Debian bookworm/aarch64
 | Feature | Builds on macOS (this repo's dev env) | Builds & links natively on Linux | Hardware/module test |
 |---|---|---|---|
 | `external-secret`, `ephemeral` (default) | yes | yes -- verified | unit tests pass; full wrap/unwrap round trip through the compiled C ABI (`examples/wrap_unwrap.c`) verified |
-| `pkcs11` | yes (build-only; no module to talk to) | yes -- verified, linked against real `cryptoki` 0.6.2 + `libsofthsm2.so` | `#[ignore]`d tests pass against a real SoftHSM2 token: `C_GenerateKeyPair` + `CKM_ECDH1_DERIVE` executed for real, same key reproduced deterministically, and `CKM_ECDH1_DERIVE` against the fixed point `H` accepted |
-| `tpm2` | **no** -- `tss-esapi-sys` ships pregenerated bindings only for specific Linux target tuples and hard-fails on macOS/aarch64 | yes -- verified, linked against real `libtss2-esys` 3.2.1 | The `#[ignore]`d conformance suite passes against a real `swtpm` instance: `TPM2_CreatePrimary` determinism and per-service uniqueness, the client-side Name formula matching the TPM's own, `TPM2_ECDH_ZGen` against `H`, the derivation secret genuinely changing the derived key, and salted/parameter-encrypted sessions producing the same `Z` as plain ones. The same suite, plus the reboot-persistence check, has also been run via `scripts/native-tpm-test.sh` against real firmware TPMs: **Intel PTT** and **AMD fTPM** |
+| `pkcs11` | yes (build-only; no module to talk to) | yes -- verified, linked against real `cryptoki` 0.6.2 + `libsofthsm2.so` | `#[ignore]`d tests pass against a real SoftHSM2 token: `C_GenerateKeyPair` + `CKM_ECDH1_DERIVE` executed for real, same key reproduced deterministically, and `CKM_ECDH1_DERIVE` against hashed per-payload points accepted |
+| `tpm2` | **no** -- `tss-esapi-sys` ships pregenerated bindings only for specific Linux target tuples and hard-fails on macOS/aarch64 | yes -- verified, linked against real `libtss2-esys` 3.2.1 | The `#[ignore]`d conformance suite passes against a real `swtpm` instance: `TPM2_CreatePrimary` determinism and per-service uniqueness, the client-side Name formula matching the TPM's own, `TPM2_ECDH_ZGen` against hashed per-payload points, the derivation secret genuinely changing the derived key, and salted/parameter-encrypted sessions producing the same `Z` as plain ones. The same suite, plus the reboot-persistence check, has also been run via `scripts/native-tpm-test.sh` against real firmware TPMs: **Intel PTT** and **AMD fTPM** |
 
 The TPM provider has been verified against `swtpm` and against two real
 firmware TPMs, Intel PTT and AMD fTPM. It has **not** been exercised
@@ -613,7 +618,7 @@ src/
                              hkdfguard_generate_and_wrap_dek; the setup-call gate
   error.rs                  Internal error type <-> C status codes
   payload.rs                Wrapped-payload wire format (version 1)
-  crypto.rs                 ECDH(H) -> HKDF-SHA512 -> AES-256-GCM protocol; the fixed point H
+  crypto.rs                 ECDH(H_salt) -> HKDF-SHA512 -> AES-256-GCM protocol; salt-to-point hashing
   policy.rs                 /etc/hkdfguard/policy.yaml parsing and evaluation
   secure_file.rs            Descriptor-checked secret-file reads, self-wiping buffer
   provider/
