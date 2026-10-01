@@ -529,21 +529,23 @@ secret. One trailing newline is ignored on both paths.
 
 ## Configuration
 
-Settings that decide *which* policy, TPM, or derivation secret is used come
-only from root-owned configuration in release builds. Their environment
-variables, marked **debug builds only** below, exist so tests and
-development can point at scratch files and simulators; a release build
-that sees one set ignores it and logs a warning. The environment is often
-set by lower-trust configuration than `/etc/hkdfguard` (a unit drop-in, a
-pod spec), and must not be able to redirect these. Release is the only
-supported shipping profile.
+In release builds every security setting -- which policy, which TPM, which
+derivation secret, which secret mount, which PKCS#11 module, token and PIN
+file -- comes only from root-owned configuration: the policy file at
+`/etc/hkdfguard/policy.toml` (see "Policy file reference"), or a built-in
+default. The environment variables below are **debug builds only**. They
+exist so tests and development can point at scratch files, simulators and
+SoftHSM2; a release build that sees one set ignores it and logs a warning.
+The environment is often set by lower-trust configuration than
+`/etc/hkdfguard` (a unit drop-in, a pod spec), and must not be able to
+redirect these. Release is the only supported shipping profile.
 
 | Env var | Used by | Purpose |
 |---|---|---|
-| `HKDFGUARD_EXTERNAL_SECRET_DIR` | External Secret | Override the mount directory searched for `<dir>/<service>` secret files (default: first of `/var/run/secrets/hkdfguard`, `/run/secrets/hkdfguard`, `/vault/secrets/hkdfguard`, `/mnt/secrets-store/hkdfguard` that exists). Each file must be owner-only (`0400`/`0600`), owned by root or the process's user, and resolve to a path inside the mount — see "External-secret file requirements". |
-| `HKDFGUARD_PKCS11_MODULE` | PKCS#11 | Absolute path to the PKCS#11 module `.so` (default: common SoftHSM2 install paths). The resolved file and its directory must be root-owned and not group/other-writable, or the module is refused. |
-| `HKDFGUARD_PKCS11_SLOT` | PKCS#11 | Slot index (default: first slot with a token present) |
-| `HKDFGUARD_PKCS11_PIN_FILE` | PKCS#11 | Path to a file holding the user PIN (default: `/etc/hkdfguard/pkcs11.pin`). Must be owned by root or the process's user with no group/other access (e.g. `0600`). The former `HKDFGUARD_PKCS11_PIN` env var is no longer read. |
+| `HKDFGUARD_EXTERNAL_SECRET_DIR` | External Secret | **Debug builds only**, when the policy sets no `external_secret.dir`. Release builds use `external_secret.dir`, or else the first of `/var/run/secrets/hkdfguard`, `/run/secrets/hkdfguard`, `/vault/secrets/hkdfguard`, `/mnt/secrets-store/hkdfguard` that exists. |
+| `HKDFGUARD_PKCS11_MODULE` | PKCS#11 | **Debug builds only**, when the policy sets no `pkcs11.module`; debug builds also fall back to common SoftHSM2 install paths. **Release builds use PKCS#11 only when `pkcs11.module` is set**: SoftHSM2 is a software token and must not be picked up, and counted as hardware, just for being installed. |
+| `HKDFGUARD_PKCS11_SLOT` | PKCS#11 | **Debug builds only.** Token index among initialized tokens. Release builds select by `pkcs11.token_label` / `token_serial`, or require exactly one initialized token -- slot numbers aren't stable across reboots or hot-plugging. |
+| `HKDFGUARD_PKCS11_PIN_FILE` | PKCS#11 | **Debug builds only**, when the policy sets no `pkcs11.pin_file`. Release builds use `pkcs11.pin_file`, or `/etc/hkdfguard/pkcs11.pin`. The retired `HKDFGUARD_PKCS11_PIN` is ignored, with a warning: a PIN is never read from the environment. |
 | `HKDFGUARD_POLICY_FILE` | Policy | **Debug builds only.** Read a different policy file. Release builds always read `/etc/hkdfguard/policy.toml`. |
 | `HKDFGUARD_TPM_DERIVATION_SECRET_FILE` | TPM2 | **Debug builds only.** Read the TPM derivation secret from a different path. Release builds always read `/etc/hkdfguard/tpm.derivation-secret`, which must be owned by root or this process's user with no group/other access (e.g. `0600`), and must not be a symlink. See "Hardening the TPM key" above. |
 | `TPM2TOOLS_TCTI` / `TCTI` / `TEST_TCTI` | TPM2 | **Debug builds only**, and only when the policy sets no `tpm.tcti`. Standard `tpm2-tools`-style TCTI selector (e.g. `swtpm:host=localhost,port=2321`). Release builds use `tpm.tcti` from the policy, or `device:/dev/tpmrm0`. |
@@ -598,6 +600,16 @@ tcti = "device:/dev/tpmrm0"         # which TPM: device:<path> | tabrmd:<conf> |
 
 [tpm.pinned_names]                  # per-service expected TPM Name; refuse any other key
 "com.company.orders" = "000b<64 hex>"
+
+[external_secret]
+dir = "/var/run/secrets/hkdfguard"  # where <service> KEK files live; when set, the only place looked
+                                    # (default: first existing of the four conventional mounts)
+
+[pkcs11]
+module = "/usr/lib/vendor/libhsm-pkcs11.so"   # required for PKCS#11 in release builds; root-owned
+pin_file = "/etc/hkdfguard/pkcs11.pin"        # owner-only; this is the default
+token_label = "hkdfguard-prod"      # choose the token by label and/or serial; exactly one must match.
+token_serial = "0123456789abcdef"   # with neither, exactly one initialized token must be present
 ```
 
 The file must be owned by root or by the process's user and not writable

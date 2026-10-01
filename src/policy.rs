@@ -142,6 +142,68 @@ struct PolicyFile {
     container_policy: ContainerPolicy,
     #[serde(default)]
     tpm: TpmPolicy,
+    #[serde(default)]
+    external_secret: ExternalSecretPolicy,
+    #[serde(default)]
+    pkcs11: Pkcs11Policy,
+}
+
+/// External-secret provider settings (`[external_secret]`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalSecretPolicy {
+    /// The directory holding `<service>` KEK files. When set, it is the
+    /// only place looked at; when unset, the provider searches the
+    /// conventional secret mounts.
+    dir: Option<String>,
+}
+
+/// PKCS#11 provider settings (`[pkcs11]`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Pkcs11Policy {
+    /// Absolute path of the PKCS#11 module to load. Release builds use
+    /// PKCS#11 only when this is set: there is no default module search,
+    /// since the commonly installed one (SoftHSM2) is a software token.
+    module: Option<String>,
+    /// Absolute path of the user-PIN file (default /etc/hkdfguard/pkcs11.pin).
+    pin_file: Option<String>,
+    /// Select the token by its CKA label (`CK_TOKEN_INFO.label`), and/or
+    /// its serial number. Slot numbers aren't stable across reboots or
+    /// hot-plugging; these are. Exactly one token must match.
+    token_label: Option<String>,
+    token_serial: Option<String>,
+}
+
+/// The PKCS#11 settings policy supplies, validated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Pkcs11Settings {
+    pub module: Option<PathBuf>,
+    pub pin_file: Option<PathBuf>,
+    pub token_label: Option<String>,
+    pub token_serial: Option<String>,
+}
+
+// A policy-supplied path must be absolute: a relative one would resolve
+// against whatever directory the host application happens to run in.
+fn absolute_path(field: &str, value: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(Error::Provider(format!("hkdfguard policy: {field} \"{value}\" must be an absolute path")));
+    }
+    Ok(path)
+}
+
+// PKCS#11 token fields are fixed-width, blank-padded: label 32 bytes,
+// serial 16. A longer value can never match, so reject it as a typo.
+fn token_field(field: &str, value: &str, max: usize) -> Result<String> {
+    if value.is_empty() || value.len() > max {
+        return Err(Error::Provider(format!(
+            "hkdfguard policy: {field} must be 1..={max} bytes, got {}",
+            value.len()
+        )));
+    }
+    Ok(value.to_string())
 }
 
 /// TPM2-provider-specific administrative controls. Parsed and validated
@@ -386,6 +448,8 @@ pub struct Policy {
     tpm_session_encryption: SessionEncryption,
     pinned_session_salt_key_name: Option<Vec<u8>>,
     tpm_tcti: Option<String>,
+    external_secret_dir: Option<PathBuf>,
+    pkcs11: Pkcs11Settings,
 }
 
 impl Policy {
@@ -535,6 +599,19 @@ impl Policy {
             validate_tcti(tcti)?;
         }
 
+        let external_secret_dir = raw
+            .external_secret
+            .dir
+            .as_deref()
+            .map(|d| absolute_path("external_secret.dir", d))
+            .transpose()?;
+        let pkcs11 = Pkcs11Settings {
+            module: raw.pkcs11.module.as_deref().map(|m| absolute_path("pkcs11.module", m)).transpose()?,
+            pin_file: raw.pkcs11.pin_file.as_deref().map(|f| absolute_path("pkcs11.pin_file", f)).transpose()?,
+            token_label: raw.pkcs11.token_label.as_deref().map(|l| token_field("pkcs11.token_label", l, 32)).transpose()?,
+            token_serial: raw.pkcs11.token_serial.as_deref().map(|n| token_field("pkcs11.token_serial", n, 16)).transpose()?,
+        };
+
         Ok(Policy {
             selection,
             minimum_protection,
@@ -546,12 +623,24 @@ impl Policy {
             tpm_session_encryption: raw.tpm.session_encryption,
             pinned_session_salt_key_name,
             tpm_tcti: raw.tpm.tcti,
+            external_secret_dir,
+            pkcs11,
         })
     }
 
     /// TPM session parameter-encryption mode (`tpm.session_encryption`).
     pub fn tpm_session_encryption(&self) -> SessionEncryption {
         self.tpm_session_encryption
+    }
+
+    /// The external-secret directory (`external_secret.dir`), if policy sets one.
+    pub fn external_secret_dir(&self) -> Option<&std::path::Path> {
+        self.external_secret_dir.as_deref()
+    }
+
+    /// The PKCS#11 settings (`[pkcs11]`).
+    pub fn pkcs11(&self) -> &Pkcs11Settings {
+        &self.pkcs11
     }
 
     /// The TCTI the TPM provider must use (`tpm.tcti`), if policy sets one.
@@ -817,6 +906,29 @@ pub(crate) fn tpm_tcti() -> Result<Option<String>> {
         Some(Ok(policy)) => Ok(policy.tpm_tcti().map(str::to_owned)),
         Some(Err(e)) => Err(e),
         None => Ok(None),
+    }
+}
+
+/// The external-secret directory policy requires (`external_secret.dir`),
+/// if any. `Err` on a policy file that exists but can't be trusted, so the
+/// provider is unavailable rather than searching the default mounts.
+#[cfg_attr(not(feature = "external-secret"), allow(dead_code))]
+pub(crate) fn external_secret_dir() -> Result<Option<PathBuf>> {
+    match load() {
+        Some(Ok(policy)) => Ok(policy.external_secret_dir().map(std::path::Path::to_path_buf)),
+        Some(Err(e)) => Err(e),
+        None => Ok(None),
+    }
+}
+
+/// The PKCS#11 settings from policy (all unset with no policy file). `Err`
+/// on a policy file that exists but can't be trusted.
+#[cfg_attr(not(feature = "pkcs11"), allow(dead_code))]
+pub(crate) fn pkcs11_settings() -> Result<Pkcs11Settings> {
+    match load() {
+        Some(Ok(policy)) => Ok(policy.pkcs11().clone()),
+        Some(Err(e)) => Err(e),
+        None => Ok(Pkcs11Settings::default()),
     }
 }
 
@@ -1365,6 +1477,44 @@ mod tests {
         for bad in ["", "libtss2-tcti-evil.so", "/tmp/evil.so", "cmd:sh", "devices:/dev/tpm0"] {
             let doc = format!("{base}[tpm]\ntcti = \"{bad}\"\n");
             assert!(Policy::from_toml_str(&doc).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn external_secret_and_pkcs11_sections_are_read_and_validated() {
+        let base = "[selection]\nmode = \"prefer\"\n";
+        let policy = Policy::from_toml_str(base).unwrap();
+        assert_eq!(policy.external_secret_dir(), None);
+        assert_eq!(policy.pkcs11(), &Pkcs11Settings::default());
+
+        let doc = format!(
+            "{base}[external_secret]\ndir = \"/srv/secrets/hkdfguard\"\n\
+             [pkcs11]\nmodule = \"/usr/lib/vendor/libhsm.so\"\npin_file = \"/etc/hkdfguard/hsm.pin\"\n\
+             token_label = \"prod-kek\"\ntoken_serial = \"0123456789abcdef\"\n"
+        );
+        let policy = Policy::from_toml_str(&doc).unwrap();
+        assert_eq!(policy.external_secret_dir(), Some(std::path::Path::new("/srv/secrets/hkdfguard")));
+        assert_eq!(
+            policy.pkcs11(),
+            &Pkcs11Settings {
+                module: Some(PathBuf::from("/usr/lib/vendor/libhsm.so")),
+                pin_file: Some(PathBuf::from("/etc/hkdfguard/hsm.pin")),
+                token_label: Some("prod-kek".into()),
+                token_serial: Some("0123456789abcdef".into()),
+            }
+        );
+
+        for bad in [
+            "[external_secret]\ndir = \"relative/dir\"\n",
+            "[pkcs11]\nmodule = \"libsofthsm2.so\"\n",
+            "[pkcs11]\npin_file = \"pkcs11.pin\"\n",
+            "[pkcs11]\ntoken_label = \"\"\n",
+            "[pkcs11]\ntoken_label = \"this label is far too long for a pkcs11 token\"\n",
+            "[pkcs11]\ntoken_serial = \"0123456789abcdef0\"\n",
+            "[pkcs11]\nslot = 0\n",
+            "[external_secret]\npath = \"/x\"\n",
+        ] {
+            assert!(Policy::from_toml_str(&format!("{base}{bad}")).is_err(), "{bad:?} must be rejected");
         }
     }
 

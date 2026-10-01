@@ -16,25 +16,30 @@
 //!
 //! ## Configuration
 //!
-//! - `HKDFGUARD_PKCS11_MODULE`: path to the PKCS#11 module `.so`. If unset,
-//!   a small list of common SoftHSM2 install paths is tried. Whichever path
-//!   is used must be absolute, and both the (symlink-resolved) module file
-//!   and the directory containing it must be owned by root and not
-//!   writable by group or others -- see [`validate_module_path`]. The
-//!   module is `dlopen`ed into this process, so a module anyone else could
-//!   replace would be arbitrary code execution in the host application.
-//! - `HKDFGUARD_PKCS11_SLOT`: slot index to use (default: first slot with a
-//!   token present).
-//! - `HKDFGUARD_PKCS11_PIN_FILE`: path to a file containing the user PIN
-//!   used to log in for key generation/derivation (default:
-//!   `/etc/hkdfguard/pkcs11.pin`). The file must be owned by root or by
-//!   this process's user and grant no access at all to group or others
-//!   (e.g. mode `0600` or `0400`); a single trailing newline is ignored.
-//!   The PIN is deliberately **not** read from an environment variable:
-//!   a process's environment is readable via `/proc/<pid>/environ` by
-//!   anything running as the same user, and is inherited by every child
-//!   process. The old `HKDFGUARD_PKCS11_PIN` variable is ignored (with a
-//!   warning) if still set.
+//! All of it comes from the `[pkcs11]` table of the root-owned policy file.
+//! The `HKDFGUARD_PKCS11_*` environment variables in brackets are honored
+//! in debug builds only, for tests (see `crate::debug_only_env`).
+//!
+//! - `module` [`HKDFGUARD_PKCS11_MODULE`]: absolute path to the PKCS#11
+//!   module. **Release builds use PKCS#11 only when this is set.** Debug
+//!   builds fall back to common SoftHSM2 install paths; release builds
+//!   don't, because SoftHSM2 is a software token that would otherwise be
+//!   picked up -- and counted as hardware -- just for being installed. The
+//!   (symlink-resolved) module file and its directory must be owned by root
+//!   and not writable by group or others -- see [`validate_module_path`]:
+//!   the module is `dlopen`ed into this process.
+//! - `token_label` / `token_serial`: which token to use, among initialized
+//!   ones. Exactly one must match. With neither set, there must be exactly
+//!   one initialized token. Slot numbers are not used in release builds
+//!   because they can change across reboots and hot-plugging; the debug-only
+//!   [`HKDFGUARD_PKCS11_SLOT`] index remains for tests.
+//! - `pin_file` [`HKDFGUARD_PKCS11_PIN_FILE`]: the user-PIN file (default
+//!   `/etc/hkdfguard/pkcs11.pin`). Owned by root or this process's user,
+//!   no access at all for group or others (e.g. `0600`/`0400`); one
+//!   trailing newline is ignored. The PIN itself is never read from the
+//!   environment (`/proc/<pid>/environ` is readable by same-user processes
+//!   and inherited by children); the retired `HKDFGUARD_PKCS11_PIN` is
+//!   ignored with a warning.
 //!
 //! ## Design
 //!
@@ -110,13 +115,59 @@ impl Default for Pkcs11Provider {
     }
 }
 
-// Resolves which module path(s) to try loading, honoring an explicit
-// override or falling back to the built-in SoftHSM2 candidate list.
-fn candidate_module_paths() -> Vec<String> {
-    if let Ok(p) = std::env::var("HKDFGUARD_PKCS11_MODULE") {
-        return vec![p]; // explicit override: try only this one path
+// Which module path(s) to try: the policy's `module`; else, in debug
+// builds, HKDFGUARD_PKCS11_MODULE or the SoftHSM2 install paths. Empty in a
+// release build with no `module` in policy -- PKCS#11 is then unavailable.
+fn candidate_module_paths(from_policy: Option<PathBuf>, from_env: Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    if let Some(module) = from_policy {
+        return vec![module];
     }
-    DEFAULT_MODULE_PATHS.iter().map(|s| s.to_string()).collect()
+    if let Some(module) = from_env {
+        return vec![PathBuf::from(module)];
+    }
+    if cfg!(debug_assertions) {
+        return DEFAULT_MODULE_PATHS.iter().map(PathBuf::from).collect();
+    }
+    Vec::new()
+}
+
+/// Picks one token from the initialized tokens present, given as
+/// `(label, serial)` pairs in slot order. With a label and/or serial
+/// configured, exactly one token must match all that are set. Otherwise
+/// the debug-only slot index is used if given, and failing that there must
+/// be exactly one initialized token -- with several, guessing would make
+/// which token holds the keys depend on enumeration order.
+fn select_token(
+    tokens: &[(String, String)],
+    label: Option<&str>,
+    serial: Option<&str>,
+    debug_index: Option<&str>,
+) -> std::result::Result<usize, String> {
+    if label.is_some() || serial.is_some() {
+        let matches: Vec<usize> = tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, (l, n))| label.is_none_or(|want| want == l) && serial.is_none_or(|want| want == n))
+            .map(|(i, _)| i)
+            .collect();
+        return match matches.as_slice() {
+            [one] => Ok(*one),
+            [] => Err(format!("no initialized token matches pkcs11.token_label {label:?} / token_serial {serial:?}")),
+            many => Err(format!(
+                "{} tokens match pkcs11.token_label {label:?} / token_serial {serial:?}; set token_serial to choose one",
+                many.len()
+            )),
+        };
+    }
+    if let Some(index) = debug_index {
+        let i: usize = index.parse().map_err(|_| format!("HKDFGUARD_PKCS11_SLOT={index:?} is not an index"))?;
+        return if i < tokens.len() { Ok(i) } else { Err(format!("HKDFGUARD_PKCS11_SLOT={i} is out of range")) };
+    }
+    match tokens.len() {
+        1 => Ok(0),
+        0 => Err("no initialized PKCS#11 token is present".to_string()),
+        n => Err(format!("{n} initialized PKCS#11 tokens are present; set pkcs11.token_label (or token_serial) to choose one")),
+    }
 }
 
 /// Checks a PKCS#11 module path before it's ever `dlopen`ed: it must be
@@ -128,10 +179,10 @@ fn candidate_module_paths() -> Vec<String> {
 /// Loading a module runs its code inside this process, so a module (or a
 /// directory it sits in) that a non-root user could write to would let
 /// that user execute arbitrary code in the host application.
-fn validate_module_path(path: &str) -> std::result::Result<PathBuf, String> {
+fn validate_module_path(path: &Path) -> std::result::Result<PathBuf, String> {
     use crate::secure_file::{check_metadata, check_owner_and_mode, Owner, FORBID_GROUP_OTHER_WRITE};
 
-    let raw = Path::new(path);
+    let raw = path;
     if !raw.is_absolute() {
         return Err(format!("PKCS#11 module path {path:?} must be absolute"));
     }
@@ -159,10 +210,10 @@ const DEFAULT_PIN_FILE: &str = "/etc/hkdfguard/pkcs11.pin";
 /// to bound the one up-front allocation `SecretBuffer` makes.
 const MAX_PIN_FILE_LEN: usize = 256;
 
-fn pin_file_path() -> PathBuf {
-    std::env::var("HKDFGUARD_PKCS11_PIN_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_PIN_FILE))
+fn pin_file_path(from_policy: Option<PathBuf>, from_env: Option<std::ffi::OsString>) -> PathBuf {
+    from_policy
+        .or_else(|| from_env.map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_PIN_FILE))
 }
 
 /// Reads the PKCS#11 user PIN from `path`. The file must be a regular file
@@ -214,11 +265,30 @@ fn read_pin_file(path: &Path) -> std::result::Result<AuthPin, std::io::Error> {
 fn open_session() -> Option<OpenSession> {
     if std::env::var_os("HKDFGUARD_PKCS11_PIN").is_some() {
         log::warn!(
-            "hkdfguard: HKDFGUARD_PKCS11_PIN is no longer supported and is ignored; put the PIN in a mode-0600 file at HKDFGUARD_PKCS11_PIN_FILE (default {DEFAULT_PIN_FILE}) instead"
+            "hkdfguard: HKDFGUARD_PKCS11_PIN is no longer supported and is ignored; put the PIN in a mode-0600 file named by pkcs11.pin_file in the policy (default {DEFAULT_PIN_FILE}) instead"
         );
     }
 
-    let pin_path = pin_file_path();
+    let settings = match crate::policy::pkcs11_settings() {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("hkdfguard: PKCS#11 provider unavailable: {e}");
+            return None;
+        }
+    };
+    // Read every debug-only variable up front, so a release build warns
+    // about each one that is set even when it would not have been reached.
+    let env_module = crate::debug_only_env("HKDFGUARD_PKCS11_MODULE");
+    let env_pin_file = crate::debug_only_env("HKDFGUARD_PKCS11_PIN_FILE");
+    let env_slot = crate::debug_only_env("HKDFGUARD_PKCS11_SLOT").map(|v| v.to_string_lossy().into_owned());
+
+    let modules = candidate_module_paths(settings.module.clone(), env_module);
+    if modules.is_empty() {
+        log::debug!("hkdfguard: no PKCS#11 module configured (pkcs11.module); PKCS#11 provider unavailable");
+        return None; // the normal state on a host without an HSM configured
+    }
+
+    let pin_path = pin_file_path(settings.pin_file.clone(), env_pin_file);
     let pin = match read_pin_file(&pin_path) {
         Ok(pin) => pin,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -231,11 +301,11 @@ fn open_session() -> Option<OpenSession> {
         }
     };
 
-    let pkcs11 = candidate_module_paths().into_iter().find_map(|path| {
+    let pkcs11 = modules.into_iter().find_map(|path| {
         match validate_module_path(&path) {
             Ok(checked) => Pkcs11::new(checked).ok(), // first acceptable path that actually loads as a valid PKCS#11 module
             Err(reason) => {
-                if Path::new(&path).exists() {
+                if path.exists() {
                     log::warn!("hkdfguard: {reason}"); // only worth a warning if something is actually there being refused
                 }
                 None
@@ -244,11 +314,27 @@ fn open_session() -> Option<OpenSession> {
     })?;
     pkcs11.initialize(CInitializeArgs::OsThreads).ok()?; // C_Initialize, telling the module we may call it from multiple OS threads
 
-    let slot: Slot = if let Ok(idx) = std::env::var("HKDFGUARD_PKCS11_SLOT") {
-        let idx: usize = idx.parse().ok()?; // explicit slot index requested
-        *pkcs11.get_slots_with_token().ok()?.get(idx)? // must exist among the slots that actually have a token present
-    } else {
-        *pkcs11.get_slots_with_token().ok()?.first()? // otherwise just take the first slot with a token
+    // Only initialized tokens can hold keys; SoftHSM2, for one, always
+    // presents an extra blank token alongside the real ones.
+    let mut candidates: Vec<(Slot, (String, String))> = Vec::new();
+    for slot in pkcs11.get_slots_with_token().ok()? {
+        let info = pkcs11.get_token_info(slot).ok()?;
+        if info.token_initialized() {
+            candidates.push((slot, (info.label().to_string(), info.serial_number().to_string())));
+        }
+    }
+    let tokens: Vec<(String, String)> = candidates.iter().map(|(_, t)| t.clone()).collect();
+    let slot: Slot = match select_token(
+        &tokens,
+        settings.token_label.as_deref(),
+        settings.token_serial.as_deref(),
+        env_slot.as_deref(),
+    ) {
+        Ok(i) => candidates[i].0,
+        Err(reason) => {
+            log::error!("hkdfguard: PKCS#11 provider unavailable: {reason}");
+            return None;
+        }
     };
 
     let session = pkcs11.open_rw_session(slot).ok()?; // read/write, since we may need to generate keys
@@ -610,10 +696,53 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
+    fn tok(label: &str, serial: &str) -> (String, String) {
+        (label.to_string(), serial.to_string())
+    }
+
+    #[test]
+    fn a_configured_label_or_serial_must_match_exactly_one_token() {
+        let tokens = [tok("prod-kek", "1111"), tok("staging", "2222"), tok("prod-kek", "3333")];
+        assert_eq!(select_token(&tokens, Some("staging"), None, None), Ok(1));
+        assert_eq!(select_token(&tokens, None, Some("3333"), None), Ok(2));
+        assert_eq!(select_token(&tokens, Some("prod-kek"), Some("1111"), None), Ok(0));
+        assert!(select_token(&tokens, Some("prod-kek"), None, None).is_err(), "two tokens share the label");
+        assert!(select_token(&tokens, Some("missing"), None, None).is_err());
+        assert!(select_token(&tokens, Some("staging"), Some("1111"), None).is_err(), "label and serial must both match");
+        // A configured label beats the debug slot index.
+        assert_eq!(select_token(&tokens, Some("staging"), None, Some("0")), Ok(1));
+    }
+
+    #[test]
+    fn without_a_label_there_must_be_exactly_one_token() {
+        assert_eq!(select_token(&[tok("only", "1")], None, None, None), Ok(0));
+        assert!(select_token(&[], None, None, None).is_err());
+        assert!(
+            select_token(&[tok("a", "1"), tok("b", "2")], None, None, None).is_err(),
+            "with several tokens, picking the first would make the key's home depend on enumeration order"
+        );
+        // The debug-only index still works for tests.
+        assert_eq!(select_token(&[tok("a", "1"), tok("b", "2")], None, None, Some("1")), Ok(1));
+        assert!(select_token(&[tok("a", "1")], None, None, Some("5")).is_err());
+        assert!(select_token(&[tok("a", "1")], None, None, Some("x")).is_err());
+    }
+
+    #[test]
+    fn module_candidates_come_from_policy_then_debug_only_sources() {
+        let policy = Some(PathBuf::from("/opt/hsm/lib.so"));
+        let env = Some(std::ffi::OsString::from("/usr/lib/other.so"));
+        assert_eq!(candidate_module_paths(policy.clone(), env.clone()), vec![PathBuf::from("/opt/hsm/lib.so")]);
+        assert_eq!(candidate_module_paths(None, env), vec![PathBuf::from("/usr/lib/other.so")]);
+        // This test binary is a debug build: the SoftHSM2 search applies.
+        // Release builds get an empty list here (no module => no PKCS#11);
+        // the Docker suite checks that against the release library.
+        assert_eq!(candidate_module_paths(None, None).len(), DEFAULT_MODULE_PATHS.len());
+    }
+
     #[test]
     fn module_path_must_be_absolute() {
-        assert!(validate_module_path("libsofthsm2.so").is_err());
-        assert!(validate_module_path("./libsofthsm2.so").is_err());
+        assert!(validate_module_path(Path::new("libsofthsm2.so")).is_err());
+        assert!(validate_module_path(Path::new("./libsofthsm2.so")).is_err());
     }
 
     #[test]
@@ -623,7 +752,7 @@ mod tests {
             return; // as root, any temp file is root-owned, so there's nothing to reject
         }
         let f = pin_file(b"not really a module", 0o755);
-        let err = validate_module_path(f.path().to_str().unwrap()).unwrap_err();
+        let err = validate_module_path(f.path()).unwrap_err();
         assert!(err.contains("refusing"), "unexpected error: {err}");
     }
 
@@ -633,7 +762,7 @@ mod tests {
         // 0755, in a root-owned 0755 directory on every Unix this builds on
         // (and canonicalizing through a merged-/usr symlink still lands in
         // a root-owned directory).
-        let checked = validate_module_path("/bin/sh").unwrap();
+        let checked = validate_module_path(Path::new("/bin/sh")).unwrap();
         assert!(checked.is_absolute());
     }
 
@@ -657,6 +786,31 @@ mod tests {
         let reported_public = h1.public_key().unwrap();
         let via_reported = p256::ecdh::diffie_hellman(eph.to_nonzero_scalar(), reported_public.as_affine());
         assert_eq!(h1.ecdh(&eph_pub).unwrap().as_slice(), via_reported.raw_secret_bytes().as_slice());
+    }
+
+    #[test]
+    #[ignore = "requires a configured SoftHSM2 (or other PKCS#11) module + token labelled hkdfguard-test"]
+    fn policy_selects_the_module_and_the_token_by_label() {
+        // docker/entrypoint-test.sh initializes a token labelled
+        // "hkdfguard-test" and exports the module path for debug builds;
+        // here the module comes from policy instead, as in production.
+        let module = std::env::var("HKDFGUARD_PKCS11_MODULE").expect("set by the test harness");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.toml");
+        let policy_for = |label: &str| {
+            format!("[selection]\nmode = \"require\"\nprovider = \"pkcs11\"\n[pkcs11]\nmodule = \"{module}\"\ntoken_label = \"{label}\"\n")
+        };
+
+        crate::secure_file::write_world_readable_for_tests(&path, policy_for("hkdfguard-test"));
+        std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
+        let matched = Pkcs11Provider::new().probe();
+
+        crate::secure_file::write_world_readable_for_tests(&path, policy_for("no-such-token"));
+        let unmatched = Pkcs11Provider::new().probe();
+        std::env::remove_var("HKDFGUARD_POLICY_FILE");
+
+        assert!(matched, "the token labelled hkdfguard-test must be selected");
+        assert!(!unmatched, "a label that matches no token must leave PKCS#11 unavailable, not pick another token");
     }
 
     #[test]

@@ -6,10 +6,10 @@
 //! sink, a CSI Secret Store volume, a systemd credential, or any other
 //! mounted-file secret mechanism -- rather than generating one itself.
 //!
-//! Lookup pattern: `<base>/hkdfguard/<service>`, where `<base>` is the first
-//! of a list of conventional secret mount points that exists (overridable
-//! wholesale with `HKDFGUARD_EXTERNAL_SECRET_DIR`, which should point
-//! directly at the `hkdfguard` directory).
+//! Lookup pattern: `<dir>/<service>`. `<dir>` is `external_secret.dir` from
+//! the root-owned policy when set; otherwise (debug builds only)
+//! `HKDFGUARD_EXTERNAL_SECRET_DIR`; otherwise the first of a list of
+//! conventional secret mount points that exists.
 //!
 //! The secret file's contents must be either a PKCS#8 DER-encoded P-256
 //! private key, or exactly 32 raw big-endian scalar bytes.
@@ -291,12 +291,24 @@ fn parse_secret_key(bytes: &[u8]) -> Result<SecretKey> {
         .map_err(|e| Error::Provider(format!("external secret is not a valid P-256 key: {e}")))
 }
 
-// Picks the secret mount directory: an explicit override first, otherwise
-// the first conventional mount point that actually exists.
+// Picks the secret mount directory: `external_secret.dir` from policy;
+// else, in debug builds only, HKDFGUARD_EXTERNAL_SECRET_DIR (see
+// crate::debug_only_env); else the first conventional mount that exists.
+// An explicitly configured directory that doesn't exist makes the provider
+// unavailable rather than falling back to the search, and so does a policy
+// file that can't be trusted.
 fn resolve_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("HKDFGUARD_EXTERNAL_SECRET_DIR") {
-        let path = PathBuf::from(dir);
-        return if path.is_dir() { Some(path) } else { None }; // override must actually exist, or we report "unavailable"
+    let from_env = crate::debug_only_env("HKDFGUARD_EXTERNAL_SECRET_DIR").map(PathBuf::from);
+    let configured = match crate::policy::external_secret_dir() {
+        Ok(Some(dir)) => Some(dir),
+        Ok(None) => from_env,
+        Err(e) => {
+            log::error!("hkdfguard: external-secret provider unavailable: {e}");
+            return None;
+        }
+    };
+    if let Some(path) = configured {
+        return if path.is_dir() { Some(path) } else { None };
     }
 
     CANDIDATE_MOUNTS
@@ -543,6 +555,37 @@ mod tests {
             // key, not some other/derived value.
             assert_eq!(handle.public_key().unwrap(), secret_key.public_key());
         });
+    }
+
+    #[test]
+    #[serial]
+    fn policy_dir_wins_over_the_environment_and_has_no_fallback() {
+        let policy_mount = tempdir().unwrap();
+        let env_mount = tempdir().unwrap();
+        let policy_dir = tempdir().unwrap();
+        let policy = policy_dir.path().join("policy.toml");
+        crate::secure_file::write_world_readable_for_tests(
+            &policy,
+            format!("[selection]\nmode = \"prefer\"\n[external_secret]\ndir = \"{}\"\n", policy_mount.path().display()),
+        );
+        std::env::set_var("HKDFGUARD_POLICY_FILE", &policy);
+        std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", env_mount.path());
+        assert_eq!(resolve_dir().as_deref(), Some(policy_mount.path()), "policy must win over the environment");
+
+        // A configured directory that doesn't exist: unavailable, never the
+        // environment or the conventional mounts.
+        crate::secure_file::write_world_readable_for_tests(
+            &policy,
+            "[selection]\nmode = \"prefer\"\n[external_secret]\ndir = \"/nonexistent-hkdfguard-mount\"\n",
+        );
+        assert_eq!(resolve_dir(), None);
+
+        // A broken policy: unavailable, not a fallback to the search.
+        crate::secure_file::write_world_readable_for_tests(&policy, "[selection]\nmode = \"require\"\n");
+        assert_eq!(resolve_dir(), None);
+
+        std::env::remove_var("HKDFGUARD_POLICY_FILE");
+        std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
     }
 
     #[test]

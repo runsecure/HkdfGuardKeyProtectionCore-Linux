@@ -40,7 +40,8 @@ use zeroize::Zeroize; // scrub sensitive stack buffers before returning
 const MAX_SERVICE_LEN: usize = 128; // spec-mandated maximum service-name length in bytes
 
 /// Reads an environment variable that redirects security configuration
-/// (which policy file, which TPM, which derivation secret). Honored only in
+/// (which policy file, TPM, derivation secret, secret mount, PKCS#11
+/// module, token or PIN file). Honored only in
 /// debug builds -- `cargo test`, `cargo build` -- so tests and development
 /// can point at scratch files and simulators. Release builds never read
 /// it: the environment is often set by lower-trust configuration than the
