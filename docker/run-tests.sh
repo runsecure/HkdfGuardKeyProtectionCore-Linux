@@ -17,4 +17,4 @@ cleanup() { docker rmi -f "$TAG" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 docker build -t "$TAG" -f docker/Dockerfile .
-docker run --rm "$TAG"
+docker run --rm --cap-add IPC_LOCK "$TAG"   # IPC_LOCK: lets the CLI take its mlockall path

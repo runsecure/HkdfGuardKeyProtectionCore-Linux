@@ -151,4 +151,23 @@ echo "--dek correctly rejected; unprovisioned wrap correctly refused; stdin and 
 rm -f "$DEK_FILE" "$WRAPPED_FILE" "$WRAPPED_FILE2" "$DEK_B64_FILE"
 unset HKDFGUARD_EXTERNAL_SECRET_DIR
 
+section "hkdfguard-v1-initialize locks its memory when it can"
+# docker/run-tests.sh and CI grant CAP_IPC_LOCK, so the CLI must take the
+# mlockall path; it exits non-zero if that fails, so a clean exit with no
+# skip warning means memory really was locked. Without the capability the
+# skip path must warn instead.
+CAP_EFF=$((16#$(awk '/^CapEff:/{print $2}' /proc/self/status)))
+CLI_STDERR=$(target/release/hkdfguard-v1-initialize --help 2>&1 >/dev/null) \
+    || { echo "FAIL: CLI exited non-zero at startup: $CLI_STDERR" >&2; exit 1; }
+if (( (CAP_EFF >> 14) & 1 )); then
+    if grep -q 'memory not locked' <<<"$CLI_STDERR"; then
+        echo "FAIL: CAP_IPC_LOCK is present but the CLI skipped mlockall" >&2; exit 1
+    fi
+    echo "CAP_IPC_LOCK present: CLI locked its memory (mlockall succeeded)."
+else
+    grep -q 'memory not locked' <<<"$CLI_STDERR" \
+        || { echo "FAIL: no CAP_IPC_LOCK, yet the CLI gave no skip warning" >&2; exit 1; }
+    echo "no CAP_IPC_LOCK: CLI skipped mlockall and warned, as designed."
+fi
+
 section "ALL CHECKS PASSED"

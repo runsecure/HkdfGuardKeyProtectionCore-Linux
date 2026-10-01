@@ -82,7 +82,9 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::ExitCode;
 use zeroize::{Zeroize, Zeroizing};
-use HkdfGuardKeyProtectionLinux::{hkdfguard_create_kek, hkdfguard_kek_exists, hkdfguard_wrap_dek, status};
+use HkdfGuardKeyProtectionLinux::{
+    hkdfguard_create_kek, hkdfguard_harden_process, hkdfguard_kek_exists, hkdfguard_wrap_dek, status,
+};
 
 // rw-r-----: readable by the owning deployment user and its group, writable
 // only by the owner, inaccessible to everyone else.
@@ -406,6 +408,9 @@ fn describe_status(code: c_int) -> String {
         status::FINGERPRINT_MISMATCH => {
             "the wrapped payload's KEK fingerprint does not match the current KEK for this service".to_string()
         }
+        status::PROCESS_HARDENING_FAILED => {
+            "could not disable core dumps / ptrace access for this process".to_string()
+        }
         other => format!("unknown status code {other}"),
     }
 }
@@ -653,6 +658,71 @@ fn run(command: Command) -> Result<(), String> {
     }
 }
 
+// `CAP_IPC_LOCK`'s bit in the capability sets of /proc/self/status.
+#[cfg(any(target_os = "linux", test))]
+const CAP_IPC_LOCK: u32 = 14;
+
+// Whether `mlockall(MCL_CURRENT | MCL_FUTURE)` is safe to apply: only when
+// no RLIMIT_MEMLOCK can ever be hit. With a finite limit the kernel either
+// refuses MCL_CURRENT outright (virtual size over the limit -- harmless,
+// nothing is applied) or accepts it, after which MCL_FUTURE makes any
+// allocation that would cross the limit fail and the process abort
+// mid-operation. CAP_IPC_LOCK bypasses the limit; so does an unlimited one.
+#[cfg(any(target_os = "linux", test))]
+fn memory_lock_is_unbounded(cap_eff: Option<u64>, memlock_soft: u64, memlock_hard: u64, infinity: u64) -> bool {
+    let has_ipc_lock = cap_eff.is_some_and(|caps| caps & (1u64 << CAP_IPC_LOCK) != 0);
+    has_ipc_lock || (memlock_soft == infinity && memlock_hard == infinity)
+}
+
+// The effective capability set, from the `CapEff:` line of a
+// /proc/<pid>/status document. `None` if absent or malformed.
+#[cfg(any(target_os = "linux", test))]
+fn parse_cap_eff(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("CapEff:"))
+        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+}
+
+// Keeps this process's memory -- the plaintext DEK included -- out of swap.
+// Applied only when it can't later abort an allocation (see
+// `memory_lock_is_unbounded`); otherwise skipped with a warning, since
+// default limits for unprivileged users would make it fail or, worse,
+// succeed and then kill the process. If it should work and doesn't, that
+// is an error.
+#[cfg(target_os = "linux")]
+fn lock_memory() -> Result<(), String> {
+    let cap_eff = fs::read_to_string("/proc/self/status").ok().as_deref().and_then(parse_cap_eff);
+    let mut memlock = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: getrlimit writes into a valid rlimit.
+    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut memlock) } != 0 {
+        return Err(format!("could not read RLIMIT_MEMLOCK: {}", std::io::Error::last_os_error()));
+    }
+
+    if !memory_lock_is_unbounded(cap_eff, memlock.rlim_cur, memlock.rlim_max, libc::RLIM_INFINITY) {
+        eprintln!(
+            "warning: memory not locked: needs CAP_IPC_LOCK or an unlimited RLIMIT_MEMLOCK \
+             (e.g. run as root, or LimitMEMLOCK=infinity for a systemd unit); key material in \
+             this process could be written to swap"
+        );
+        return Ok(());
+    }
+
+    // SAFETY: mlockall takes only flags.
+    if unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) } != 0 {
+        return Err(format!(
+            "could not lock memory (mlockall): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn lock_memory() -> Result<(), String> {
+    Ok(())
+}
+
 // Prints the library's warnings and errors to stderr. The library reports
 // through the `log` facade and is silent without a logger installed, which
 // would hide exactly the messages an operator running this tool needs --
@@ -677,6 +747,18 @@ static LOGGER: StderrLogger = StderrLogger;
 fn main() -> ExitCode {
     if log::set_logger(&LOGGER).is_ok() {
         log::set_max_level(log::LevelFilter::Warn);
+    }
+    // Before anything is read: this process holds a plaintext DEK, so it
+    // must not be dumpable or debuggable by other processes of the same
+    // user. Refuse to run rather than handle a DEK unprotected.
+    let rc = hkdfguard_harden_process();
+    if rc != status::OK {
+        eprintln!("error: {}; refusing to handle key material", describe_status(rc));
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = lock_memory() {
+        eprintln!("error: {e}; refusing to handle key material");
+        return ExitCode::FAILURE;
     }
     match parse_args(std::env::args()) {
         Ok(ParseOutcome::Help) => {
@@ -1018,6 +1100,34 @@ mod tests {
 
         let at_limit = vec![b'A'; MAX_DEK_INPUT_LEN];
         assert_eq!(read_bounded(&mut at_limit.as_slice(), "test").unwrap().len(), MAX_DEK_INPUT_LEN);
+    }
+
+    // ---- memory locking decision ----
+
+    const INF: u64 = u64::MAX;
+
+    #[test]
+    fn cap_eff_is_parsed_from_proc_status() {
+        let status = "Name:\tx\nCapInh:\t0000000000000000\nCapEff:\t000001ffffffffff\nCapBnd:\t0\n";
+        assert_eq!(parse_cap_eff(status), Some(0x1ff_ffff_ffff));
+        assert_eq!(parse_cap_eff("Name:\tx\n"), None);
+        assert_eq!(parse_cap_eff("CapEff:\tnothex\n"), None);
+    }
+
+    #[test]
+    fn memory_is_locked_only_when_no_limit_can_be_hit() {
+        let ipc_lock = Some(1u64 << CAP_IPC_LOCK);
+        let other_caps = Some(!(1u64 << CAP_IPC_LOCK));
+
+        assert!(memory_lock_is_unbounded(ipc_lock, 65536, 65536, INF), "CAP_IPC_LOCK bypasses any limit");
+        assert!(memory_lock_is_unbounded(Some(0), INF, INF, INF), "an unlimited RLIMIT_MEMLOCK is safe");
+        assert!(memory_lock_is_unbounded(None, INF, INF, INF), "unlimited is safe even if caps are unreadable");
+
+        // A finite limit without the capability: MCL_FUTURE could abort a
+        // later allocation, so skip.
+        assert!(!memory_lock_is_unbounded(other_caps, 8 << 20, 8 << 20, INF));
+        assert!(!memory_lock_is_unbounded(Some(0), 1 << 30, INF, INF), "a finite soft limit still binds");
+        assert!(!memory_lock_is_unbounded(None, 65536, 65536, INF));
     }
 
     // ---- --dek-file hardening ----

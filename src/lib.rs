@@ -306,6 +306,64 @@ pub extern "C" fn hkdfguard_generate_and_wrap_dek(
     }
 }
 
+/// Hardens the *calling process* against memory disclosure: disables core
+/// dumps and, on Linux, marks the process non-dumpable, which also stops
+/// other non-root processes running as the same user from attaching with
+/// `ptrace` or reading `/proc/<pid>/mem`. Keys and DEKs that pass through
+/// this library's memory then can't be recovered from a crash dump or a
+/// same-user debugger.
+///
+/// Opt-in, because it changes process-wide state the host application
+/// owns: debuggers and crash reporters stop working for the process.
+/// Call it once, early in startup, and *after* any privilege change --
+/// the kernel resets the dumpable flag when a process's credentials
+/// change. Root, and a process with `CAP_SYS_PTRACE`, can still inspect
+/// the process; that is host configuration (see README).
+///
+/// Linux: sets `RLIMIT_CORE` to 0 (soft and hard, so it can't be raised
+/// again) and `prctl(PR_SET_DUMPABLE, 0)`. Other platforms: only the core
+/// limit. Idempotent.
+///
+/// # Returns
+/// [`status::OK`], or [`status::PROCESS_HARDENING_FAILED`] if either step
+/// failed (logged with the OS error). Never throws/unwinds.
+#[no_mangle]
+pub extern "C" fn hkdfguard_harden_process() -> c_int {
+    match std::panic::catch_unwind(harden_process_impl) {
+        Ok(code) => code,
+        Err(_) => {
+            log::error!("hkdfguard: internal panic caught at hkdfguard_harden_process boundary");
+            status::INTERNAL_ERROR
+        }
+    }
+}
+
+fn harden_process_impl() -> c_int {
+    let no_core = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: setrlimit reads a valid, fully initialized rlimit.
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) } != 0 {
+        log::error!(
+            "hkdfguard: could not disable core dumps (setrlimit RLIMIT_CORE): {}",
+            std::io::Error::last_os_error()
+        );
+        return status::PROCESS_HARDENING_FAILED;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: PR_SET_DUMPABLE takes one integer argument; the rest are ignored.
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0 as libc::c_ulong, 0, 0, 0) } != 0 {
+            log::error!(
+                "hkdfguard: could not mark the process non-dumpable (prctl PR_SET_DUMPABLE): {}",
+                std::io::Error::last_os_error()
+            );
+            return status::PROCESS_HARDENING_FAILED;
+        }
+    }
+
+    status::OK
+}
+
 // The actual logic behind `hkdfguard_generate_and_wrap_dek`, running inside
 // the `catch_unwind` wrapper above. Generates the DEK, then delegates to
 // `wrap_impl` (the exact same validation/wrap/copy-out logic

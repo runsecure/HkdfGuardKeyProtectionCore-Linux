@@ -44,6 +44,7 @@ pub mod status {
     // (and now Windows) use for the same concept, since it's a
     // cross-platform notion, unlike the gap above it.
     pub const FINGERPRINT_MISMATCH: i32 = -16; // wrapped payload's embedded KEK fingerprint doesn't match the current KEK's public key
+    pub const PROCESS_HARDENING_FAILED: i32 = -17; // hkdfguard_harden_process could not disable core dumps or ptrace access
 }
 
 #[derive(Debug)] // lets `Error` be formatted with `{:?}` in tests/logs

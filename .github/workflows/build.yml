@@ -90,7 +90,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=hkdfguard-${{ matrix.arch }}
 
       - name: Full test matrix (swtpm + SoftHSM2)
-        run: docker run --rm hkdfguard-ci:${{ matrix.arch }}
+        run: docker run --rm --cap-add IPC_LOCK hkdfguard-ci:${{ matrix.arch }}   # IPC_LOCK: exercises the CLI's mlockall path
 
       - name: Release build
         run: |

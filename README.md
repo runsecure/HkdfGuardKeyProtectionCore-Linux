@@ -90,6 +90,34 @@ int wrapped_len = sizeof(wrapped);
 hkdfguard_generate_and_wrap_dek("com.company.orders", wrapped, &wrapped_len);
 ```
 
+### Hardening the host process (opt-in)
+
+Keys and DEKs pass through your process's memory. `hkdfguard_harden_process`
+makes that memory harder to recover: it disables core dumps (`RLIMIT_CORE`
+set to 0, hard limit included) and calls `prctl(PR_SET_DUMPABLE, 0)`,
+which also stops other non-root processes running as the same user from
+attaching a debugger or reading `/proc/<pid>/mem`. Call it once, early,
+and after any privilege drop (the kernel resets the flag when a
+process's credentials change):
+
+```c
+if (hkdfguard_harden_process() != HKDFGUARD_OK) { /* refuse to start */ }
+```
+
+It is opt-in because it is process-wide: debuggers and crash reporters
+stop working for your application. It does not stop root or a process
+with `CAP_SYS_PTRACE`, and it does not keep memory out of swap; those are
+host settings -- no swap or encrypted swap, `kernel.yama.ptrace_scope` of
+2 or 3, and for a systemd service `LimitCORE=0` and
+`ProtectProc=invisible`.
+
+`hkdfguard-v1-initialize` always calls it, and refuses to run if it fails.
+The CLI also locks its memory out of swap with `mlockall`, but only when
+the process has `CAP_IPC_LOCK` or an unlimited `RLIMIT_MEMLOCK` (root, or
+`LimitMEMLOCK=infinity`). Under a finite limit, locking future
+allocations could make one fail and abort the CLI mid-operation, so it
+skips the lock and prints a warning instead.
+
 See [`examples/wrap_unwrap.c`](examples/wrap_unwrap.c) for a complete,
 buildable example, and [`include/hkdfguard.h`](include/hkdfguard.h) for the
 full API contract (status codes, buffer sizing, safety requirements).
@@ -673,7 +701,8 @@ its default.
 src/
   lib.rs                    C ABI: hkdfguard_create_kek / hkdfguard_kek_exists /
                              hkdfguard_wrap_dek / hkdfguard_unwrap_dek /
-                             hkdfguard_generate_and_wrap_dek; the setup-call gate
+                             hkdfguard_generate_and_wrap_dek /
+                             hkdfguard_harden_process; the setup-call gate
   error.rs                  Internal error type <-> C status codes
   payload.rs                Wrapped-payload wire format (version 1)
   crypto.rs                 ECDH(H_salt) -> HKDF-SHA512 -> AES-256-GCM protocol; salt-to-point hashing
@@ -694,6 +723,7 @@ examples/
   cli_unwrap_check.c         Unwraps a CLI-written key file through the .so
 tests/
   cli_initialize_round_trip.rs   Drives the CLI as a real subprocess
+  harden_process.rs              hkdfguard_harden_process, in its own process
 scripts/
   build-release.sh           cargo build --release, then renames the output
                               to HkdfGuard.Kms.Linux.v1.{so,dylib}

@@ -42,6 +42,25 @@ extern "C" {
 #define HKDFGUARD_ERR_KEK_NOT_FOUND    (-9)
 /* -10..-15 intentionally unassigned here -- see hkdfguard's error.rs. */
 #define HKDFGUARD_ERR_FINGERPRINT_MISMATCH (-16)
+#define HKDFGUARD_ERR_PROCESS_HARDENING_FAILED (-17) /* hkdfguard_harden_process could not disable core dumps or ptrace access */
+
+/*
+ * Opt-in hardening of the *calling process* against memory disclosure:
+ * disables core dumps (RLIMIT_CORE = 0, soft and hard) and, on Linux,
+ * calls prctl(PR_SET_DUMPABLE, 0), which also stops other non-root
+ * processes of the same user from ptrace-attaching or reading
+ * /proc/<pid>/mem. Keys and DEKs that pass through this library then
+ * can't be recovered from a crash dump or a same-user debugger.
+ *
+ * It changes process-wide state, so debuggers and crash reporters stop
+ * working for the process -- hence opt-in. Call once, early in startup,
+ * and after any privilege change (the kernel resets the dumpable flag
+ * when credentials change). Root and CAP_SYS_PTRACE are unaffected; that
+ * is host configuration. Idempotent.
+ *
+ * Returns HKDFGUARD_OK, or HKDFGUARD_ERR_PROCESS_HARDENING_FAILED.
+ */
+int hkdfguard_harden_process(void);
 
 /*
  * Ensures a persistent KEK exists for `service`, creating one (on the
