@@ -261,20 +261,26 @@ const SECRET_FILE_REQUIREMENTS: FileRequirements = FileRequirements {
 /// The resolved path contains no symlinks, so opening *it* with
 /// `O_NOFOLLOW` closes the race between resolution and open: a link
 /// swapped in for the final component in that window fails with `ELOOP`
-/// instead of being followed. On Linux the descriptor's own path is then
-/// read back from `/proc/self/fd` and re-checked against the mount, which
-/// also covers an intermediate directory being swapped. (Doing that
-/// requires write access to the mount or a directory above it, which
+/// instead of being followed. The opened descriptor is then confirmed to be
+/// the resolved file (see [`verify_opened`]), which also covers an
+/// intermediate directory being swapped. (Doing that requires write access
+/// to a directory between `/` and the file, which
 /// [`crate::secure_file::check_dir_chain`] has already confined to root and
-/// the service's own uid -- but the check is one `readlink`, and it turns a
-/// race into a detection.)
+/// the service's own uid -- but the check is cheap, and it turns a race
+/// into a detection.)
 ///
-/// Only `NotFound` means "nothing provisioned"; every other failure means
-/// "something is there and it is not acceptable".
+/// Only a missing `<mount>/<service>` is `NotFound`, meaning "nothing
+/// provisioned"; every other failure means "something is there and it is
+/// not acceptable", or "this couldn't be checked".
 fn open_secret_within_mount(mount: &Path, service: &str) -> std::io::Result<File> {
     use std::io::{Error as IoError, ErrorKind};
 
-    let mount_real = std::fs::canonicalize(mount)?;
+    // Only a missing `<mount>/<service>` may come back as `NotFound`; that
+    // is the one failure the chain reads as "not provisioned here". A mount
+    // that vanished, or a check that couldn't be carried out, is not a
+    // statement about this service and must not look like one.
+    let mount_real = std::fs::canonicalize(mount)
+        .map_err(|e| IoError::new(ErrorKind::PermissionDenied, format!("secret mount {}: {e}", mount.display())))?;
     // A mount others can write to would let them plant a KEK for a service
     // not provisioned yet -- which `create_kek` would then adopt, leaving
     // them holding the key to everything wrapped under it. The service's
@@ -289,6 +295,11 @@ fn open_secret_within_mount(mount: &Path, service: &str) -> std::io::Result<File
             format!("resolves to {}, outside the secret mount", target_real.display()),
         ));
     }
+    // And every directory between the mount and the file (Kubernetes'
+    // `..<timestamp>/`), so nothing under the mount can be swapped either.
+    if let Some(target_dir) = target_real.parent() {
+        crate::secure_file::check_dir_chain(target_dir, Owner::RootOrCurrentUser)?;
+    }
 
     let file = open_checked(&target_real, &SECRET_FILE_REQUIREMENTS).map_err(|e| {
         if e.raw_os_error() == Some(libc::ELOOP) {
@@ -298,19 +309,44 @@ fn open_secret_within_mount(mount: &Path, service: &str) -> std::io::Result<File
         }
     })?;
 
+    verify_opened(&file, &target_real, &mount_real, Path::new("/proc"))?;
+    Ok(file)
+}
+
+/// Confirms the descriptor `open` returned is the file that was resolved
+/// and checked: on Linux, by reading its path back from
+/// `<proc>/self/fd/<n>` and re-checking containment; where that isn't
+/// possible (`/proc` not mounted or masked, as in some minimal containers
+/// and sandboxes, or a non-Linux build), by comparing the descriptor's
+/// device and inode with the resolved path's. Every failure is
+/// `PermissionDenied` -- never `NotFound`, which would read as "not
+/// provisioned".
+fn verify_opened(file: &File, target_real: &Path, mount_real: &Path, proc_root: &Path) -> std::io::Result<()> {
+    use std::io::{Error as IoError, ErrorKind};
+    use std::os::unix::fs::MetadataExt;
+
+    let denied = |what: String| IoError::new(ErrorKind::PermissionDenied, what);
+
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
-        let opened = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
-        if !opened.starts_with(&mount_real) {
-            return Err(IoError::new(
-                ErrorKind::PermissionDenied,
-                format!("opened descriptor refers to {}, outside the secret mount", opened.display()),
-            ));
+        if let Ok(opened) = std::fs::read_link(proc_root.join(format!("self/fd/{}", file.as_raw_fd()))) {
+            if !opened.starts_with(mount_real) {
+                return Err(denied(format!("opened descriptor refers to {}, outside the secret mount", opened.display())));
+            }
+            return Ok(());
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (mount_real, proc_root);
 
-    Ok(file)
+    let opened = file.metadata().map_err(|e| denied(format!("could not stat the opened secret: {e}")))?;
+    let resolved = std::fs::symlink_metadata(target_real)
+        .map_err(|e| denied(format!("{} changed after it was opened: {e}", target_real.display())))?;
+    if (opened.dev(), opened.ino()) != (resolved.dev(), resolved.ino()) {
+        return Err(denied(format!("{} was replaced between resolution and open", target_real.display())));
+    }
+    Ok(())
 }
 
 // Accepts either a 32-byte raw scalar or a PKCS#8 DER-encoded key, since
@@ -450,6 +486,7 @@ mod tests {
         with_dir(|provider, dir| {
             let versioned = dir.join("..2026_09_28_00_00_00.000000000");
             std::fs::create_dir(&versioned).unwrap();
+            std::fs::set_permissions(&versioned, std::fs::Permissions::from_mode(0o755)).unwrap(); // as kubelet makes it, whatever the umask
             let key = SecretKey::random(&mut OsRng);
             provision(&versioned, "com.company.orders", key.to_bytes());
             std::os::unix::fs::symlink(&versioned, dir.join("..data")).unwrap();
@@ -514,6 +551,49 @@ mod tests {
                 assert!(provider.kek_exists("com.company.orders").unwrap(), "mode {mode:o}");
                 provider.load_kek("com.company.orders", true).unwrap();
             }
+        });
+    }
+
+    #[test]
+    fn opened_file_is_verified_without_proc() {
+        // `/proc` masked or not mounted: the descriptor is still checked,
+        // by device and inode, and a failure is never `NotFound` (which
+        // the chain would read as "not provisioned").
+        let mount = crate::secure_file::private_tempdir();
+        let mount_real = std::fs::canonicalize(mount.path()).unwrap();
+        let no_proc = mount_real.join("no-proc-here");
+        let a = provision(&mount_real, "a", [1u8; 32]);
+        let b = provision(&mount_real, "b", [2u8; 32]);
+
+        let file_a = File::open(&a).unwrap();
+        verify_opened(&file_a, &a, &mount_real, &no_proc).expect("the opened file is the resolved one");
+
+        let err = verify_opened(&file_a, &b, &mount_real, &no_proc).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "a mismatch is a refusal");
+
+        std::fs::remove_file(&a).unwrap();
+        let err = verify_opened(&file_a, &a, &mount_real, &no_proc).unwrap_err();
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound, "must never read as 'not provisioned'");
+    }
+
+    #[test]
+    #[serial]
+    fn refuses_a_writable_directory_inside_the_mount() {
+        with_dir(|provider, dir| {
+            // Kubernetes-style `..data/<key>`, but with the inner directory
+            // writable by others: they could swap the key underneath.
+            let inner = dir.join("..2026_10_01");
+            std::fs::create_dir(&inner).unwrap();
+            provision(&inner, "com.company.orders", SecretKey::random(&mut OsRng).to_bytes());
+            std::os::unix::fs::symlink("..2026_10_01/com.company.orders", dir.join("com.company.orders")).unwrap();
+
+            std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o700)).unwrap();
+            provider.load_kek("com.company.orders", false).unwrap();
+
+            std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(matches!(provider.load_kek("com.company.orders", false), Err(Error::Provider(_))));
+            assert!(provider.kek_exists("com.company.orders").is_err());
+            std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o700)).unwrap();
         });
     }
 
