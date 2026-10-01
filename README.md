@@ -133,6 +133,25 @@ originally wrapped the payload (recorded -- and authenticated -- in the
 payload itself, never in `service`). Providers are constructed fresh on
 every call; nothing is cached or kept open between calls.
 
+The walk moves past a provider only when it is **absent** -- not on this
+host, or not set up for use here -- or has **no key for this service**.
+A provider that is present but failing ends the call with its error
+instead: a secret file with the wrong owner or mode, a TPM that fails its
+self-test or whose configured TCTI can't be opened, a PKCS#11 module that
+won't load, a token label that matches nothing, a wrong PIN, a configured
+secret mount that isn't there. Falling through in those cases would
+quietly wrap every new DEK under a weaker KEK -- or, with Ephemeral, one
+lost at the next restart -- with nothing reporting a problem.
+`hkdfguard_kek_exists` fails the same way rather than answering 0, so a
+caller isn't steered into creating a key somewhere weaker.
+
+| Provider | Absent (the walk moves on) | Present but failing (the call fails) |
+|---|---|---|
+| TPM2 | default device can't be opened (no TPM, or not in `tss`); no derivation secret | leaky `TSS2_LOG`; unusable policy TCTI, or a configured one that can't be opened; untrusted secret; failed or unrunnable self-test |
+| PKCS#11 | no module configured; no PIN file | untrusted PIN file; module refused or won't load; no matching token; `C_Initialize`/session/login failure |
+| External secret | no mount found | configured `external_secret.dir` missing; a service's secret file present but untrusted |
+| (any) | -- | policy present but unusable |
+
 | # | Provider | Module | Feature flag | Built by default |
 |---|----------|--------|---------------|-------------------|
 | 1 | TPM2 | [`src/provider/tpm2.rs`](src/provider/tpm2.rs) | `tpm2` | no |
@@ -308,10 +327,12 @@ Add the entry as root and run `provision` again; it then reports
 protection (above), so one record does both jobs. A policy file that
 exists but can't be parsed applies the allowlist rather than dropping it.
 
-This gates the *TPM* provider. Under `mode = "prefer"`, a refused
-TPM is skipped like any other unavailable provider, so a weaker provider
-later in the order could serve the service instead; pair the allowlist
-with `mode = "require"`, `provider = "tpm2"` (or `mode = "require-level"`, `level = "hardware"`) if that matters. Don't
+This gates the *TPM* provider. `provision` for an unpinned service fails
+outright rather than creating the key elsewhere. But under
+`mode = "prefer"`, wrap and unwrap treat an unpinned service like one the
+TPM has no key for, so a weaker provider later in the order that *does*
+hold a key for it can still serve it; pair the allowlist with
+`mode = "require"`, `provider = "tpm2"` (or `mode = "require-level"`, `level = "hardware"`) if that matters. Don't
 treat the allowlist as access control, either: anything that can open the
 TPM and read the derivation secret can issue the same `CreatePrimary`
 itself. What it buys is that the set of TPM services is explicit,

@@ -57,7 +57,7 @@
 //! returning -- the *persistent* private key never leaves the token.
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
-use crate::provider::{KekHandle, KekProvider, ProviderType, SharedSecret}; // traits/types this module implements
+use crate::provider::{Backend, KekHandle, KekProvider, ProviderType, SharedSecret}; // traits/types this module implements
 use elliptic_curve::sec1::ToEncodedPoint; // encodes our ephemeral public key into the raw bytes the token expects
 use p256::PublicKey; // the caller's ephemeral public key type
 use sha2::{Digest as ShaDigest, Sha256}; // used for the CKA_ID tag (aliased to avoid clashing with cryptoki's own naming)
@@ -101,12 +101,33 @@ struct OpenSession {
 // no module/token/PIN was usable at construction time.
 pub struct Pkcs11Provider {
     state: Arc<Mutex<Option<OpenSession>>>,
+    // Set when PKCS#11 is configured but can't be used (see
+    // `crate::provider::Backend::Refused`); every call then fails with it.
+    refused: Option<String>,
 }
 
 impl Pkcs11Provider {
     pub fn new() -> Self {
-        Pkcs11Provider {
-            state: Arc::new(Mutex::new(open_session())), // try to set everything up once, at construction time
+        // try to set everything up once, at construction time
+        let (state, refused) = match open_session() {
+            Backend::Ready(open) => (Some(open), None),
+            Backend::Absent => (None, None),
+            Backend::Refused(reason) => {
+                log::error!("hkdfguard: PKCS#11 refused: {reason}");
+                (None, Some(reason))
+            }
+        };
+        Pkcs11Provider { state: Arc::new(Mutex::new(state)), refused }
+    }
+
+    fn connected(&self) -> bool {
+        self.state.lock().map(|guard| guard.is_some()).unwrap_or(false) // a poisoned lock counts as not connected
+    }
+
+    fn check_not_refused(&self) -> Result<()> {
+        match &self.refused {
+            Some(reason) => Err(Error::Provider(format!("PKCS#11 refused: {reason}"))),
+            None => Ok(()),
         }
     }
 }
@@ -268,10 +289,13 @@ fn read_pin_file(path: &Path) -> std::result::Result<AuthPin, std::io::Error> {
 }
 
 // Loads the PIN, loads the module, initializes the library, picks a slot,
-// opens a read/write session, and logs in -- or returns `None` at the
-// first step that isn't possible (no usable PIN file, no acceptable
-// module, no token, bad PIN, ...).
-fn open_session() -> Option<OpenSession> {
+// opens a read/write session, and logs in. `Absent` when PKCS#11 isn't
+// configured on this host -- no module named (or, in debug builds, none of
+// the SoftHSM2 defaults installed), or no PIN file. Once it is configured,
+// every later failure is `Refused`: the HSM is meant to be used, so a
+// module that won't load, a missing token, or a wrong PIN is an outage to
+// surface, not a reason to wrap under a weaker provider.
+fn open_session() -> Backend<OpenSession> {
     if std::env::var_os("HKDFGUARD_PKCS11_PIN").is_some() {
         log::warn!(
             "hkdfguard: HKDFGUARD_PKCS11_PIN is no longer supported and is ignored; put the PIN in a root-owned mode-0400 (or 0440, group = the service's group) file named by pkcs11.pin_file in the policy (default {DEFAULT_PIN_FILE}) instead"
@@ -280,10 +304,7 @@ fn open_session() -> Option<OpenSession> {
 
     let settings = match crate::policy::pkcs11_settings() {
         Ok(s) => s,
-        Err(e) => {
-            log::error!("hkdfguard: PKCS#11 provider unavailable: {e}");
-            return None;
-        }
+        Err(e) => return Backend::Refused(e.to_string()),
     };
     // Read every debug-only variable up front, so a release build warns
     // about each one that is set even when it would not have been reached.
@@ -291,43 +312,69 @@ fn open_session() -> Option<OpenSession> {
     let env_pin_file = crate::debug_only_env("HKDFGUARD_PKCS11_PIN_FILE");
     let env_slot = crate::debug_only_env("HKDFGUARD_PKCS11_SLOT").map(|v| v.to_string_lossy().into_owned());
 
+    let module_named = settings.module.is_some() || env_module.is_some();
     let modules = candidate_module_paths(settings.module.clone(), env_module);
     if modules.is_empty() {
-        log::debug!("hkdfguard: no PKCS#11 module configured (pkcs11.module); PKCS#11 provider unavailable");
-        return None; // the normal state on a host without an HSM configured
+        log::debug!("hkdfguard: no PKCS#11 module configured (pkcs11.module); PKCS#11 provider not used");
+        return Backend::Absent; // the normal state on a host without an HSM configured
     }
 
     let pin_path = pin_file_path(settings.pin_file.clone(), env_pin_file);
     let pin = match read_pin_file(&pin_path) {
         Ok(pin) => pin,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            log::debug!("hkdfguard: no PKCS#11 PIN file at {}; PKCS#11 provider unavailable", pin_path.display());
-            return None; // the normal state on a host without PKCS#11 configured
+            // Its directory is root-controlled (see `read_pin_file`), so
+            // nobody else can make it absent.
+            log::debug!("hkdfguard: no PKCS#11 PIN file at {}; PKCS#11 provider not used", pin_path.display());
+            return Backend::Absent;
         }
-        Err(e) => {
-            log::warn!("hkdfguard: refusing PKCS#11 PIN file {}: {e}; PKCS#11 provider unavailable", pin_path.display());
-            return None;
-        }
+        Err(e) => return Backend::Refused(format!("PIN file {}: {e}", pin_path.display())),
     };
 
-    let pkcs11 = modules.into_iter().find_map(|path| {
-        match validate_module_path(&path) {
-            Ok(checked) => Pkcs11::new(checked).ok(), // first acceptable path that actually loads as a valid PKCS#11 module
+    let pkcs11 = if module_named {
+        let path = &modules[0];
+        let checked = match validate_module_path(path) {
+            Ok(checked) => checked,
+            Err(reason) => return Backend::Refused(reason),
+        };
+        match Pkcs11::new(&checked) {
+            Ok(pkcs11) => pkcs11,
+            Err(e) => return Backend::Refused(format!("could not load module {}: {e}", checked.display())),
+        }
+    } else {
+        // Debug builds only: the SoftHSM2 install-path search.
+        let found = modules.into_iter().find_map(|path| match validate_module_path(&path) {
+            Ok(checked) => Pkcs11::new(checked).ok(),
             Err(reason) => {
                 if path.exists() {
                     log::warn!("hkdfguard: {reason}"); // only worth a warning if something is actually there being refused
                 }
                 None
             }
+        });
+        match found {
+            Some(pkcs11) => pkcs11,
+            None => return Backend::Absent,
         }
-    })?;
-    pkcs11.initialize(CInitializeArgs::OsThreads).ok()?; // C_Initialize, telling the module we may call it from multiple OS threads
+    };
+    let refuse = |what: &str, e: &dyn std::fmt::Display| Backend::Refused(format!("{what}: {e}"));
+
+    if let Err(e) = pkcs11.initialize(CInitializeArgs::OsThreads) {
+        return refuse("C_Initialize failed", &e); // telling the module we may call it from multiple OS threads
+    }
 
     // Only initialized tokens can hold keys; SoftHSM2, for one, always
     // presents an extra blank token alongside the real ones.
+    let slots = match pkcs11.get_slots_with_token() {
+        Ok(slots) => slots,
+        Err(e) => return refuse("could not list slots", &e),
+    };
     let mut candidates: Vec<(Slot, (String, String))> = Vec::new();
-    for slot in pkcs11.get_slots_with_token().ok()? {
-        let info = pkcs11.get_token_info(slot).ok()?;
+    for slot in slots {
+        let info = match pkcs11.get_token_info(slot) {
+            Ok(info) => info,
+            Err(e) => return refuse("could not read token info", &e),
+        };
         if info.token_initialized() {
             candidates.push((slot, (info.label().to_string(), info.serial_number().to_string())));
         }
@@ -340,19 +387,20 @@ fn open_session() -> Option<OpenSession> {
         env_slot.as_deref(),
     ) {
         Ok(i) => candidates[i].0,
-        Err(reason) => {
-            log::error!("hkdfguard: PKCS#11 provider unavailable: {reason}");
-            return None;
-        }
+        Err(reason) => return Backend::Refused(reason),
     };
 
-    let session = pkcs11.open_rw_session(slot).ok()?; // read/write, since we may need to generate keys
-    session
-        .login(UserType::User, Some(&pin)) // C_Login as the normal user role, required before key generation/derivation
-        .ok()?;
+    let session = match pkcs11.open_rw_session(slot) {
+        Ok(session) => session, // read/write, since we may need to generate keys
+        Err(e) => return refuse("could not open a session", &e),
+    };
+    // C_Login as the normal user role, required before key generation/derivation
+    if let Err(e) = session.login(UserType::User, Some(&pin)) {
+        return refuse("C_Login failed", &e);
+    }
     drop(pin); // AuthPin zeroizes its storage on drop; don't keep the PIN around for the session's lifetime
 
-    Some(OpenSession { session })
+    Backend::Ready(OpenSession { session })
 }
 
 // Handle type returned from `load_kek`; holds only the service name and a
@@ -464,10 +512,7 @@ impl KekProvider for Pkcs11Provider {
     }
 
     fn probe(&self) -> bool {
-        self.state
-            .lock()
-            .map(|guard| guard.is_some()) // "available" means the session was successfully opened at construction time
-            .unwrap_or(false) // a poisoned lock is treated as "not available" rather than panicking
+        self.refused.is_some() || self.connected()
     }
 
     // Eager, side-effect-free existence check -- unlike `load_kek`, which
@@ -476,6 +521,7 @@ impl KekProvider for Pkcs11Provider {
     // chain can decide whether this provider has the requested service's
     // key *before* attempting any ECDH.
     fn kek_exists(&self, service: &str) -> Result<bool> {
+        self.check_not_refused()?;
         let mut guard = self
             .state
             .lock()
@@ -487,7 +533,8 @@ impl KekProvider for Pkcs11Provider {
     }
 
     fn load_kek(&self, service: &str, create_if_missing: bool) -> Result<Box<dyn KekHandle>> {
-        if !self.probe() {
+        self.check_not_refused()?;
+        if !self.connected() {
             return Err(Error::Provider("PKCS#11 session not available".into()));
         }
         Ok(Box::new(Pkcs11Handle {
@@ -848,11 +895,19 @@ mod tests {
         let matched = Pkcs11Provider::new().probe();
 
         crate::secure_file::write_world_readable_for_tests(&path, policy_for("no-such-token"));
-        let unmatched = Pkcs11Provider::new().probe();
+        let unmatched = Pkcs11Provider::new();
+        let unmatched_load = unmatched.load_kek("com.company.orders", false).err();
         std::env::remove_var("HKDFGUARD_POLICY_FILE");
 
         assert!(matched, "the token labelled {SOFTHSM_TEST_TOKEN_LABEL} must be selected");
-        assert!(!unmatched, "a label that matches no token must leave PKCS#11 unavailable, not pick another token");
+        // Configured but unusable: refused -- present, so the chain stops
+        // here, and failing every call -- never another token, and never
+        // a quiet fall-through to a weaker provider.
+        assert!(unmatched.probe(), "a configured PKCS#11 that can't be used is refused, not absent");
+        match unmatched_load {
+            Some(Error::Provider(msg)) => assert!(msg.contains("no-such-token"), "unexpected: {msg}"),
+            other => panic!("a label that matches no token must fail the call, got {other:?}"),
+        }
     }
 
     #[test]

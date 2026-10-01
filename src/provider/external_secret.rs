@@ -53,7 +53,7 @@
 //! Swarm `mode: 0400`; systemd `LoadCredential=` is already `0400`.
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
-use crate::provider::{KekHandle, KekProvider, ProviderType, SharedSecret}; // traits/types this module implements
+use crate::provider::{Backend, KekHandle, KekProvider, ProviderType, SharedSecret}; // traits/types this module implements
 use crate::secure_file::{open_checked, FileRequirements, Owner, SecretBuffer, FORBID_GROUP_OTHER_ACCESS}; // descriptor-based trust checks and a self-wiping read buffer
 use elliptic_curve::pkcs8::DecodePrivateKey; // lets `SecretKey` parse from PKCS#8 DER
 use p256::{PublicKey, SecretKey}; // P-256 key types
@@ -73,11 +73,29 @@ const CANDIDATE_MOUNTS: &[&str] = &[
 // construction time (in which case this provider is simply unavailable).
 pub struct ExternalSecretProvider {
     dir: Option<PathBuf>,
+    // Set when a mount is configured but can't be used (see
+    // `crate::provider::Backend::Refused`); every call then fails with it.
+    refused: Option<String>,
 }
 
 impl ExternalSecretProvider {
     pub fn new() -> Self {
-        ExternalSecretProvider { dir: resolve_dir() } // resolve once at construction
+        // resolve once at construction
+        match resolve_dir() {
+            Backend::Ready(dir) => ExternalSecretProvider { dir: Some(dir), refused: None },
+            Backend::Absent => ExternalSecretProvider { dir: None, refused: None },
+            Backend::Refused(reason) => {
+                log::error!("hkdfguard: external-secret provider refused: {reason}");
+                ExternalSecretProvider { dir: None, refused: Some(reason) }
+            }
+        }
+    }
+
+    fn check_not_refused(&self) -> Result<()> {
+        match &self.refused {
+            Some(reason) => Err(Error::Provider(format!("external secret refused: {reason}"))),
+            None => Ok(()),
+        }
     }
 }
 
@@ -134,7 +152,9 @@ impl KekProvider for ExternalSecretProvider {
     }
 
     fn probe(&self) -> bool {
-        self.dir.is_some() // "available" means we at least found a mount directory (not that any given service has a file in it)
+        // a mount directory was found (not that any given service has a file
+        // in it), or one was configured and is refused
+        self.dir.is_some() || self.refused.is_some()
     }
 
     // Reads nothing: resolves and opens the file exactly as `load_kek`
@@ -143,6 +163,7 @@ impl KekProvider for ExternalSecretProvider {
     // `false` -- reporting it as absent would let the chain move on to a
     // weaker provider and hide the misconfiguration.
     fn kek_exists(&self, service: &str) -> Result<bool> {
+        self.check_not_refused()?;
         if !is_safe_file_name(service) {
             return Ok(false); // can never name a provisioned secret file
         }
@@ -164,6 +185,7 @@ impl KekProvider for ExternalSecretProvider {
     // one, the answer when nothing is provisioned is the same
     // `KeyNotProvisioned` decline either way.
     fn load_kek(&self, service: &str, _create_if_missing: bool) -> Result<Box<dyn KekHandle>> {
+        self.check_not_refused()?;
         if !is_safe_file_name(service) {
             return Err(Error::Provider(format!(
                 "service name {service:?} cannot be used as an external secret file name"
@@ -307,28 +329,30 @@ fn parse_secret_key(bytes: &[u8]) -> Result<SecretKey> {
 // Picks the secret mount directory: `external_secret.dir` from policy;
 // else, in debug builds only, HKDFGUARD_EXTERNAL_SECRET_DIR (see
 // crate::debug_only_env); else the first conventional mount that exists.
-// An explicitly configured directory that doesn't exist makes the provider
-// unavailable rather than falling back to the search, and so does a policy
-// file that can't be trusted.
-fn resolve_dir() -> Option<PathBuf> {
+//
+// A policy that can't be trusted, or a policy-configured directory that
+// isn't there, is `Refused`: the administrator said KEKs live there, so
+// its absence is an outage (a mount not ready yet), not a reason to hand
+// the call to a weaker provider. The debug-only environment override
+// pointing nowhere is `Absent` -- that is how tests switch this provider
+// off. No conventional mount existing is `Absent`.
+fn resolve_dir() -> Backend<PathBuf> {
     let from_env = crate::debug_only_env("HKDFGUARD_EXTERNAL_SECRET_DIR").map(PathBuf::from);
-    let configured = match crate::policy::external_secret_dir() {
-        Ok(Some(dir)) => Some(dir),
-        Ok(None) => from_env,
-        Err(e) => {
-            log::error!("hkdfguard: external-secret provider unavailable: {e}");
-            return None;
-        }
-    };
-    if let Some(path) = configured {
-        return if path.is_dir() { Some(path) } else { None };
+    match crate::policy::external_secret_dir() {
+        Ok(Some(dir)) if dir.is_dir() => return Backend::Ready(dir),
+        Ok(Some(dir)) => return Backend::Refused(format!("external_secret.dir {} is not a directory", dir.display())),
+        Ok(None) => {}
+        Err(e) => return Backend::Refused(e.to_string()),
+    }
+    if let Some(dir) = from_env {
+        return if dir.is_dir() { Backend::Ready(dir) } else { Backend::Absent };
     }
 
     CANDIDATE_MOUNTS
         .iter()
-        .map(Path::new) // turn each &str into a &Path
+        .map(Path::new)
         .find(|p| p.is_dir()) // first one that actually exists on this host
-        .map(Path::to_path_buf) // convert the borrowed Path into an owned PathBuf to return
+        .map_or(Backend::Absent, |p| Backend::Ready(p.to_path_buf()))
 }
 
 #[cfg(test)]
@@ -603,19 +627,27 @@ mod tests {
         );
         std::env::set_var("HKDFGUARD_POLICY_FILE", &policy);
         std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", env_mount.path());
-        assert_eq!(resolve_dir().as_deref(), Some(policy_mount.path()), "policy must win over the environment");
+        assert_eq!(resolve_dir(), Backend::Ready(policy_mount.path().to_path_buf()), "policy must win over the environment");
 
-        // A configured directory that doesn't exist: unavailable, never the
-        // environment or the conventional mounts.
+        // A configured directory that doesn't exist: refused -- an outage of
+        // the provider the administrator chose, never a fallback to the
+        // environment, the conventional mounts, or the next provider.
         crate::secure_file::write_world_readable_for_tests(
             &policy,
             "[selection]\nmode = \"prefer\"\n[external_secret]\ndir = \"/nonexistent-hkdfguard-mount\"\n",
         );
-        assert_eq!(resolve_dir(), None);
+        assert!(matches!(resolve_dir(), Backend::Refused(_)));
 
-        // A broken policy: unavailable, not a fallback to the search.
+        // A broken policy: refused, not a fallback to the search.
         crate::secure_file::write_world_readable_for_tests(&policy, "[selection]\nmode = \"require\"\n");
-        assert_eq!(resolve_dir(), None);
+        assert!(matches!(resolve_dir(), Backend::Refused(_)));
+
+        // Only the debug-only override pointing nowhere means "not here".
+        std::env::remove_var("HKDFGUARD_POLICY_FILE");
+        std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-hkdfguard-mount");
+        if !CANDIDATE_MOUNTS.iter().any(|m| Path::new(m).is_dir()) {
+            assert_eq!(resolve_dir(), Backend::Absent);
+        }
 
         std::env::remove_var("HKDFGUARD_POLICY_FILE");
         std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");

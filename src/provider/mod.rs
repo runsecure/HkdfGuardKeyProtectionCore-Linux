@@ -88,6 +88,28 @@ impl ProviderType {
     }
 }
 
+/// What a provider found when it was constructed. The distinction between
+/// the last two is what keeps the chain fail-closed: only an `Absent`
+/// provider lets the chain move on to the next (usually weaker) one.
+#[cfg_attr(not(any(feature = "tpm2", feature = "pkcs11", feature = "external-secret")), allow(dead_code))]
+#[derive(Debug, PartialEq)]
+pub(crate) enum Backend<T> {
+    /// Connected and usable.
+    Ready(T),
+    /// Not on this host, or not configured for use here (no TPM device we
+    /// can open, no derivation secret, no PKCS#11 module or PIN file, no
+    /// secret mount). The provider takes no part in the chain.
+    Absent,
+    /// There and configured, but unusable or untrustworthy: a secret with
+    /// the wrong owner or mode, a TPM that fails its self-test, a module
+    /// that won't load, a token that can't be selected. Every call that
+    /// reaches this provider fails with this reason, rather than quietly
+    /// falling through to a weaker provider -- a misconfiguration or outage
+    /// of the strong provider must not silently turn into new DEKs wrapped
+    /// under a weak (or, with Ephemeral, a lost-on-restart) KEK.
+    Refused(String),
+}
+
 /// A handle to a loaded persistent service KEK. The private key material
 /// never leaves the provider that produced this handle -- only
 /// [`KekHandle::ecdh`]'s *output* (a shared secret) crosses back into
@@ -115,10 +137,11 @@ pub trait KekHandle {
 pub trait KekProvider: Send + Sync {
     fn provider_type(&self) -> ProviderType; // which of the 5 tags this provider implements
 
-    /// Cheap, side-effect-free check: is this provider's backing store
-    /// reachable on this host right now (TPM device present, PKCS#11 module
-    /// loadable and a token present, secret mount present, filesystem
-    /// writable, ...)? Must not create or persist anything.
+    /// Cheap, side-effect-free check: is this provider present on this
+    /// host -- ready, or there but refused ([`Backend::Refused`])? Only a
+    /// `false` here lets the chain skip the provider; a refused provider
+    /// reports `true` and fails `kek_exists`/`load_kek` with its reason.
+    /// Must not create or persist anything.
     fn probe(&self) -> bool;
 
     /// Whether a persistent KEK already exists for `service`, without
@@ -226,51 +249,38 @@ static EPHEMERAL_WARNED: OnceLock<()> = OnceLock::new(); // `set()` succeeds exa
 /// (see [`construct_provider`]), probes it, and calls
 /// `provider.load_kek(service, create_if_missing)`; the first to succeed
 /// wins and the walk stops -- providers later in the order are never even
-/// constructed. A provider declining via [`Error::KeyNotProvisioned`] is a
-/// soft "try the next provider" signal; any other error falls through too,
-/// and the last one is returned if nothing succeeds. `not_found_err` is
-/// what's returned if the entire chain is exhausted without a hard error
-/// along the way.
+/// constructed.
 ///
-/// Logging rule: every provider failure is logged exactly once, by whoever
-/// ends up holding it. A failure this function returns is logged by its
-/// caller (the C ABI layer), so it is *not* logged here; one that is
-/// superseded by a later failure, or that the chain falls back past, is
-/// logged here, since nothing downstream will ever see it. A returned
-/// `Error::Provider` is prefixed with the provider's name so the caller's
-/// one log line still says which provider failed.
+/// The walk moves on past a provider in exactly two cases: it isn't
+/// present at all (`probe()` is false -- see [`Backend::Absent`]), or it is
+/// present but has no key for this service ([`Error::KeyNotProvisioned`]).
+/// Any other error from a present provider ends the walk and is returned:
+/// a TPM, token, or secret mount that is there but failing must not quietly
+/// hand the call to a weaker provider, because every DEK wrapped meanwhile
+/// would land under that weaker KEK -- or, with Ephemeral, under one that
+/// is gone at the next restart. `not_found_err` is returned if the walk
+/// runs out of providers.
+///
+/// The returned error is logged by the caller (the C ABI layer), not here;
+/// an `Error::Provider` is prefixed with the provider's name so that one
+/// line still says which provider failed.
 fn walk_chain(
     service: &str,
     create_if_missing: bool,
     not_found_err: Error,
 ) -> Result<(Arc<dyn KekProvider>, Box<dyn KekHandle>)> {
-    // The most recent hard failure, not yet logged.
-    let mut pending: Option<(ProviderType, Error)> = None;
-
     for provider_type in allowed_types()? {
         // priority order, per the configured policy (or the default compiled-in order)
         let Some(provider) = construct_provider(provider_type) else {
             continue; // not compiled into this build (policy can name a type the build lacks)
         };
         if !provider.probe() {
-            // provider's backing store isn't reachable at all right now
-            log::debug!(
-                "hkdfguard: provider {} unavailable, trying next",
-                provider_type.as_str()
-            );
-            continue; // move on to the next provider in priority order
+            log::debug!("hkdfguard: provider {} not present, trying next", provider_type.as_str());
+            continue;
         }
 
         match provider.load_kek(service, create_if_missing) {
             Ok(handle) => {
-                // this provider successfully produced a usable KEK handle
-                if let Some((failed, e)) = pending.take() {
-                    log::warn!(
-                        "hkdfguard: provider {} failed ({e}); fell back to {}",
-                        failed.as_str(),
-                        provider_type.as_str()
-                    );
-                }
                 log::debug!("hkdfguard: using provider {} for this call", provider_type.as_str());
                 if matches!(provider_type, ProviderType::Ephemeral) && EPHEMERAL_WARNED.set(()).is_ok() {
                     // `.set()` only returns Ok the first time; subsequent calls see it already set
@@ -283,40 +293,25 @@ fn walk_chain(
                 return Ok((provider, handle)); // stop the chain walk; this is the provider+handle to use
             }
             Err(Error::KeyNotProvisioned(msg)) => {
-                // soft decline: quietly try the next provider, without
-                // replacing a pending hard failure -- an expected, common
-                // case (no key created here yet), not itself informative
-                // enough to surface over `not_found_err`.
                 log::debug!(
                     "hkdfguard: provider {} has no key for this service ({msg}), trying next",
                     provider_type.as_str()
                 );
             }
-            Err(e) => {
-                // A real failure (TPM/PKCS11/filesystem error). Hold it
-                // rather than logging now: if nothing later replaces it,
-                // the caller logs it. The one it replaces will never be
-                // seen downstream, so that one is logged here.
-                if let Some((superseded, prev)) = pending.replace((provider_type, e)) {
-                    log::warn!(
-                        "hkdfguard: provider {} failed ({prev}), trying next",
-                        superseded.as_str()
-                    );
-                }
-            }
+            Err(e) => return Err(attribute(provider_type, e)),
         }
         // `provider` drops here: session logged out / module finalized /
         // TCTI closed before the next candidate is even constructed.
     }
+    Err(not_found_err)
+}
 
-    // every provider was tried and none produced a key
-    Err(match pending {
-        Some((provider_type, Error::Provider(msg))) => {
-            Error::Provider(format!("{}: {msg}", provider_type.as_str()))
-        }
-        Some((_, e)) => e,
-        None => not_found_err,
-    })
+// Names the provider in a `Provider` error's message, for the caller's log line.
+fn attribute(provider_type: ProviderType, e: Error) -> Error {
+    match e {
+        Error::Provider(msg) => Error::Provider(format!("{}: {msg}", provider_type.as_str())),
+        other => other,
+    }
 }
 
 /// Walks the policy-allowed priority chain (TPM2 -> PKCS#11 -> External
@@ -326,11 +321,9 @@ fn walk_chain(
 /// the *only* path that ever creates a KEK -- `wrap`/`unwrap` (via
 /// [`select_existing`]) only ever load one. Backs `hkdfguard_create_kek`.
 ///
-/// If a policy is configured and every provider it names is unreachable,
-/// this fails (with whichever error the last attempt produced, or
-/// [`Error::NoProviderAvailable`] if every provider simply declined/wasn't
-/// reachable) -- unlike the old unrestricted chain, there's no guaranteed
-/// Ephemeral fallback once a policy excludes it.
+/// Fails with the error of the first provider that is present but failing
+/// (see [`walk_chain`]), or [`Error::NoProviderAvailable`] if every allowed
+/// provider is absent or declined.
 pub fn create_kek(service: &str) -> Result<(Arc<dyn KekProvider>, Box<dyn KekHandle>)> {
     walk_chain(service, true, Error::NoProviderAvailable)
 }
@@ -346,7 +339,8 @@ pub fn select_existing(service: &str) -> Result<(Arc<dyn KekProvider>, Box<dyn K
 
 /// Walks the policy-allowed chain checking whether a persistent KEK already
 /// exists for `service`, without creating one anywhere. `Ok(false)` (not an
-/// error) means the chain was fully walked and nothing has one yet -- call
+/// error) means the chain was fully walked, every present provider answered,
+/// and none has one yet -- call
 /// [`create_kek`] to provision one. Backs `hkdfguard_kek_exists`. Like
 /// [`walk_chain`], constructs providers one at a time and stops at the
 /// first that has the key.
@@ -358,16 +352,11 @@ pub fn kek_exists(service: &str) -> Result<bool> {
         if !provider.probe() {
             continue;
         }
-        match provider.kek_exists(service) {
-            Ok(true) => return Ok(true),
-            Ok(false) => continue,
-            Err(e) => {
-                log::warn!(
-                    "hkdfguard: provider {} kek_exists check failed ({e}), trying next",
-                    provider_type.as_str()
-                );
-                continue;
-            }
+        // An error is returned, not read as "no key": the caller would
+        // otherwise go on to `create_kek`, and a strong provider that is
+        // failing must not be the reason a key gets created somewhere weaker.
+        if provider.kek_exists(service).map_err(|e| attribute(provider_type, e))? {
+            return Ok(true);
         }
     }
     Ok(false)
@@ -863,26 +852,63 @@ mod tests {
 
     #[test]
     #[serial]
-    fn a_provider_failure_the_chain_falls_back_past_is_logged_once() {
+    fn a_failing_provider_stops_the_chain_instead_of_falling_back_to_a_weaker_one() {
         #[cfg(all(feature = "external-secret", feature = "ephemeral"))]
         {
-            let service = "com.company.logoncefallback";
+            // The platform's secret drifted to a group-readable mode. Policy
+            // would let Ephemeral serve the service -- but only for a service
+            // external-secret doesn't have, not one it has and can't trust:
+            // otherwise every DEK from here on is wrapped under a key that is
+            // gone at the next restart, and no call ever reports a problem.
+            let service = "com.company.nofallback";
             let _mount = mount_with_untrusted_secret(service);
             let _policy = crate::policy::allow_ephemeral_policy_for_tests(); // external-secret, then ephemeral
+            let c = std::ffi::CString::new(service).unwrap();
 
             let lines = logged_lines_containing("permissions too broad", || {
-                let c = std::ffi::CString::new(service).unwrap();
-                assert_eq!(crate::hkdfguard_create_kek(c.as_ptr()), crate::status::OK, "ephemeral should serve it");
+                assert_eq!(crate::hkdfguard_create_kek(c.as_ptr()), crate::status::PROVIDER_ERROR);
             });
+            assert_eq!(lines.len(), 1, "the failure must be logged exactly once, got: {lines:#?}");
+            assert!(lines[0].contains("EXTERNAL_SECRET"), "the line must name the provider: {}", lines[0]);
+
+            // kek_exists must surface it too, rather than answer "no", which
+            // would invite the caller to create a key somewhere weaker.
+            let mut exists: std::os::raw::c_int = -1;
+            assert_eq!(crate::hkdfguard_kek_exists(c.as_ptr(), &mut exists), crate::status::PROVIDER_ERROR);
+            assert_eq!(exists, -1, "untouched on error");
+            assert!(kek_exists(service).is_err());
+
+            // And nothing was quietly created on Ephemeral.
+            assert!(matches!(
+                crate::provider::ephemeral::EphemeralProvider::new().kek_exists(service),
+                Ok(false)
+            ));
 
             std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
             std::env::remove_var("HKDFGUARD_POLICY_FILE");
-            assert_eq!(lines.len(), 1, "the skipped failure must be logged exactly once, got: {lines:#?}");
-            assert!(
-                lines[0].contains("EXTERNAL_SECRET") && lines[0].contains("fell back to EPHEMERAL"),
-                "the line must say which provider failed and what was used instead: {}",
-                lines[0]
-            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn an_absent_provider_or_a_missing_key_still_moves_the_chain_on() {
+        #[cfg(all(feature = "external-secret", feature = "ephemeral"))]
+        {
+            let _policy = crate::policy::allow_ephemeral_policy_for_tests();
+
+            // No mount at all: absent.
+            std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-dir-for-tests");
+            let (provider, _) = create_kek("com.company.absentmount").unwrap();
+            assert_eq!(provider.provider_type(), ProviderType::Ephemeral);
+
+            // A trusted mount with nothing for this service: declined.
+            let mount = crate::secure_file::private_tempdir();
+            std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", mount.path());
+            let (provider, _) = create_kek("com.company.notinmount").unwrap();
+            assert_eq!(provider.provider_type(), ProviderType::Ephemeral);
+
+            std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
+            std::env::remove_var("HKDFGUARD_POLICY_FILE");
         }
     }
 

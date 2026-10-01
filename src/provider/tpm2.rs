@@ -45,7 +45,7 @@
 //! means deterministically reproducible, not resident in NV storage.
 
 use crate::error::{Error, Result}; // this crate's error type + `Result` alias
-use crate::provider::{KekHandle, KekProvider, ProviderType, SharedSecret}; // traits/types this module implements
+use crate::provider::{Backend, KekHandle, KekProvider, ProviderType, SharedSecret}; // traits/types this module implements
 use elliptic_curve::sec1::ToEncodedPoint; // lets us split the caller's ephemeral public key into X/Y coordinates
 use p256::PublicKey; // the caller's ephemeral public key type
 use sha2::{Digest as ShaDigest, Sha256}; // hashing used to build the per-service `unique` label (aliased to avoid clashing with tss-esapi's own `Digest`)
@@ -124,6 +124,10 @@ fn derivation_secret_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_DERIVATION_SECRET_FILE))
 }
 
+fn derivation_secret_is_missing() -> bool {
+    matches!(std::fs::symlink_metadata(derivation_secret_path()), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// The TCTI used when neither policy nor (in debug builds) the environment
 /// names one: the kernel's TPM resource manager.
 const DEFAULT_TCTI: &str = "device:/dev/tpmrm0";
@@ -137,6 +141,14 @@ const DEFAULT_TCTI: &str = "device:/dev/tpmrm0";
 /// A policy TCTI that can't be parsed, or a policy file that can't be
 /// trusted, is an error -- the TPM is then unavailable rather than opened
 /// at a default the administrator may have meant to avoid.
+/// Whether the TCTI came from policy or (debug builds) the environment,
+/// rather than being [`DEFAULT_TCTI`] -- i.e. whether someone pointed this
+/// process at a particular TPM on purpose.
+fn tcti_is_explicit() -> bool {
+    matches!(crate::policy::tpm_tcti(), Ok(Some(_)))
+        || ["TPM2TOOLS_TCTI", "TCTI", "TEST_TCTI"].into_iter().any(|name| crate::debug_only_env(name).is_some())
+}
+
 fn resolve_tcti() -> Result<TctiNameConf> {
     // Read every variable even when policy decides, so a release build
     // warns about each one that is set rather than ignoring it silently.
@@ -261,12 +273,33 @@ pub struct Tpm2Provider {
     // round trip can happen lazily in `KekHandle::ecdh`, once the caller's
     // ephemeral public key is available.
     context: Arc<Mutex<Option<Context>>>,
+    // Set when a TPM is there but can't be trusted or used (see
+    // `crate::provider::Backend::Refused`); every call then fails with it.
+    refused: Option<String>,
 }
 
 impl Tpm2Provider {
     pub fn new() -> Self {
-        Tpm2Provider {
-            context: Arc::new(Mutex::new(open_context())), // try to connect once, at construction time
+        // try to connect once, at construction time
+        let (context, refused) = match open_context() {
+            Backend::Ready(ctx) => (Some(ctx), None),
+            Backend::Absent => (None, None),
+            Backend::Refused(reason) => {
+                log::error!("hkdfguard: TPM refused: {reason}");
+                (None, Some(reason))
+            }
+        };
+        Tpm2Provider { context: Arc::new(Mutex::new(context)), refused }
+    }
+
+    fn connected(&self) -> bool {
+        self.context.lock().map(|guard| guard.is_some()).unwrap_or(false) // a poisoned lock counts as not connected
+    }
+
+    fn check_not_refused(&self) -> Result<()> {
+        match &self.refused {
+            Some(reason) => Err(Error::Provider(format!("TPM refused: {reason}"))),
+            None => Ok(()),
         }
     }
 }
@@ -285,35 +318,49 @@ impl Default for Tpm2Provider {
 // couldn't be established at all, so `probe()`/`kek_exists()` correctly
 // report this provider as unavailable rather than silently producing KEKs
 // this crate's persistence model can't actually rely on.
-fn open_context() -> Option<Context> {
+fn open_context() -> Backend<Context> {
     // Checked before the TCTI is even opened: tpm2-tss starts logging from
     // the first command.
     if let Some(level) = std::env::var_os("TSS2_LOG") {
         if tss2_log_exposes_secrets(&level.to_string_lossy()) {
-            log::error!(
-                "hkdfguard: TPM unavailable: TSS2_LOG enables debug/trace logging in tpm2-tss, which \
-                 writes raw TPM commands and responses (including ECDH shared secrets), session keys \
-                 and plaintext parameters to its log; unset TSS2_LOG or lower it to info or below"
+            return Backend::Refused(
+                "TSS2_LOG enables debug/trace logging in tpm2-tss, which writes raw TPM commands and \
+                 responses (including ECDH shared secrets), session keys and plaintext parameters to \
+                 its log; unset TSS2_LOG or lower it to info or below"
+                    .to_string(),
             );
-            return None;
         }
     }
 
     let tcti = match resolve_tcti() {
         Ok(tcti) => tcti,
+        Err(e) => return Backend::Refused(e.to_string()),
+    };
+    let mut ctx = match Context::new(tcti) {
+        Ok(ctx) => ctx,
+        // The default device failing to open is the normal state of a host
+        // with no TPM, or one this service isn't meant to use (not in the
+        // `tss` group). A TCTI someone configured on purpose is different:
+        // its TPM is meant to be used, so failing to reach it is an outage.
+        Err(e) if tcti_is_explicit() => return Backend::Refused(format!("could not open the configured TCTI: {e}")),
         Err(e) => {
-            log::error!("hkdfguard: TPM unavailable: {e}");
-            return None;
+            log::debug!("hkdfguard: no usable TPM at {DEFAULT_TCTI} ({e})");
+            return Backend::Absent;
         }
     };
-    let mut ctx = Context::new(tcti).ok()?; // actually establish the ESAPI connection; `None` on any failure
 
     // Resolve the derivation secret before the self-test, purely so a
     // missing-but-required (or present-but-untrustworthy) secret reports
     // *that* rather than surfacing as an opaque "self-test could not run".
+    // A missing one means the TPM isn't set up for use on this host; its
+    // directory is root-controlled (see `read_derivation_secret`), so its
+    // absence can't be forced by anyone else.
     if let Err(e) = read_derivation_secret() {
-        log::warn!("hkdfguard: TPM unavailable: {e}");
-        return None;
+        if derivation_secret_is_missing() {
+            log::warn!("hkdfguard: TPM not used: {e}");
+            return Backend::Absent;
+        }
+        return Backend::Refused(e.to_string());
     }
 
     // The conformance verdict is a fact about the TPM's *behavior*, not a
@@ -322,21 +369,17 @@ fn open_context() -> Option<Context> {
     // call, and re-running three CreatePrimary round trips on each one
     // would triple the per-call TPM cost for no security benefit. Only a
     // definitive verdict is cached; a self-test that couldn't run at all
-    // (TPM busy, command error) makes the TPM unavailable for *this* call
-    // only and is retried next time.
+    // (TPM busy, command error) refuses the TPM for *this* call only and
+    // is retried next time.
     let compatible = match TPM_CONFORMANCE_VERDICT.get() {
         Some(verdict) => *verdict,
         None => match validate_tpm_compatibility(&mut ctx) {
             Ok(verdict) => *TPM_CONFORMANCE_VERDICT.get_or_init(|| verdict), // first definitive verdict wins; a concurrent one agrees
-            Err(e) => {
-                log::warn!("hkdfguard: TPM conformance self-test could not run ({e}); TPM unavailable for this call");
-                return None;
-            }
+            Err(e) => return Backend::Refused(format!("conformance self-test could not run ({e})")),
         },
     };
     if !compatible {
-        log::warn!("hkdfguard: TPM failed conformance self-test, treating as unavailable");
-        return None;
+        return Backend::Refused("failed its conformance self-test".to_string());
     }
 
     // Deliberately cached separately from the verdict above rather than
@@ -345,24 +388,22 @@ fn open_context() -> Option<Context> {
     // one provisioned underneath it must still run it the first time the
     // secret is actually used, instead of inheriting a verdict that never
     // examined it.
+    let secret_refused = || Backend::Refused("derives the same key with or without the derivation secret".to_string());
     match TPM_DERIVATION_SECRET_VERDICT.get() {
         Some(true) => {}
-        Some(false) => return None, // already reported when the verdict was established
+        Some(false) => return secret_refused(),
         None => match validate_derivation_secret_is_honored(&mut ctx) {
             Ok(None) => {} // no secret configured, so nothing to verify and nothing cached
             Ok(Some(verdict)) => {
                 if !*TPM_DERIVATION_SECRET_VERDICT.get_or_init(|| verdict) {
-                    return None;
+                    return secret_refused();
                 }
             }
-            Err(e) => {
-                log::warn!("hkdfguard: could not verify that the TPM honors the derivation secret ({e}); TPM unavailable for this call");
-                return None;
-            }
+            Err(e) => return Backend::Refused(format!("could not verify that it honors the derivation secret ({e})")),
         },
     }
 
-    Some(ctx)
+    Backend::Ready(ctx)
 }
 
 /// Whether a `TSS2_LOG` value turns on tpm2-tss logging at `debug` or
@@ -1009,10 +1050,7 @@ impl KekProvider for Tpm2Provider {
     }
 
     fn probe(&self) -> bool {
-        self.context
-            .lock()
-            .map(|guard| guard.is_some()) // "available" means we successfully connected at construction time
-            .unwrap_or(false) // a poisoned lock is treated as "not available" rather than panicking
+        self.refused.is_some() || self.connected()
     }
 
     // TPM2_CreatePrimary is deterministic (see the module-level design
@@ -1023,14 +1061,16 @@ impl KekProvider for Tpm2Provider {
     // (see `service_is_provisioned`); without it, every service exists the
     // moment the TPM is reachable.
     fn kek_exists(&self, service: &str) -> Result<bool> {
-        if !self.probe() {
+        self.check_not_refused()?;
+        if !self.connected() {
             return Ok(false);
         }
         service_is_provisioned(service)
     }
 
     fn load_kek(&self, service: &str, create_if_missing: bool) -> Result<Box<dyn KekHandle>> {
-        if !self.probe() {
+        self.check_not_refused()?;
+        if !self.connected() {
             return Err(Error::Provider("TPM context not available".into()));
         }
         if !service_is_provisioned(service)? {
@@ -1722,6 +1762,35 @@ mod tests {
         let key1 = create_primary_and_get_public("a").unwrap();
         let key2 = create_primary_and_get_public("a").unwrap();
         assert_eq!(key1, key2);
+    }
+
+    #[test]
+    #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
+    #[serial]
+    fn an_untrusted_derivation_secret_refuses_the_tpm_rather_than_skipping_it() {
+        // Present (so the chain stops here) but failing every call: a TPM
+        // whose secret can't be trusted must not quietly hand the service to
+        // a weaker provider further down the chain.
+        let (present, err) = with_secret_file(b"secret", 0o604, |_| {
+            let provider = Tpm2Provider::new();
+            (provider.probe(), provider.load_kek("com.company.orders", false).err())
+        });
+        assert!(present, "a refused TPM is still present");
+        match err {
+            Some(Error::Provider(msg)) => assert!(msg.contains("refused"), "unexpected: {msg}"),
+            other => panic!("expected a Provider error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
+    #[serial]
+    fn a_missing_derivation_secret_leaves_the_tpm_absent() {
+        // Not set up for use on this host: the chain may move on.
+        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
+        let present = with_no_secret_file(|| Tpm2Provider::new().probe());
+        std::env::remove_var("HKDFGUARD_POLICY_FILE");
+        assert!(!present);
     }
 
     #[test]
