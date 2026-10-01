@@ -557,7 +557,12 @@ reaches any argv.
 `wrap --force` completes the wrap in memory *before* it securely
 overwrites and replaces the existing key file, so a wrap that fails — no
 KEK, provider unavailable, bad input — never destroys the key file that
-was already there.
+was already there. It only ever overwrites a regular file at that exact
+path: a symlink there is refused rather than followed (following it would
+overwrite whatever it points to), as are a directory, FIFO, or device, and
+any file far larger than a wrapped key. The overwrite is best-effort: on
+copy-on-write or log-structured filesystems (btrfs, ZFS) and on flash
+storage, old blocks can survive it.
 
 A `--dek-file` must be a regular file, not a symlink, owned by root or by
 the invoking user, with no group or other access (e.g. `0400`/`0600`) — the

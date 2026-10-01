@@ -315,7 +315,7 @@ fn read_bounded(src: &mut dyn Read, what: &str) -> Result<Zeroizing<Vec<u8>>, St
 fn read_dek_file(path: &str) -> Result<Zeroizing<Vec<u8>>, String> {
     let mut file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY) // a FIFO must fail the regular-file check below, not block the open
         .open(path)
         .map_err(|e| {
             if e.raw_os_error() == Some(libc::ELOOP) {
@@ -492,10 +492,30 @@ fn prepare_service(service_name: &mut str) -> Result<CString, String> {
     CString::new(&*service_name).map_err(|_| "the service name must not contain a NUL byte".to_string())
 }
 
+// Whether anything at all occupies `path` -- including a dangling symlink,
+// which `Path::exists` (it follows links) reports as absent, and which the
+// `create_new` below would then fail on with a misleading "already exists".
+fn path_is_taken(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+// Largest existing file `--force` will overwrite. A wrapped key is a few
+// hundred bytes; something far bigger at the key path isn't one, and
+// overwriting it would also mean allocating and writing that much eight
+// times over.
+const MAX_REPLACEABLE_KEY_FILE_LEN: u64 = 64 * 1024;
+
 // Overwrites `path`'s existing content in place for `SECURE_DELETE_ROUNDS`
 // rounds -- each round first an all-zero-bit pass, then a pass of fresh
 // random bits, fsync'd after every pass -- before unlinking it. Called only
 // when `--force` is about to replace a file that already exists.
+//
+// Only ever a regular file, and only the one at `path` itself: a symlink
+// there is refused rather than followed (following it would overwrite
+// whatever it points at -- any file this user can write), as are a FIFO
+// (which would block the open forever), a directory, and a device. The
+// descriptor is opened `O_NOFOLLOW|O_NONBLOCK` and re-checked against what
+// was examined, so nothing swapped in between gets overwritten either.
 //
 // If the file can't be opened for writing (EACCES/EPERM -- this tool
 // doesn't own it), the overwrite passes are skipped entirely and this falls
@@ -504,19 +524,39 @@ fn prepare_service(service_name: &mut str) -> Result<CString, String> {
 // command over when this process isn't even allowed to write to the file
 // it's about to replace -- matches this project's macOS/Windows tools.
 fn secure_delete(path: &Path) -> Result<(), String> {
-    let len = fs::metadata(path)
-        .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
-        .len() as usize;
+    let refuse = |why: &str| format!("{} {why}; refusing to overwrite it", path.display());
+    let check = |meta: &fs::Metadata| -> Result<usize, String> {
+        if !meta.file_type().is_file() {
+            return Err(refuse("is not a regular file (a symlink, directory, FIFO, or device)"));
+        }
+        if meta.len() > MAX_REPLACEABLE_KEY_FILE_LEN {
+            return Err(refuse(&format!("is {} bytes, far larger than any wrapped key", meta.len())));
+        }
+        Ok(meta.len() as usize)
+    };
 
-    let mut file = match OpenOptions::new().write(true).open(path) {
+    let examined = fs::symlink_metadata(path).map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+    check(&examined)?;
+
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+    {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             return fs::remove_file(path).map_err(|e| {
                 format!("failed to remove {} after permission-denied secure delete: {e}", path.display())
             });
         }
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(refuse("changed to a symlink")),
         Err(e) => return Err(format!("failed to open {} for secure delete: {e}", path.display())),
     };
+    let opened = file.metadata().map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+    if (opened.dev(), opened.ino()) != (examined.dev(), examined.ino()) {
+        return Err(refuse("was replaced while it was being examined"));
+    }
+    let len = check(&opened)?;
 
     let mut buf = vec![0u8; len];
     for _ in 0..SECURE_DELETE_ROUNDS {
@@ -581,7 +621,7 @@ fn run_wrap(key_file_path: String, mut service_name: String, dek_source: DekSour
     // wasn't passed. The final `create_new` open below is the actual
     // correctness guarantee against the exists-then-create race; this is
     // purely a fail-fast convenience on top of it.
-    if path.exists() && !force {
+    if path_is_taken(path) && !force {
         return Err(format!("{key_file_path} already exists; pass --force|-f to overwrite"));
     }
 
@@ -606,7 +646,7 @@ fn run_wrap(key_file_path: String, mut service_name: String, dek_source: DekSour
     // Only now, with a complete wrapped payload in hand, replace the old
     // file. Re-evaluated here rather than trusting the pre-check above, in
     // case the file appeared in the meantime.
-    if path.exists() {
+    if path_is_taken(path) {
         if !force {
             return Err(format!("{key_file_path} already exists; pass --force|-f to overwrite"));
         }
@@ -834,6 +874,55 @@ mod tests {
         let file = NamedTempFile::new().unwrap(); // created empty
         secure_delete(file.path()).unwrap();
         assert!(!file.path().exists());
+    }
+
+    #[test]
+    fn secure_delete_refuses_a_symlink_and_leaves_its_target_alone() {
+        let dir = private_tempdir();
+        let victim = dir.path().join("some-other-file");
+        fs::write(&victim, b"not a wrapped key").unwrap();
+        let link = dir.path().join("wrapped.key");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        let err = secure_delete(&link).unwrap_err();
+        assert!(err.contains("not a regular file"), "unexpected: {err}");
+        assert_eq!(fs::read(&victim).unwrap(), b"not a wrapped key", "the link's target must be untouched");
+        assert!(path_is_taken(&link), "and the link itself is left for the operator to look at");
+    }
+
+    #[test]
+    fn secure_delete_refuses_a_fifo_without_blocking() {
+        let dir = private_tempdir();
+        let fifo = dir.path().join("wrapped.key");
+        let c = CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: c is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || tx.send(secure_delete(&path)).unwrap());
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("secure_delete blocked on a FIFO");
+        assert!(result.unwrap_err().contains("not a regular file"));
+    }
+
+    #[test]
+    fn secure_delete_refuses_a_file_far_larger_than_a_wrapped_key() {
+        let dir = private_tempdir();
+        let big = dir.path().join("wrapped.key");
+        let f = File::create(&big).unwrap();
+        f.set_len(MAX_REPLACEABLE_KEY_FILE_LEN + 1).unwrap(); // sparse: no real disk use
+        let err = secure_delete(&big).unwrap_err();
+        assert!(err.contains("far larger"), "unexpected: {err}");
+        assert!(big.exists());
+    }
+
+    #[test]
+    fn a_dangling_symlink_counts_as_taken() {
+        let dir = private_tempdir();
+        let link = dir.path().join("wrapped.key");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &link).unwrap();
+        assert!(!link.exists(), "Path::exists follows the link");
+        assert!(path_is_taken(&link));
     }
 
     #[test]

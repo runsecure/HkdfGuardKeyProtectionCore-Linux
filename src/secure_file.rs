@@ -80,11 +80,18 @@ pub struct FileRequirements {
 /// is reported as `PermissionDenied` or `InvalidData`, so callers can tell
 /// "absent" apart from "present but untrustworthy".
 pub fn open_checked(path: &Path, req: &FileRequirements) -> io::Result<File> {
-    let mut opts = OpenOptions::new();
-    opts.read(true);
+    // O_NONBLOCK: opening a FIFO with no writer would otherwise block in
+    // open(2) itself -- before the descriptor could be checked -- hanging
+    // the caller (and, for a setup call, everything queued behind it). With
+    // it, the open returns at once and the regular-file check below refuses
+    // it. It has no effect on reading a regular file. O_NOCTTY: a terminal
+    // device must not become this process's controlling terminal.
+    let mut flags = libc::O_NONBLOCK | libc::O_NOCTTY;
     if !req.follow_symlinks {
-        opts.custom_flags(libc::O_NOFOLLOW);
+        flags |= libc::O_NOFOLLOW;
     }
+    let mut opts = OpenOptions::new();
+    opts.read(true).custom_flags(flags);
     let file = opts.open(path)?;
     let meta = file.metadata()?;
     let mut forbidden = req.forbidden_mode_bits;
@@ -178,8 +185,8 @@ pub fn check_location(path: &Path, owner: Owner) -> io::Result<()> {
 }
 
 /// Validates already-obtained metadata: must be a regular file (never a
-/// directory, FIFO, device, or socket -- a FIFO would otherwise block a
-/// read forever), owned per `owner`, with none of `forbidden_mode_bits` set.
+/// directory, FIFO, device, or socket), owned per `owner`, with none of
+/// `forbidden_mode_bits` set.
 pub fn check_metadata(meta: &Metadata, owner: Option<Owner>, forbidden_mode_bits: u32) -> io::Result<()> {
     if !meta.file_type().is_file() {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "not a regular file"));
@@ -471,6 +478,20 @@ mod tests {
         let dir = crate::secure_file::private_tempdir();
         let req = FileRequirements { owner: None, forbidden_mode_bits: 0, ..OWNER_ONLY };
         assert_eq!(open_checked(dir.path(), &req).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_fifo_is_refused_without_blocking_the_open() {
+        let dir = private_tempdir();
+        let fifo = dir.path().join("policy.toml");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: c is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(open_checked(&fifo, &OWNER_ONLY).map(|_| ())).unwrap());
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("open_checked blocked on a FIFO");
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
