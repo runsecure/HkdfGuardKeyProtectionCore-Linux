@@ -556,7 +556,10 @@ fn run_provision(mut service_name: String) -> Result<(), String> {
 
     let rc = hkdfguard_create_kek(service_c.as_ptr());
     if rc != status::OK {
-        return Err(format!("hkdfguard_create_kek failed: {}", describe_status(rc)));
+        return Err(format!(
+            "hkdfguard_create_kek failed: {} (see the messages above for the provider's reason)",
+            describe_status(rc)
+        ));
     }
     println!("KEK provisioned for service \"{service_name}\"");
     Ok(())
@@ -650,7 +653,31 @@ fn run(command: Command) -> Result<(), String> {
     }
 }
 
+// Prints the library's warnings and errors to stderr. The library reports
+// through the `log` facade and is silent without a logger installed, which
+// would hide exactly the messages an operator running this tool needs --
+// e.g. the TPM Name to pin when `provision` is refused under
+// `tpm.require_pinned_names`, or why a PIN file or secret was rejected.
+struct StderrLogger;
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Warn
+    }
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("{}: {}", record.level().as_str().to_ascii_lowercase(), record.args());
+        }
+    }
+    fn flush(&self) {}
+}
+
+static LOGGER: StderrLogger = StderrLogger;
+
 fn main() -> ExitCode {
+    if log::set_logger(&LOGGER).is_ok() {
+        log::set_max_level(log::LevelFilter::Warn);
+    }
     match parse_args(std::env::args()) {
         Ok(ParseOutcome::Help) => {
             print_usage();
@@ -882,8 +909,8 @@ mod tests {
     // exactly right for an in-process test of the provision flow.
     fn with_ephemeral_policy<F: FnOnce()>(f: F) {
         let dir = tempfile::tempdir().unwrap();
-        let policy = dir.path().join("policy.yaml");
-        fs::write(&policy, "selection:\n  mode: prefer\npreferred_order:\n  - external-secret\n  - ephemeral\n").unwrap();
+        let policy = dir.path().join("policy.toml");
+        fs::write(&policy, "preferred_order = [\"external-secret\", \"ephemeral\"]\n[selection]\nmode = \"prefer\"\n").unwrap();
         fs::set_permissions(&policy, fs::Permissions::from_mode(0o644)).unwrap(); // not the umask: some distros default to 002 (group-writable), which the policy loader correctly refuses
         std::env::set_var("HKDFGUARD_POLICY_FILE", &policy);
         std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-hkdfguard-cli-test");

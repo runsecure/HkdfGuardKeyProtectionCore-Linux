@@ -127,7 +127,7 @@ policy (or a policy that never names it), a missing secret mount or
 unavailable TPM makes `hkdfguard_create_kek` fail rather than silently
 degrade to it.
 
-The policy file (`/etc/hkdfguard/policy.yaml`, or `HKDFGUARD_POLICY_FILE`)
+The policy file (`/etc/hkdfguard/policy.toml`, or `HKDFGUARD_POLICY_FILE`)
 must be owned by root or by the process's own user and not writable by
 group or others. Only a *missing* file means "no policy"; a file that
 exists but is unreadable, too broadly writable, or malformed makes every
@@ -149,9 +149,9 @@ once a process has made more than 10 setup calls.
 The floor is set by the policy file and can be tuned per host (up to
 60 000 ms; `0` disables it):
 
-```yaml
-startup_behavior:
-  setup_min_delay_ms: 1000   # default when absent
+```toml
+[startup_behavior]
+setup_min_delay_ms = 1000   # default when absent
 ```
 
 A policy file that is present but invalid keeps the 1 s default (the
@@ -209,11 +209,12 @@ non-conformant stack, since a Name is a public function of the public
 area that anyone could recompute), this compares against a value held in
 the root-owned policy file, so substitution is detectable.
 
-```yaml
-tpm:
-  require_derivation_secret: true      # refuse the TPM without the secret file
-  pinned_names:
-    com.company.orders: "000b<64 hex chars>"
+```toml
+[tpm]
+require_derivation_secret = true       # refuse the TPM without the secret file
+
+[tpm.pinned_names]
+"com.company.orders" = "000b<64 hex chars>"   # quote service names: unquoted dots make nested tables
 ```
 
 Get the values to pin from the TPM itself with the two operator-helper
@@ -227,6 +228,53 @@ one. Both settings fail closed: a policy file that exists but can't be
 parsed is treated as requiring the secret, and pinning errors rather than
 reporting "nothing pinned".
 
+**Pinned Names as the provisioning allowlist.** A TPM has no stored
+per-service state: `TPM2_CreatePrimary` derives a key for *any* service
+name on demand. Left alone, that means on a TPM host `kek_exists` is
+always true, `provision` always reports "already provisioned", and `wrap`
+works for a service nobody ever provisioned — a typo in a deploy wraps
+under a different key and is only discovered at unwrap. Setting
+`require_pinned_names` moves the provisioning record into the root-owned
+policy file:
+
+```toml
+[tpm]
+require_pinned_names = true            # only services listed below exist on the TPM
+
+[tpm.pinned_names]
+"com.company.orders" = "000b<64 hex chars>"
+```
+
+Under it, a service with no pinned Name has no KEK: `kek_exists` returns
+0, and wrap and unwrap fail. `provision` for such a service fails too, but
+prints the exact entry to add — the Name this TPM derives for it, through
+the production derivation (so with the derivation secret, if one is
+configured):
+
+```text
+$ hkdfguard-v1-initialize provision -sn com.company.orders
+error: hkdfguard: create_kek failed for service (redacted): provider error: TPM2: tpm.require_pinned_names
+is set and this service has no pinned TPM Name. To provision it, add this to the policy file and run
+provision again:
+  [tpm.pinned_names]
+  "com.company.orders" = "000b..."
+error: hkdfguard_create_kek failed: the selected KEK provider failed (see the messages above for the provider's reason)
+```
+
+Add the entry as root and run `provision` again; it then reports
+"already provisioned". The same entry also gives you substitution
+protection (above), so one record does both jobs. A policy file that
+exists but can't be parsed applies the allowlist rather than dropping it.
+
+This gates the *TPM* provider. Under `mode = "prefer"`, a refused
+TPM is skipped like any other unavailable provider, so a weaker provider
+later in the order could serve the service instead; pair the allowlist
+with `mode = "require"`, `provider = "tpm2"` (or `mode = "require-level"`, `level = "hardware"`) if that matters. Don't
+treat the allowlist as access control, either: anything that can open the
+TPM and read the derivation secret can issue the same `CreatePrimary`
+itself. What it buys is that the set of TPM services is explicit,
+root-controlled, and checked on every call.
+
 **3. Session parameter encryption (bus protection).** On a *discrete*
 TPM — a separate chip on the LPC/SPI bus — an interposer can read
 `TPM2_ECDH_ZGen`'s response, the shared secret, in cleartext. Each
@@ -237,10 +285,10 @@ a salted HMAC session with parameter encryption (TPM 2.0 Part 1 §19.6;
 the cryptography is tpm2-tss's ESAPI, not this crate's), so the secret
 crosses the bus AES-128-CFB encrypted.
 
-```yaml
-tpm:
-  session_encryption: auto            # auto (default) | required | off
-  pinned_session_salt_key_name: "000b<64 hex chars>"
+```toml
+[tpm]
+session_encryption = "auto"           # "auto" (default) | "required" | "off"
+pinned_session_salt_key_name = "000b<64 hex chars>"
 ```
 
 `auto` reads `TPM_PT_MANUFACTURER` and skips encryption only for TPMs
@@ -315,7 +363,7 @@ scripts/native-tpm-test.sh        # the full matrix, on the real TPM
 ```
 
 The preflight identifies the TPM from `TPM2_PT_MANUFACTURER` and tells you
-what `tpm.session_encryption: auto` will decide on it (skip for an
+what `session_encryption = "auto"` will decide on it (skip for an
 fTPM/vTPM, encrypt for a discrete chip). The full run then does everything
 `docker/entrypoint-test.sh` does, against the real device: the
 conformance suite (determinism, Name formula, the fixed ECDH point,
@@ -456,7 +504,7 @@ secret. One trailing newline is ignored on both paths.
 | `HKDFGUARD_PKCS11_MODULE` | PKCS#11 | Absolute path to the PKCS#11 module `.so` (default: common SoftHSM2 install paths). The resolved file and its directory must be root-owned and not group/other-writable, or the module is refused. |
 | `HKDFGUARD_PKCS11_SLOT` | PKCS#11 | Slot index (default: first slot with a token present) |
 | `HKDFGUARD_PKCS11_PIN_FILE` | PKCS#11 | Path to a file holding the user PIN (default: `/etc/hkdfguard/pkcs11.pin`). Must be owned by root or the process's user with no group/other access (e.g. `0600`). The former `HKDFGUARD_PKCS11_PIN` env var is no longer read. |
-| `HKDFGUARD_POLICY_FILE` | Policy | Override the policy file path (default: `/etc/hkdfguard/policy.yaml`) |
+| `HKDFGUARD_POLICY_FILE` | Policy | Override the policy file path (default: `/etc/hkdfguard/policy.toml`) |
 | `HKDFGUARD_TPM_DERIVATION_SECRET_FILE` | TPM2 | Path to the optional host secret mixed into TPM key derivation (default: `/etc/hkdfguard/tpm.derivation-secret`). Must be owned by root or this process's user with no group/other access (e.g. `0600`), and must not be a symlink. See "Hardening the TPM key" above. |
 | `TPM2TOOLS_TCTI` / `TCTI` / `TEST_TCTI` | TPM2 | Standard `tpm2-tools`-style TCTI selector (e.g. `device:/dev/tpmrm0`, `swtpm:host=localhost,port=2321`); falls back to `device:/dev/tpmrm0` if unset |
 
@@ -467,44 +515,54 @@ descriptor for ownership, mode, and type before its contents are trusted.
 
 ### Policy file reference
 
-Everything the policy file (`/etc/hkdfguard/policy.yaml`) accepts, in one
-place. Unknown keys are rejected. Every field is optional except
-`selection`; the values shown are the defaults where one exists.
+Everything the policy file (`/etc/hkdfguard/policy.toml`) accepts, in one
+place. It is [TOML](https://toml.io). Unknown keys are rejected. Every
+field is optional except `[selection]`; the values shown are the defaults
+where one exists.
 
-```yaml
-key_requirements:
-  minimum_protection: external      # ephemeral | software | external | hardware; providers below this tier are excluded
+Two TOML rules matter here. Top-level keys (`preferred_order`) must come
+before the first `[table]` header: written below one, they belong to that
+table and the file is rejected. And service names in `[tpm.pinned_names]`
+must be quoted: an unquoted `com.company.orders` is a dotted key meaning
+nested tables, which is also rejected.
 
-selection:
-  mode: prefer                      # require | require-level | prefer
-  provider: tpm2                    # with `require`: exactly this provider (tpm2 | pkcs11 | external-secret | ephemeral)
-  level: hardware                   # with `require-level`: any provider at this tier or above
+```toml
+preferred_order = ["tpm2", "pkcs11", "external-secret"]
+                                    # with `prefer`: try in this order; omitted providers are excluded.
+                                    # This is also the ONLY way Ephemeral is ever used: it must be named here
+                                    # (or be the `require` provider). With no policy file at all, the order is
+                                    # tpm2, pkcs11, external-secret -- and never ephemeral.
 
-preferred_order:                    # with `prefer`: try in this order; omitted providers are excluded.
-  - tpm2                            # This is also the ONLY way Ephemeral is ever used: it must be named here
-  - pkcs11                          # (or be the `require` provider). With no policy file at all, the order is
-  - external-secret                 # tpm2, pkcs11, external-secret -- and never ephemeral.
+[key_requirements]
+minimum_protection = "external"     # ephemeral | software | external | hardware; providers below this tier are excluded
 
-startup_behavior:
-  setup_min_delay_ms: 1000          # floor on create_kek/kek_exists latency; 0 disables, max 60000
-  fail_if_requirement_unmet: true   # accepted for schema parity; the library always fails closed regardless
+[selection]
+mode = "prefer"                     # require | require-level | prefer
+provider = "tpm2"                   # with `require`: exactly this provider (tpm2 | pkcs11 | external-secret | ephemeral)
+level = "hardware"                  # with `require-level`: any provider at this tier or above
 
-container_policy:
-  max_ephemeral_lifetime_seconds: 3600   # accepted and validated (> 0); not enforced by an internal timer
+[startup_behavior]
+setup_min_delay_ms = 1000           # floor on create_kek/kek_exists latency; 0 disables, max 60000
+fail_if_requirement_unmet = true    # accepted for schema parity; the library always fails closed regardless
 
-tpm:
-  require_derivation_secret: false  # refuse the TPM without /etc/hkdfguard/tpm.derivation-secret
-  pinned_names:                     # per-service expected TPM Name; refuse any other key
-    com.company.orders: "000b<64 hex>"
-  session_encryption: auto          # auto | required | off  (see "Session parameter encryption")
-  pinned_session_salt_key_name: "000b<64 hex>"   # mandatory under `required`
+[container_policy]
+max_ephemeral_lifetime_seconds = 3600   # accepted and validated (> 0); not enforced by an internal timer
+
+[tpm]
+require_derivation_secret = false   # refuse the TPM without /etc/hkdfguard/tpm.derivation-secret
+require_pinned_names = false        # true: only services in pinned_names exist on the TPM (provisioning allowlist)
+session_encryption = "auto"         # auto | required | off  (see "Session parameter encryption")
+pinned_session_salt_key_name = "000b<64 hex>"   # mandatory under `required`
+
+[tpm.pinned_names]                  # per-service expected TPM Name; refuse any other key
+"com.company.orders" = "000b<64 hex>"
 ```
 
 The file must be owned by root or by the process's user and not writable
 by group or others. Only a *missing* file means "no policy"; a present but
 unreadable, too-broadly-writable, or malformed file makes every operation
 fail closed -- and resolves each hardening knob to its strictest setting
-(`session_encryption: required`, derivation secret required) rather than
+(`session_encryption = "required"`, derivation secret required) rather than
 its default.
 
 ## Design decisions worth knowing
@@ -619,7 +677,7 @@ src/
   error.rs                  Internal error type <-> C status codes
   payload.rs                Wrapped-payload wire format (version 1)
   crypto.rs                 ECDH(H_salt) -> HKDF-SHA512 -> AES-256-GCM protocol; salt-to-point hashing
-  policy.rs                 /etc/hkdfguard/policy.yaml parsing and evaluation
+  policy.rs                 /etc/hkdfguard/policy.toml parsing and evaluation
   secure_file.rs            Descriptor-checked secret-file reads, self-wiping buffer
   provider/
     mod.rs                  KekProvider/KekHandle traits, selection chain

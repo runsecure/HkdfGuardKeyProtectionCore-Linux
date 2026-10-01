@@ -209,8 +209,8 @@ fn cli_wrap_without_a_provisioned_kek_fails_and_preserves_the_existing_file() {
     let empty_mount = tempdir().unwrap();
     std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", empty_mount.path());
     let policy_dir = tempdir().unwrap();
-    let policy = policy_dir.path().join("policy.yaml");
-    fs::write(&policy, "selection:\n  mode: require\n  provider: external-secret\n").unwrap();
+    let policy = policy_dir.path().join("policy.toml");
+    fs::write(&policy, "[selection]\nmode = \"require\"\nprovider = \"external-secret\"\n").unwrap();
     fs::set_permissions(&policy, fs::Permissions::from_mode(0o644)).unwrap(); // not the umask: some distros default to 002 (group-writable), which the policy loader correctly refuses
     std::env::set_var("HKDFGUARD_POLICY_FILE", &policy);
 

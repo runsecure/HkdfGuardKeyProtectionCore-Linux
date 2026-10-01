@@ -22,7 +22,7 @@
 //! `kek_exists`/`load_kek` doc comments for why.
 //!
 //! The "allow-list" is now the full administrative policy engine in
-//! `crate::policy` (`/etc/hkdfguard/policy.yaml`) -- see [`allowed_chain`],
+//! `crate::policy` (`/etc/hkdfguard/policy.toml`) -- see [`allowed_chain`],
 //! the sole point where every provider-selection function below crosses
 //! from "what's compiled into this build" to "what policy currently
 //! allows, and in what order."
@@ -188,7 +188,7 @@ fn construct_provider(provider_type: ProviderType) -> Option<Arc<dyn KekProvider
 /// The provider types this process is currently allowed to use, in
 /// try-order: the compiled-in list ([`compiled_provider_types`]), filtered
 /// down to and reordered by the administrative policy in `crate::policy`
-/// (`/etc/hkdfguard/policy.yaml`, or `HKDFGUARD_POLICY_FILE`) if one is
+/// (`/etc/hkdfguard/policy.toml`, or `HKDFGUARD_POLICY_FILE`) if one is
 /// configured. Pure policy evaluation over types -- no provider is
 /// constructed here -- so a policy of e.g. `require: external-secret`
 /// never causes a TPM connection or an HSM login just to be told no.
@@ -227,15 +227,25 @@ static EPHEMERAL_WARNED: OnceLock<()> = OnceLock::new(); // `set()` succeeds exa
 /// `provider.load_kek(service, create_if_missing)`; the first to succeed
 /// wins and the walk stops -- providers later in the order are never even
 /// constructed. A provider declining via [`Error::KeyNotProvisioned`] is a
-/// soft "try the next provider" signal; any other error is logged as a
-/// warning before falling through too. `not_found_err` is what's returned
-/// if the entire chain is exhausted without a hard error along the way.
+/// soft "try the next provider" signal; any other error falls through too,
+/// and the last one is returned if nothing succeeds. `not_found_err` is
+/// what's returned if the entire chain is exhausted without a hard error
+/// along the way.
+///
+/// Logging rule: every provider failure is logged exactly once, by whoever
+/// ends up holding it. A failure this function returns is logged by its
+/// caller (the C ABI layer), so it is *not* logged here; one that is
+/// superseded by a later failure, or that the chain falls back past, is
+/// logged here, since nothing downstream will ever see it. A returned
+/// `Error::Provider` is prefixed with the provider's name so the caller's
+/// one log line still says which provider failed.
 fn walk_chain(
     service: &str,
     create_if_missing: bool,
     not_found_err: Error,
 ) -> Result<(Arc<dyn KekProvider>, Box<dyn KekHandle>)> {
-    let mut last_err = not_found_err;
+    // The most recent hard failure, not yet logged.
+    let mut pending: Option<(ProviderType, Error)> = None;
 
     for provider_type in allowed_types()? {
         // priority order, per the configured policy (or the default compiled-in order)
@@ -254,6 +264,13 @@ fn walk_chain(
         match provider.load_kek(service, create_if_missing) {
             Ok(handle) => {
                 // this provider successfully produced a usable KEK handle
+                if let Some((failed, e)) = pending.take() {
+                    log::warn!(
+                        "hkdfguard: provider {} failed ({e}); fell back to {}",
+                        failed.as_str(),
+                        provider_type.as_str()
+                    );
+                }
                 log::debug!("hkdfguard: using provider {} for this call", provider_type.as_str());
                 if matches!(provider_type, ProviderType::Ephemeral) && EPHEMERAL_WARNED.set(()).is_ok() {
                     // `.set()` only returns Ok the first time; subsequent calls see it already set
@@ -267,28 +284,39 @@ fn walk_chain(
             }
             Err(Error::KeyNotProvisioned(msg)) => {
                 // soft decline: quietly try the next provider, without
-                // overwriting `last_err` -- an expected, common case (no
-                // key created here yet), not itself informative enough to
-                // surface over `not_found_err`.
+                // replacing a pending hard failure -- an expected, common
+                // case (no key created here yet), not itself informative
+                // enough to surface over `not_found_err`.
                 log::debug!(
                     "hkdfguard: provider {} has no key for this service ({msg}), trying next",
                     provider_type.as_str()
                 );
             }
             Err(e) => {
-                // a real failure (TPM/PKCS11/filesystem error) -- log it loudly, remember it, then still fall through
-                log::warn!(
-                    "hkdfguard: provider {} failed ({e}), trying next",
-                    provider_type.as_str()
-                );
-                last_err = e;
+                // A real failure (TPM/PKCS11/filesystem error). Hold it
+                // rather than logging now: if nothing later replaces it,
+                // the caller logs it. The one it replaces will never be
+                // seen downstream, so that one is logged here.
+                if let Some((superseded, prev)) = pending.replace((provider_type, e)) {
+                    log::warn!(
+                        "hkdfguard: provider {} failed ({prev}), trying next",
+                        superseded.as_str()
+                    );
+                }
             }
         }
         // `provider` drops here: session logged out / module finalized /
         // TCTI closed before the next candidate is even constructed.
     }
 
-    Err(last_err) // every provider was tried and none produced a key
+    // every provider was tried and none produced a key
+    Err(match pending {
+        Some((provider_type, Error::Provider(msg))) => {
+            Error::Provider(format!("{}: {msg}", provider_type.as_str()))
+        }
+        Some((_, e)) => e,
+        None => not_found_err,
+    })
 }
 
 /// Walks the policy-allowed priority chain (TPM2 -> PKCS#11 -> External
@@ -628,15 +656,15 @@ mod tests {
         }
     }
 
-    // Writes `yaml` to a fresh temp file and points HKDFGUARD_POLICY_FILE
+    // Writes `doc` to a fresh temp file and points HKDFGUARD_POLICY_FILE
     // at it, returning the owning `TempDir` -- callers must keep that
     // binding alive for as long as the policy file needs to exist (an
     // unbound `tempdir().unwrap().path().join(...)` drops the directory,
     // and everything in it, at the end of that statement).
-    fn write_policy(yaml: &str) -> tempfile::TempDir {
+    fn write_policy(doc: &str) -> tempfile::TempDir {
         let dir = tempdir().unwrap();
-        crate::secure_file::write_world_readable_for_tests(&dir.path().join("policy.yaml"), yaml);
-        std::env::set_var("HKDFGUARD_POLICY_FILE", dir.path().join("policy.yaml"));
+        crate::secure_file::write_world_readable_for_tests(&dir.path().join("policy.toml"), doc);
+        std::env::set_var("HKDFGUARD_POLICY_FILE", dir.path().join("policy.toml"));
         dir
     }
 
@@ -649,7 +677,7 @@ mod tests {
 
             // Deliberately excludes external-secret; naming Ephemeral in
             // preferred_order is what makes it reachable at all.
-            let _policy_dir = write_policy("selection:\n  mode: prefer\npreferred_order:\n  - ephemeral\n");
+            let _policy_dir = write_policy("preferred_order = [\"ephemeral\"]\n[selection]\nmode = \"prefer\"\n");
 
             let (provider, _handle) = create_kek("com.company.orders").unwrap();
             assert_eq!(
@@ -674,7 +702,7 @@ mod tests {
             // Ephemeral/external-secret, unlike the unrestricted default
             // chain (this is the Linux equivalent of "Require TPM
             // failure" when TPM hardware isn't present).
-            let _policy_dir = write_policy("selection:\n  mode: require\n  provider: pkcs11\n");
+            let _policy_dir = write_policy("[selection]\nmode = \"require\"\nprovider = \"pkcs11\"\n");
 
             let err = expect_err(create_kek("com.company.orders"));
             assert!(matches!(err, Error::NoProviderAvailable | Error::Provider(_)));
@@ -702,7 +730,7 @@ mod tests {
             // PKCS#11 (no PIN configured) is unreachable; policy must
             // fall through to external-secret.
             let _policy_dir = write_policy(
-                "selection:\n  mode: prefer\npreferred_order:\n  - pkcs11\n  - external-secret\n  - ephemeral\n",
+                "preferred_order = [\"pkcs11\", \"external-secret\", \"ephemeral\"]\n[selection]\nmode = \"prefer\"\n",
             );
 
             let (provider, _handle) = create_kek("com.company.orders").unwrap();
@@ -723,7 +751,7 @@ mod tests {
             // No preferred_order at all -- ephemeral must default to
             // disallowed (never named), even where it would otherwise be
             // the only reachable provider.
-            let _policy_dir = write_policy("selection:\n  mode: prefer\n");
+            let _policy_dir = write_policy("[selection]\nmode = \"prefer\"\n");
 
             assert_never_ephemeral(create_kek("com.company.orders"));
 
@@ -739,7 +767,7 @@ mod tests {
         {
             std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-dir-for-tests");
 
-            let _policy_dir = write_policy("selection:\n  mode: prefer\npreferred_order:\n  - ephemeral\n");
+            let _policy_dir = write_policy("preferred_order = [\"ephemeral\"]\n[selection]\nmode = \"prefer\"\n");
 
             let (provider, _handle) = create_kek("com.company.orders").unwrap();
             assert_eq!(provider.provider_type(), ProviderType::Ephemeral);
@@ -761,7 +789,7 @@ mod tests {
             // between it and being selected -- isolating exactly the
             // mechanism this test means to exercise.
             let _policy_dir = write_policy(
-                "key_requirements:\n  minimum_protection: external\nselection:\n  mode: prefer\npreferred_order:\n  - ephemeral\n",
+                "preferred_order = [\"ephemeral\"]\n[key_requirements]\nminimum_protection = \"external\"\n[selection]\nmode = \"prefer\"\n",
             );
 
             let err = expect_err(create_kek("com.company.orders"));
@@ -772,12 +800,99 @@ mod tests {
         }
     }
 
+    // ---- each provider failure is logged exactly once ----
+
+    struct CapturingLogger(std::sync::Mutex<Vec<String>>);
+
+    impl log::Log for CapturingLogger {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+        fn log(&self, record: &log::Record) {
+            if self.enabled(record.metadata()) {
+                self.0.lock().unwrap().push(format!("{}", record.args()));
+            }
+        }
+        fn flush(&self) {}
+    }
+
+    static CAPTURED: CapturingLogger = CapturingLogger(std::sync::Mutex::new(Vec::new()));
+
+    // Runs `f` and returns every warn/error line it logged that contains
+    // `marker`. `#[serial]` callers keep other tests' lines out.
+    fn logged_lines_containing(marker: &str, f: impl FnOnce()) -> Vec<String> {
+        if log::set_logger(&CAPTURED).is_ok() {
+            log::set_max_level(log::LevelFilter::Warn);
+        }
+        CAPTURED.0.lock().unwrap().clear();
+        f();
+        CAPTURED.0.lock().unwrap().iter().filter(|l| l.contains(marker)).cloned().collect()
+    }
+
+    // An external-secret mount holding a group-readable key for `service`:
+    // a hard provider failure ("permissions too broad"), not a soft decline.
+    fn mount_with_untrusted_secret(service: &str) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(service);
+        std::fs::write(&path, p256::SecretKey::random(&mut rand_core::OsRng).to_bytes()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", dir.path());
+        dir
+    }
+
+    #[test]
+    #[serial]
+    fn a_provider_failure_that_fails_the_call_is_logged_once() {
+        #[cfg(feature = "external-secret")]
+        {
+            let service = "com.company.logonce";
+            let _mount = mount_with_untrusted_secret(service);
+            let _policy = crate::policy::require_provider_policy_for_tests("external-secret");
+
+            let lines = logged_lines_containing("permissions too broad", || {
+                let c = std::ffi::CString::new(service).unwrap();
+                assert_ne!(crate::hkdfguard_create_kek(c.as_ptr()), crate::status::OK);
+            });
+
+            std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
+            std::env::remove_var("HKDFGUARD_POLICY_FILE");
+            assert_eq!(lines.len(), 1, "the failure must be logged exactly once, got: {lines:#?}");
+            assert!(lines[0].contains("EXTERNAL_SECRET"), "the one line must still name the provider: {}", lines[0]);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn a_provider_failure_the_chain_falls_back_past_is_logged_once() {
+        #[cfg(all(feature = "external-secret", feature = "ephemeral"))]
+        {
+            let service = "com.company.logoncefallback";
+            let _mount = mount_with_untrusted_secret(service);
+            let _policy = crate::policy::allow_ephemeral_policy_for_tests(); // external-secret, then ephemeral
+
+            let lines = logged_lines_containing("permissions too broad", || {
+                let c = std::ffi::CString::new(service).unwrap();
+                assert_eq!(crate::hkdfguard_create_kek(c.as_ptr()), crate::status::OK, "ephemeral should serve it");
+            });
+
+            std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
+            std::env::remove_var("HKDFGUARD_POLICY_FILE");
+            assert_eq!(lines.len(), 1, "the skipped failure must be logged exactly once, got: {lines:#?}");
+            assert!(
+                lines[0].contains("EXTERNAL_SECRET") && lines[0].contains("fell back to EPHEMERAL"),
+                "the line must say which provider failed and what was used instead: {}",
+                lines[0]
+            );
+        }
+    }
+
     #[test]
     #[serial]
     fn malformed_policy_fails_closed_even_when_providers_are_available() {
         std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-dir-for-tests");
 
-        let _policy_dir = write_policy("selection:\n  mode: require\n  provider: quantum-vault\n");
+        let _policy_dir = write_policy("[selection]\nmode = \"require\"\nprovider = \"quantum-vault\"\n");
 
         let err = expect_err(create_kek("com.company.orders"));
         assert!(matches!(err, Error::Provider(_)), "a malformed policy must fail closed, not fall back to the default chain");

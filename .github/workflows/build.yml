@@ -10,9 +10,19 @@
 #      binary is never published for an architecture where this fails.
 #   2. docker/entrypoint-build.sh -- release build (--all-features) and
 #      artifact collection.
-#   3. Package as hkdfguard-<version>-linux-<arch>.tar.gz with a SHA-256.
+#   3. Package as hkdfguard-<version>-linux-<arch>.tar.gz with a SHA-256,
+#      and a Sigstore build-provenance attestation (verify with
+#      `gh attestation verify <file> --repo <owner>/<repo>`).
 #
-# On a `v*` tag, a release job attaches both archives to a GitHub Release.
+# A separate, independent job runs `cargo deny check advisories` against
+# Cargo.lock (see deny.toml) as a supply-chain gate.
+#
+# On a `v*` tag, a release job attaches both archives (and their checksums)
+# to a GitHub Release.
+#
+# Every action below is pinned to a commit SHA, not a floating tag, so a
+# compromised or re-tagged action can't silently change what this workflow
+# runs; the trailing comment names the release that SHA corresponds to.
 name: build
 
 on:
@@ -30,6 +40,18 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  supply-chain:
+    name: cargo deny (advisories)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          command-arguments: advisories
+
   build:
     name: build (${{ matrix.arch }})
     strategy:
@@ -44,16 +66,20 @@ jobs:
             platform: linux/arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write      # for attest-build-provenance's Sigstore signing
+      attestations: write  # to publish the attestation to this repo
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       # The image (apt packages + rustup) is the slow part and rarely
       # changes; cache its layers per architecture.
       - name: Build the build/test image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: docker/Dockerfile
@@ -107,7 +133,17 @@ jobs:
           cat "$name.tar.gz.sha256"
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      # Signed, verifiable provenance for the exact bytes being published:
+      # which workflow run, which commit, which runner produced this file.
+      # The SHA-256 above is integrity ("these bytes are unmodified"); this
+      # is authenticity ("these bytes came from this repo's CI"). Verify
+      # with: gh attestation verify <file>.tar.gz --repo <owner>/<repo>
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: ${{ steps.package.outputs.name }}.tar.gz
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ steps.package.outputs.name }}
           path: |
@@ -119,17 +155,17 @@ jobs:
   release:
     name: publish release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, supply-chain]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
           merge-multiple: true
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             artifacts/*.tar.gz

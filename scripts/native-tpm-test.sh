@@ -85,8 +85,8 @@ export HKDFGUARD_EXTERNAL_SECRET_DIR="$WORK/no-external-secret"
 # Writes $1 as the active policy file (root-or-self owned, 0600 -- the
 # library refuses anything looser).
 use_policy() {
-    ( umask 077; printf '%s' "$1" > "$WORK/policy.yaml" )
-    export HKDFGUARD_POLICY_FILE="$WORK/policy.yaml"
+    ( umask 077; printf '%s' "$1" > "$WORK/policy.toml" )
+    export HKDFGUARD_POLICY_FILE="$WORK/policy.toml"
 }
 no_policy() { export HKDFGUARD_POLICY_FILE="$WORK/no-policy"; }
 
@@ -108,7 +108,7 @@ build_c() { # build_c <source.c> <out>
 if [ "$MODE" = "reboot" ]; then
     STATE="${HKDFGUARD_NATIVE_TEST_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/hkdfguard-native-tpm-test}"
     SERVICE="com.hkdfguard.nativetest.reboot"
-    use_policy $'selection:\n  mode: require\n  provider: tpm2\n'
+    use_policy $'[selection]\nmode = "require"\nprovider = "tpm2"\n'
 
     section "build (release, --features tpm2)"
     cargo build --release --features tpm2
@@ -202,18 +202,20 @@ SVC_NAME=$(HKDFGUARD_PIN_SERVICE=com.company.orders learn print_service_key_name
 note "salt key Name:      $SALT_NAME"
 note "service key Name:   $SVC_NAME (com.company.orders)"
 REQUIRED_POLICY=$(cat <<EOF
-selection:
-  mode: require
-  provider: tpm2
-tpm:
-  session_encryption: required
-  pinned_session_salt_key_name: "$SALT_NAME"
-  pinned_names:
-    com.company.orders: "$SVC_NAME"
+[selection]
+mode = "require"
+provider = "tpm2"
+
+[tpm]
+session_encryption = "required"
+pinned_session_salt_key_name = "$SALT_NAME"
+
+[tpm.pinned_names]
+"com.company.orders" = "$SVC_NAME"
 EOF
 )
-note "this policy is what a hardened deployment on THIS machine would install at /etc/hkdfguard/policy.yaml"
-printf '%s\n' "$REQUIRED_POLICY" > "$WORK/required-policy.example.yaml"
+note "this policy is what a hardened deployment on THIS machine would install at /etc/hkdfguard/policy.toml"
+printf '%s\n' "$REQUIRED_POLICY" > "$WORK/required-policy.example.toml"
 
 # ---------------------------------------------------------------------
 # 7. C ABI round trip on the TPM, under both policies
@@ -224,7 +226,7 @@ build_c examples/wrap_unwrap.c "$WORK/wrap_unwrap"
 build_c examples/cli_unwrap_check.c "$WORK/cli_unwrap_check"
 
 section "C ABI round trip (examples/wrap_unwrap.c) -- KEK on the TPM, policy: require tpm2, session_encryption auto"
-use_policy $'selection:\n  mode: require\n  provider: tpm2\n'
+use_policy $'[selection]\nmode = "require"\nprovider = "tpm2"\n'
 LD_LIBRARY_PATH=target/release "$WORK/wrap_unwrap"
 
 section "C ABI round trip -- policy: session_encryption REQUIRED with both Names pinned"

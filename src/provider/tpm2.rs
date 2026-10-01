@@ -130,7 +130,7 @@ fn derivation_secret_path() -> PathBuf {
 ///
 /// - Absent, and policy doesn't require one: `Ok(None)` -- derivation
 ///   falls back to seed + service label, exactly as before.
-/// - Absent, with `tpm.require_derivation_secret: true`: `Err`.
+/// - Absent, with `tpm.require_derivation_secret = true`: `Err`.
 /// - Present but untrustworthy (wrong owner, group/other-accessible, a
 ///   symlink, oversized, empty): always `Err`. A secret that exists but
 ///   can't be trusted is never silently skipped, since that would quietly
@@ -396,8 +396,8 @@ fn verify_name(service: &str, public: &Public, name: &Name) -> Result<()> {
     Ok(())
 }
 
-// Low-level, provider-instance-independent CreatePrimary: reads the
-// derivation secret, builds this service's deterministic template, runs
+// Low-level, provider-instance-independent CreatePrimary: builds this
+// service's deterministic template from `secret`, runs
 // TPM2_CreatePrimary, reads back the resulting object's public area and
 // Name via TPM2_ReadPublic, and verifies both before handing anything
 // back. Returns the *still-loaded* handle -- the caller owns flushing it
@@ -405,18 +405,12 @@ fn verify_name(service: &str, public: &Public, name: &Name) -> Result<()> {
 // public-key read without diverging. Every internal failure path flushes
 // before returning.
 //
-// Every path that needs this service's key goes through here, which is
-// what guarantees `ecdh` and `public_key` derive the *same* key: if they
-// disagreed on the template or the sensitive data, the fingerprint check
-// in `crypto::unwrap` would reject every payload.
-fn create_and_verify_primary(
-    ctx: &mut Context,
-    service: &str,
-) -> Result<(KeyHandle, Public, Name)> {
-    let secret = read_derivation_secret()?;
-    create_and_verify_primary_with(ctx, service, secret.as_ref())
-}
-
+// The secret is a parameter, never read here, so that a caller making
+// several derivations that must agree reads the file exactly once and
+// passes the same bytes to each. Re-reading per derivation would let a
+// secret rotated between two of them produce two different keys -- e.g.
+// a payload whose fingerprint is one KEK and whose ciphertext is another,
+// unopenable forever.
 fn create_and_verify_primary_with(
     ctx: &mut Context,
     service: &str,
@@ -452,10 +446,15 @@ fn create_and_verify_primary_with(
     Ok((key_handle, public, name))
 }
 
-// `create_and_verify_primary` for callers that only want the public area
-// and Name: flushes the transient primary before returning, on every path.
-fn create_and_read_primary(ctx: &mut Context, service: &str) -> Result<(Public, Name)> {
-    let (key_handle, public, name) = create_and_verify_primary(ctx, service)?;
+// `create_and_verify_primary_with` for callers that only want the public
+// area and Name: flushes the transient primary before returning, on every
+// path.
+fn create_and_read_primary(
+    ctx: &mut Context,
+    service: &str,
+    secret: Option<&Zeroizing<[u8; 32]>>,
+) -> Result<(Public, Name)> {
+    let (key_handle, public, name) = create_and_verify_primary_with(ctx, service, secret)?;
     let _ = ctx.flush_context(key_handle.into());
     Ok((public, name))
 }
@@ -486,8 +485,13 @@ const SELFTEST_ALT_SERVICE: &str = "__hkdfguard_selftest_alt__";
 /// command failure, which says nothing about the TPM's determinism and so
 /// must not be cached as a verdict.
 fn validate_tpm_compatibility(ctx: &mut Context) -> Result<bool> {
-    let (public1, _) = create_and_read_primary(ctx, SELFTEST_SERVICE)?;
-    let (public2, _) = create_and_read_primary(ctx, SELFTEST_SERVICE)?;
+    // Read once for all three derivations: a secret rotated between them
+    // would make the determinism check fail, and that verdict is cached
+    // for the life of the process.
+    let secret = read_derivation_secret()?;
+    let secret = secret.as_ref();
+    let (public1, _) = create_and_read_primary(ctx, SELFTEST_SERVICE, secret)?;
+    let (public2, _) = create_and_read_primary(ctx, SELFTEST_SERVICE, secret)?;
     let bytes1 = public1.marshall().map_err(|e| Error::Provider(format!("failed to marshal TPM public area: {e}")))?;
     let bytes2 = public2.marshall().map_err(|e| Error::Provider(format!("failed to marshal TPM public area: {e}")))?;
     if bytes1 != bytes2 {
@@ -495,7 +499,7 @@ fn validate_tpm_compatibility(ctx: &mut Context) -> Result<bool> {
         return Ok(false);
     }
 
-    let (public_alt, _) = create_and_read_primary(ctx, SELFTEST_ALT_SERVICE)?;
+    let (public_alt, _) = create_and_read_primary(ctx, SELFTEST_ALT_SERVICE, secret)?;
     let bytes_alt = public_alt.marshall().map_err(|e| Error::Provider(format!("failed to marshal TPM public area: {e}")))?;
     if bytes1 == bytes_alt {
         log::warn!("hkdfguard: TPM behavior incompatible with hkdfguard requirements: different services reproduced the same key (unique field ignored)");
@@ -657,7 +661,7 @@ fn session_encryption_enabled(ctx: &mut Context) -> Result<bool> {
             let internal = match ctx.get_tpm_property(PropertyTag::Manufacturer) {
                 Ok(Some(id)) if manufacturer_has_no_external_bus(id) => {
                     log::info!(
-                        "hkdfguard: TPM manufacturer {:?} has no external bus; session encryption skipped (tpm.session_encryption: auto)",
+                        "hkdfguard: TPM manufacturer {:?} has no external bus; session encryption skipped (tpm.session_encryption = \"auto\")",
                         String::from_utf8_lossy(&id.to_be_bytes())
                     );
                     true
@@ -792,12 +796,16 @@ fn ecdh_z_gen_encrypted(ctx: &mut Context, key_handle: KeyHandle, peer_point: &E
     result
 }
 
-// Handle type returned from `get_or_create_kek`; deliberately does *not*
-// hold a loaded TPM key -- that's created fresh (deterministically) inside
-// `ecdh`, once the peer's ephemeral public key is known.
+// Handle type returned from `load_kek`; deliberately does *not* hold a
+// loaded TPM key -- that's created fresh (deterministically) inside each
+// method. It does hold the derivation secret, read once in `load_kek`, so
+// `public_key` and `ecdh` within one wrap/unwrap derive from identical
+// bytes. The handle lives for a single call and the secret is zeroized
+// when it drops, so this is not caching across calls.
 struct Tpm2Handle {
     key_id: Vec<u8>,     // diagnostic-only tag embedded in the wrapped payload
     service: String,      // the service name, needed to rebuild the same deterministic template later
+    secret: Option<Zeroizing<[u8; 32]>>, // derivation secret snapshot for this handle's lifetime
     context: Arc<Mutex<Option<Context>>>, // shared handle back to the TPM connection
 }
 
@@ -821,7 +829,8 @@ impl KekHandle for Tpm2Handle {
         // policy-pinned Name) *before* it is used for ECDH -- so a key
         // that isn't the one policy expects never computes a shared
         // secret at all.
-        let (key_handle, _public, _name) = create_and_verify_primary(ctx, &self.service)?;
+        let (key_handle, _public, _name) =
+            create_and_verify_primary_with(ctx, &self.service, self.secret.as_ref())?;
 
         // TPM2_ECDH_ZGen: computes the shared point Z inside the TPM. Under
         // an encrypted session its response -- Z itself -- is AES-CFB
@@ -870,10 +879,11 @@ impl KekHandle for Tpm2Handle {
             .as_mut()
             .ok_or(Error::Provider("TPM context not available".into()))?;
 
-        // Same verified derivation path `ecdh` uses, so the public key
-        // reported here (and hence the fingerprint written into the
-        // payload) is guaranteed to belong to the key `ecdh` would use.
-        let (public, _name) = create_and_read_primary(ctx, &self.service)?;
+        // Same verified derivation path and the same secret bytes `ecdh`
+        // uses, so the public key reported here (and hence the fingerprint
+        // written into the payload) is guaranteed to belong to the key
+        // `ecdh` will use, even if the secret file is rotated in between.
+        let (public, _name) = create_and_read_primary(ctx, &self.service, self.secret.as_ref())?;
         encode_tpm_public_key(&public)
     }
 }
@@ -919,18 +929,32 @@ impl KekProvider for Tpm2Provider {
 
     // TPM2_CreatePrimary is deterministic (see the module-level design
     // note): for a fixed TPM seed and template, it always reproduces the
-    // exact same key. There is no separate persisted "does this key exist"
-    // state to check -- the key conceptually already exists for every
-    // possible service string the moment the TPM itself is reachable. So
-    // this always answers `true` once `probe()` does, and `load_kek` below
-    // ignores `create_if_missing` entirely: there is nothing to create.
-    fn kek_exists(&self, _service: &str) -> Result<bool> {
-        Ok(self.probe())
+    // exact same key, so the TPM itself has no notion of a key "existing".
+    // Provisioning state therefore lives in policy: under
+    // `tpm.require_pinned_names`, a service exists iff its Name is pinned
+    // (see `service_is_provisioned`); without it, every service exists the
+    // moment the TPM is reachable.
+    fn kek_exists(&self, service: &str) -> Result<bool> {
+        if !self.probe() {
+            return Ok(false);
+        }
+        service_is_provisioned(service)
     }
 
-    fn load_kek(&self, service: &str, _create_if_missing: bool) -> Result<Box<dyn KekHandle>> {
+    fn load_kek(&self, service: &str, create_if_missing: bool) -> Result<Box<dyn KekHandle>> {
         if !self.probe() {
             return Err(Error::Provider("TPM context not available".into()));
+        }
+        if !service_is_provisioned(service)? {
+            if create_if_missing {
+                // Provisioning here means a root-owned policy edit, which
+                // this process can't (and mustn't) make itself. Do the part
+                // it can: derive the key and report the exact Name to pin.
+                return Err(Error::Provider(unpinned_service_instructions(&self.context, service)));
+            }
+            return Err(Error::KeyNotProvisioned(
+                "tpm.require_pinned_names is set and policy pins no TPM Name for this service",
+            ));
         }
         // The actual TPM2_CreatePrimary + TPM2_ECDH_ZGen round trip is
         // deferred to `KekHandle::ecdh`, once the caller's ephemeral
@@ -939,8 +963,50 @@ impl KekProvider for Tpm2Provider {
         Ok(Box::new(Tpm2Handle {
             key_id: service_fingerprint(service),
             service: service.to_string(),
+            secret: read_derivation_secret()?, // the one read this handle's derivations share
             context: Arc::clone(&self.context), // clone the Arc (cheap: just bumps a refcount), not the underlying context
         }))
+    }
+}
+
+/// Whether `service` counts as provisioned on the TPM. Always true unless
+/// policy sets `tpm.require_pinned_names`, in which case only services with
+/// an entry in `tpm.pinned_names` are. A policy file that exists but is
+/// broken fails closed: the allowlist applies, and the pin lookup errors.
+fn service_is_provisioned(service: &str) -> Result<bool> {
+    if !crate::policy::require_tpm_pinned_names() {
+        return Ok(true);
+    }
+    Ok(crate::policy::pinned_tpm_name(service)?.is_some())
+}
+
+/// The message `provision` gets for an unpinned service under
+/// `tpm.require_pinned_names`: the Name this TPM derives for it, in the
+/// form to paste into policy. Derived through the production path, so it
+/// honors the derivation secret. If derivation itself fails, says so
+/// rather than hiding the reason the service can't be provisioned.
+fn unpinned_service_instructions(context: &Arc<Mutex<Option<Context>>>, service: &str) -> String {
+    let name = (|| -> Result<String> {
+        let mut guard = context
+            .lock()
+            .map_err(|_| Error::Provider("TPM context lock poisoned".into()))?;
+        let ctx = guard
+            .as_mut()
+            .ok_or(Error::Provider("TPM context not available".into()))?;
+        let secret = read_derivation_secret()?;
+        let (_public, name) = create_and_read_primary(ctx, service, secret.as_ref())?;
+        Ok(hex(name.value()))
+    })();
+    match name {
+        Ok(name) => format!(
+            "tpm.require_pinned_names is set and this service has no pinned TPM Name. To provision \
+             it, add this to the policy file and run provision again:\n  [tpm.pinned_names]\n  \
+             \"{service}\" = \"{name}\""
+        ),
+        Err(e) => format!(
+            "tpm.require_pinned_names is set and this service has no pinned TPM Name; deriving its \
+             Name to report it failed: {e}"
+        ),
     }
 }
 
@@ -1125,10 +1191,10 @@ mod tests {
     #[serial]
     fn absent_secret_is_an_error_when_policy_requires_one() {
         let dir = tempfile::tempdir().unwrap();
-        let policy = dir.path().join("policy.yaml");
+        let policy = dir.path().join("policy.toml");
         crate::secure_file::write_world_readable_for_tests(
             &policy,
-            "selection:\n  mode: require\n  provider: tpm2\ntpm:\n  require_derivation_secret: true\n",
+            "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nrequire_derivation_secret = true\n",
         );
         std::env::set_var("HKDFGUARD_POLICY_FILE", &policy);
         let result = with_no_secret_file(read_derivation_secret);
@@ -1290,6 +1356,60 @@ mod tests {
         assert_ne!(name, computed_name(&billing).unwrap());
     }
 
+    // Writes `doc` as the policy for the duration of `f`.
+    fn with_policy<T>(doc: &str, f: impl FnOnce() -> T) -> T {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.toml");
+        crate::secure_file::write_world_readable_for_tests(&path, doc);
+        std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
+        let result = f();
+        std::env::remove_var("HKDFGUARD_POLICY_FILE");
+        result
+    }
+
+    const SOME_NAME: &str = "000b0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+
+    #[test]
+    #[serial]
+    fn every_service_is_provisioned_without_the_allowlist() {
+        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
+        let no_policy = service_is_provisioned("com.company.anything").unwrap();
+        std::env::remove_var("HKDFGUARD_POLICY_FILE");
+        assert!(no_policy, "with no policy, the TPM serves every service (the historical behavior)");
+
+        let off = with_policy("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n", || {
+            service_is_provisioned("com.company.anything").unwrap()
+        });
+        assert!(off, "require_pinned_names defaults to false");
+    }
+
+    #[test]
+    #[serial]
+    fn only_pinned_services_are_provisioned_under_the_allowlist() {
+        let doc = format!(
+            "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nrequire_pinned_names = true\n[tpm.pinned_names]\n\"com.company.orders\" = \"{SOME_NAME}\"\n"
+        );
+        let (pinned, pinned_other_case, unpinned) = with_policy(&doc, || {
+            (
+                service_is_provisioned("com.company.orders").unwrap(),
+                service_is_provisioned(&crate::normalize_service("COM.COMPANY.ORDERS")).unwrap(),
+                service_is_provisioned("com.company.billing").unwrap(),
+            )
+        });
+        assert!(pinned);
+        assert!(pinned_other_case, "lookup goes through the same normalization as the C ABI");
+        assert!(!unpinned, "a service with no pinned Name must not count as provisioned");
+    }
+
+    #[test]
+    #[serial]
+    fn a_broken_policy_is_an_error_not_provisioned() {
+        // Fails closed: neither "everything is provisioned" nor a quiet
+        // "not provisioned" that could let the chain fall through.
+        let result = with_policy("[selection]\nmode = \"require\"\n", || service_is_provisioned("com.company.orders"));
+        assert!(result.is_err());
+    }
+
     #[test]
     fn hex_encodes_lowercase_and_zero_pads() {
         assert_eq!(hex(&[0x00, 0x0b, 0xff, 0x10]), "000bff10");
@@ -1354,7 +1474,8 @@ mod tests {
     // two calls indicates a different underlying TPM key.
     fn create_primary_and_get_public(service: &str) -> Result<Vec<u8>> {
         with_tpm_context(|ctx| {
-            let (public, _name) = create_and_read_primary(ctx, service)?;
+            let secret = read_derivation_secret()?;
+            let (public, _name) = create_and_read_primary(ctx, service, secret.as_ref())?;
             public
                 .marshall()
                 .map_err(|e| Error::Provider(format!("failed to marshal TPM public area: {e}")))
@@ -1366,7 +1487,8 @@ mod tests {
     // deterministic primary.
     fn create_primary_and_get_name(service: &str) -> Result<Vec<u8>> {
         with_tpm_context(|ctx| {
-            let (_public, name) = create_and_read_primary(ctx, service)?;
+            let secret = read_derivation_secret()?;
+            let (_public, name) = create_and_read_primary(ctx, service, secret.as_ref())?;
             Ok(name.value().to_vec())
         })
     }
@@ -1602,6 +1724,55 @@ mod tests {
     #[test]
     #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
     #[serial]
+    fn rotating_the_secret_mid_handle_does_not_split_public_key_and_ecdh() {
+        // A wrap calls `public_key()` (for the fingerprint) and then
+        // `ecdh()` (for the wrapping key). If each re-read the secret file,
+        // a rotation between them would produce a payload whose
+        // fingerprint names one KEK and whose ciphertext is under another
+        // -- unopenable forever. The handle must use one snapshot for both.
+        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
+        let service = "com.company.rotation";
+        let peer = crate::crypto::payload_ecdh_point(&[0x42u8; 32]).unwrap();
+
+        let (before, after, z_handle) = with_secret_file(b"secret-before-rotation", 0o600, |path| {
+            let provider = Tpm2Provider::new();
+            assert!(provider.probe(), "no TPM available");
+            let handle = provider.load_kek(service, false).unwrap();
+            let before = handle.public_key().unwrap();
+
+            // Rotate the file underneath the live handle.
+            std::fs::write(path, b"secret-after-rotation").unwrap();
+
+            let after = handle.public_key().unwrap();
+            let z = handle.ecdh(&peer).unwrap();
+            (before, after, *z)
+        });
+        std::env::remove_var("HKDFGUARD_POLICY_FILE");
+
+        assert_eq!(before, after, "public_key() must not change when the secret file is rotated mid-handle");
+
+        // And ecdh() used that same key, not one derived from the new
+        // file: Z computed by the handle must equal the reference value
+        // obtained by deriving directly with the pre-rotation secret.
+        let pre = with_secret_file(b"secret-before-rotation", 0o600, |_| read_derivation_secret().unwrap().unwrap());
+        let z_reference = with_tpm_context(|ctx| {
+            let (key, _p, _n) = create_and_verify_primary_with(ctx, service, Some(&pre))?;
+            let encoded = encode_peer_point(&peer)?;
+            let z = ctx
+                .execute_with_nullauth_session(|ctx| ctx.ecdh_z_gen(key, encoded.clone()))
+                .map_err(|e| Error::Provider(e.to_string()));
+            let _ = ctx.flush_context(key.into());
+            let mut out = [0u8; 32];
+            out.copy_from_slice(z?.x().value());
+            Ok(out)
+        })
+        .unwrap();
+        assert_eq!(z_handle, z_reference, "ecdh() must use the snapshot taken at load_kek, not the rotated file");
+    }
+
+    #[test]
+    #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
+    #[serial]
     fn derivation_secret_self_test_reports_a_verdict_when_a_secret_is_configured() {
         // With no secret there is nothing to verify and nothing to cache.
         let verdict = with_no_secret_file(|| with_tpm_context(validate_derivation_secret_is_honored)).unwrap();
@@ -1734,10 +1905,10 @@ mod tests {
         let mut wrong = names[0].clone();
         wrong[2] ^= 0xff;
         let policy_for = |name_hex: &str| {
-            format!("selection:\n  mode: require\n  provider: tpm2\ntpm:\n  session_encryption: required\n  pinned_session_salt_key_name: \"{name_hex}\"\n")
+            format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"required\"\npinned_session_salt_key_name = \"{name_hex}\"\n")
         };
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("policy.yaml");
+        let path = dir.path().join("policy.toml");
 
         crate::secure_file::write_world_readable_for_tests(&path, policy_for(&real));
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
@@ -1787,10 +1958,10 @@ mod tests {
         })
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("policy.yaml");
+        let path = dir.path().join("policy.toml");
         crate::secure_file::write_world_readable_for_tests(
             &path,
-            format!("selection:\n  mode: require\n  provider: tpm2\ntpm:\n  session_encryption: required\n  pinned_session_salt_key_name: \"{real}\"\n"),
+            format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"required\"\npinned_session_salt_key_name = \"{real}\"\n"),
         );
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
         let required = with_tpm_context(session_encryption_enabled).unwrap();
@@ -1833,7 +2004,10 @@ mod tests {
         // to a test. Normalized exactly as the C ABI would normalize it.
         let service = std::env::var("HKDFGUARD_PIN_SERVICE").unwrap_or_else(|_| "com.company.orders".to_string());
         let service = crate::normalize_service(&service);
-        let (_public, name) = with_tpm_context(|ctx| create_and_read_primary(ctx, &service))
+        let (_public, name) = with_tpm_context(|ctx| {
+            let secret = read_derivation_secret()?;
+            create_and_read_primary(ctx, &service, secret.as_ref())
+        })
             .expect("no TPM available, or the service key failed its checks");
         println!("SERVICE={service}");
         println!("SERVICE_KEY_NAME={}", hex(name.value()));
@@ -1843,17 +2017,68 @@ mod tests {
     // HKDFGUARD_POLICY_FILE at it for the duration of `f`.
     fn with_pinned_name<T>(service: &str, name_hex: &str, f: impl FnOnce() -> T) -> T {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("policy.yaml");
+        let path = dir.path().join("policy.toml");
         crate::secure_file::write_world_readable_for_tests(
             &path,
             format!(
-                "selection:\n  mode: require\n  provider: tpm2\ntpm:\n  pinned_names:\n    {service}: \"{name_hex}\"\n"
+                "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm.pinned_names]\n\"{service}\" = \"{name_hex}\"\n"
             ),
         );
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
         let result = f();
         std::env::remove_var("HKDFGUARD_POLICY_FILE");
         result
+    }
+
+    #[test]
+    #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
+    #[serial]
+    fn require_pinned_names_makes_provisioning_a_real_gate() {
+        std::env::set_var("HKDFGUARD_TPM_DERIVATION_SECRET_FILE", "/nonexistent-hkdfguard-tpm-secret-for-tests");
+        let service = "com.company.allowlisted";
+        let allowlist_only = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nrequire_pinned_names = true\n";
+
+        // Unpinned: not provisioned, wrap/unwrap decline softly, and
+        // "create" is refused with the exact Name to pin.
+        let message = with_policy(allowlist_only, || {
+            let provider = Tpm2Provider::new();
+            assert!(provider.probe(), "no TPM available");
+            assert!(!provider.kek_exists(service).unwrap(), "an unpinned service must not exist");
+            assert!(
+                matches!(provider.load_kek(service, false), Err(Error::KeyNotProvisioned(_))),
+                "loading an unpinned service must decline"
+            );
+            match provider.load_kek(service, true) {
+                Err(Error::Provider(msg)) => msg,
+                Err(other) => panic!("expected Provider error with pinning instructions, got {other:?}"),
+                Ok(_) => panic!("creating an unpinned service must be refused"),
+            }
+        });
+
+        // The Name in the message is the one this TPM actually derives.
+        let actual = with_tpm_context(|ctx| {
+            let (_public, name) = create_and_read_primary(ctx, service, None)?;
+            Ok(hex(name.value()))
+        })
+        .unwrap();
+        assert!(
+            message.contains(&format!("\"{service}\" = \"{actual}\"")),
+            "the refusal must carry a paste-ready pin for the real Name; got: {message}"
+        );
+
+        // Pinned (as the operator would, from that message): now it exists,
+        // loads, and works end to end.
+        let pinned = format!("{allowlist_only}[tpm.pinned_names]\n\"{service}\" = \"{actual}\"\n");
+        with_policy(&pinned, || {
+            let provider = Tpm2Provider::new();
+            assert!(provider.kek_exists(service).unwrap(), "a pinned service must exist");
+            let handle = provider.load_kek(service, false).unwrap();
+            let h = crate::crypto::payload_ecdh_point(&[0x42u8; 32]).unwrap();
+            assert_ne!(*handle.ecdh(&h).unwrap(), [0u8; 32]);
+            // Other services are still refused.
+            assert!(!provider.kek_exists("com.company.notpinned").unwrap());
+        });
+        std::env::remove_var("HKDFGUARD_TPM_DERIVATION_SECRET_FILE");
     }
 
     #[test]

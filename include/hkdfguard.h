@@ -53,6 +53,13 @@ extern "C" {
  * hkdfguard_generate_and_wrap_dek both return HKDFGUARD_ERR_KEK_NOT_FOUND
  * if called before this for a given `service`.
  *
+ * TPM2 exception: the TPM derives a KEK for any service on demand, so by
+ * default every service already "exists" there and this call has nothing
+ * to create. With `tpm.require_pinned_names: true` in the policy file, a
+ * service exists on the TPM only if policy pins its Name; for an unpinned
+ * service this call fails and logs (at error level) the exact policy entry
+ * to add. Provisioning on TPM is that root-owned policy edit.
+ *
  * Deliberately slow: this and hkdfguard_kek_exists are setup calls, meant
  * to run once per application startup, and each takes at least
  * `startup_behavior.setup_min_delay_ms` (policy file; default 1000 ms)
@@ -71,7 +78,8 @@ int hkdfguard_create_kek(const char* service);
  * Reports whether a persistent KEK already exists for `service`, without
  * creating one. Subject to the same startup latency floor and
  * serialization as hkdfguard_create_kek above; "exists" and "doesn't
- * exist" take the same time.
+ * exist" take the same time. On TPM2, always 1 when the TPM is reachable
+ * unless policy sets `tpm.require_pinned_names` (see hkdfguard_create_kek).
  *
  * service:  see hkdfguard_wrap_dek below.
  * exists:   out-parameter; on HKDFGUARD_OK, set to 1 if a KEK exists for

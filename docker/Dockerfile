@@ -6,7 +6,15 @@
 # built or tested on the macOS host this crate was originally written on --
 # can be exercised for real. See docker/README.md for usage.
 
-FROM debian:bookworm-slim
+# Pinned by digest so a rebuild never silently picks up a different base
+# image. To take a Debian update, re-resolve deliberately:
+#   docker pull debian:bookworm-slim
+#   docker inspect --format='{{index .RepoDigests 0}}' debian:bookworm-slim
+# apt package versions below are intentionally not pinned: Debian mirrors
+# drop superseded point releases, so exact `pkg=version` pins would make
+# this build start failing on its own. The base digest bounds which
+# package set apt resolves against; Cargo.lock pins the Rust dependencies.
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CARGO_HOME=/usr/local/cargo \
@@ -27,8 +35,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         opensc \
     && rm -rf /var/lib/apt/lists/*
 
+# Toolchain version must match rust-toolchain.toml at the repo root.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-        sh -s -- -y --profile minimal --default-toolchain stable \
+        sh -s -- -y --profile minimal --default-toolchain 1.98.1 \
     && rustup component add clippy
 
 # SoftHSM2 needs a writable config + token directory; the default

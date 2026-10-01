@@ -28,14 +28,16 @@ libc = "0.2"
 # --dek argument; already pulled in transitively by other dependencies, so
 # this adds no new compiled code to the dependency graph.
 base64 = "0.22"
+# Policy file (/etc/hkdfguard/policy.toml) parsing. Parse + deserialize
+# only: this crate never writes TOML.
+serde = { version = "1", features = ["derive"] }
+toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
 
 # Optional hardware-backed provider dependencies. Not enabled by default
 # because they require system libraries (tpm2-tss / a PKCS#11 module) that
 # are not present on every build host. See README.md "Provider build matrix".
 tss-esapi = { version = "7", optional = true }
 cryptoki = { version = "0.6", optional = true }
-serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
 
 [dev-dependencies]
 env_logger = "0.11"

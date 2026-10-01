@@ -23,7 +23,7 @@
 mod crypto; // ECDH -> HKDF -> AES-GCM protocol
 mod error; // internal error type + public status codes
 mod payload; // wrapped-payload wire format
-mod policy; // administrative key-selection policy (/etc/hkdfguard/policy.yaml)
+mod policy; // administrative key-selection policy (/etc/hkdfguard/policy.toml)
 mod provider; // provider trait + selection chain
 mod secure_file; // hardened, check-then-read-safe file access + self-wiping SecretBuffer
 
@@ -735,10 +735,10 @@ mod ffi_tests {
         // policy file that names the providers -- exactly as in production.
         std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-for-tests");
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("policy.yaml");
+        let path = dir.path().join("policy.toml");
         crate::secure_file::write_world_readable_for_tests(
             &path,
-            "selection:\n  mode: prefer\npreferred_order:\n  - ephemeral\nstartup_behavior:\n  setup_min_delay_ms: 80\n",
+            "preferred_order = [\"ephemeral\"]\n[selection]\nmode = \"prefer\"\n[startup_behavior]\nsetup_min_delay_ms = 80\n",
         );
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
 

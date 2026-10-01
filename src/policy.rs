@@ -1,4 +1,4 @@
-//! Linux administrative key-selection policy: `/etc/hkdfguard/policy.yaml`
+//! Linux administrative key-selection policy: `/etc/hkdfguard/policy.toml`
 //! (overridable with `HKDFGUARD_POLICY_FILE`), giving system administrators
 //! control over which KEK providers this crate may use and how the
 //! provider chain is selected -- functionally equivalent to HKDFGuard's
@@ -37,7 +37,7 @@ use std::time::Duration;
 /// Default location of the policy file. Overridable with
 /// `HKDFGUARD_POLICY_FILE` (used by every test in this module and by
 /// deployments that keep configuration elsewhere).
-const DEFAULT_POLICY_FILE: &str = "/etc/hkdfguard/policy.yaml";
+const DEFAULT_POLICY_FILE: &str = "/etc/hkdfguard/policy.toml";
 
 fn policy_file_path() -> PathBuf {
     std::env::var("HKDFGUARD_POLICY_FILE")
@@ -84,7 +84,7 @@ impl ProviderType {
 
     /// The policy-file vocabulary's name for this provider (distinct from
     /// [`Self::as_str`], which is the log-message/legacy form) -- used in
-    /// policy error messages so they read in the same terms the YAML uses.
+    /// policy error messages so they read in the same terms the policy file uses.
     fn policy_name(&self) -> &'static str {
         match self {
             ProviderType::Tpm2 => "tpm2",
@@ -165,6 +165,13 @@ struct TpmPolicy {
     /// self-consistency check, is the part that resists substitution.
     #[serde(default)]
     pinned_names: BTreeMap<String, String>,
+    /// Make `pinned_names` the TPM provider's allowlist: a service with no
+    /// pinned Name is treated as having no KEK (`kek_exists` is false,
+    /// wrap/unwrap decline). Without this, the TPM derives a key for any
+    /// service name on demand, so "provisioning" gates nothing. Default
+    /// `false`, so existing deployments keep working until they pin.
+    #[serde(default)]
+    require_pinned_names: bool,
     /// Whether `TPM2_ECDH_ZGen` runs inside a salted, parameter-encrypted
     /// HMAC session, so the shared secret does not cross the TPM bus in
     /// cleartext. See [`SessionEncryption`].
@@ -173,7 +180,7 @@ struct TpmPolicy {
     /// Expected TPM Name of the key that salts encrypted sessions, as
     /// lowercase hex. Without it, a bus-resident attacker can substitute
     /// their own salt key at `TPM2_ReadPublic` and decrypt the session
-    /// (a full man-in-the-middle), so `session_encryption: required`
+    /// (a full man-in-the-middle), so `session_encryption = "required"`
     /// refuses to load without one. Under `auto` it is optional and its
     /// absence is logged once: passive sniffing is still defeated.
     pinned_session_salt_key_name: Option<String>,
@@ -350,6 +357,7 @@ pub struct Policy {
     preferred_order: Vec<ProviderType>,
     setup_min_delay: Duration,
     require_tpm_derivation_secret: bool,
+    require_tpm_pinned_names: bool,
     /// Normalized service name -> expected TPM Name bytes.
     pinned_tpm_names: BTreeMap<String, Vec<u8>>,
     tpm_session_encryption: SessionEncryption,
@@ -357,12 +365,19 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// Parses and validates a policy document from a string (the YAML
+    /// Parses and validates a policy document from a string (the TOML
     /// text itself, not a path) -- kept separate from file I/O so tests
     /// can exercise every schema/validation rule without touching disk or
     /// environment variables.
-    pub fn from_yaml_str(yaml: &str) -> Result<Policy> {
-        let raw: PolicyFile = serde_yaml::from_str(yaml)
+    ///
+    /// TOML rather than YAML: it has one way to write each value (no
+    /// implicit `off`/`no` booleans, no anchors or aliases to expand), its
+    /// parser is a maintained, Rust-native crate, and a misplaced key is a
+    /// hard error here rather than a silent reinterpretation -- every
+    /// table is `deny_unknown_fields`, so a top-level key written below a
+    /// `[table]` header lands inside that table and is rejected.
+    pub fn from_toml_str(doc: &str) -> Result<Policy> {
+        let raw: PolicyFile = toml::from_str(doc)
             .map_err(|e| Error::Provider(format!("invalid hkdfguard policy: {e}")))?;
         Self::validate(raw)
     }
@@ -498,6 +513,7 @@ impl Policy {
             preferred_order: raw.preferred_order,
             setup_min_delay: Duration::from_millis(setup_min_delay_ms),
             require_tpm_derivation_secret: raw.tpm.require_derivation_secret,
+            require_tpm_pinned_names: raw.tpm.require_pinned_names,
             pinned_tpm_names,
             tpm_session_encryption: raw.tpm.session_encryption,
             pinned_session_salt_key_name,
@@ -525,6 +541,12 @@ impl Policy {
     /// derivation-secret file (`tpm.require_derivation_secret`).
     pub fn require_tpm_derivation_secret(&self) -> bool {
         self.require_tpm_derivation_secret
+    }
+
+    /// Whether the TPM provider treats only pinned services as provisioned
+    /// (`tpm.require_pinned_names`).
+    pub fn require_tpm_pinned_names(&self) -> bool {
+        self.require_tpm_pinned_names
     }
 
     /// The administrator-pinned TPM Name for `service`, if policy sets one.
@@ -654,7 +676,7 @@ pub fn load() -> Option<Result<Policy>> {
         Err(_) => return fail("is not valid UTF-8".to_string()),
     };
 
-    Some(Policy::from_yaml_str(text).map_err(|e| match e {
+    Some(Policy::from_toml_str(text).map_err(|e| match e {
         Error::Provider(msg) => Error::Provider(format!("{} ({})", msg, path.display())),
         other => other,
     }))
@@ -727,6 +749,19 @@ pub(crate) fn pinned_tpm_name(service: &str) -> Result<Option<Vec<u8>>> {
     }
 }
 
+/// Whether the TPM provider only serves services whose Name is pinned
+/// (`tpm.require_pinned_names`). No policy file → `false`. A policy file
+/// that exists but is invalid → `true`: a broken policy must never be what
+/// widens the set of services the TPM will serve.
+#[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
+pub(crate) fn require_tpm_pinned_names() -> bool {
+    match load() {
+        Some(Ok(policy)) => policy.require_tpm_pinned_names(),
+        Some(Err(_)) => true,
+        None => false,
+    }
+}
+
 /// TPM session parameter-encryption mode. No policy file → `Auto`. A
 /// policy file that exists but is invalid → `Required` (fail closed: a
 /// broken policy must never be what turns bus protection off).
@@ -761,10 +796,10 @@ pub(crate) fn pinned_session_salt_key_name() -> Result<Option<Vec<u8>>> {
 #[cfg(test)]
 pub(crate) fn allow_ephemeral_policy_for_tests() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("policy.yaml");
+    let path = dir.path().join("policy.toml");
     crate::secure_file::write_world_readable_for_tests(
         &path,
-        "selection:\n  mode: prefer\npreferred_order:\n  - external-secret\n  - ephemeral\n",
+        "preferred_order = [\"external-secret\", \"ephemeral\"]\n[selection]\nmode = \"prefer\"\n",
     );
     std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
     dir
@@ -786,10 +821,10 @@ pub(crate) fn allow_ephemeral_policy_for_tests() -> tempfile::TempDir {
 #[cfg(test)]
 pub(crate) fn require_provider_policy_for_tests(provider: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("policy.yaml");
+    let path = dir.path().join("policy.toml");
     crate::secure_file::write_world_readable_for_tests(
         &path,
-        format!("selection:\n  mode: require\n  provider: {provider}\n"),
+        format!("[selection]\nmode = \"require\"\nprovider = \"{provider}\"\n"),
     );
     std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
     dir
@@ -822,8 +857,8 @@ mod tests {
 
     #[test]
     fn provider_names_parse_per_policy_vocabulary() {
-        let yaml = "selection:\n  mode: prefer\npreferred_order: [tpm2, pkcs11, external-secret, ephemeral]\n";
-        let policy = Policy::from_yaml_str(yaml).unwrap();
+        let doc = "preferred_order = [\"tpm2\", \"pkcs11\", \"external-secret\", \"ephemeral\"]\n[selection]\nmode = \"prefer\"\n";
+        let policy = Policy::from_toml_str(doc).unwrap();
         assert_eq!(
             policy.preferred_order,
             vec![
@@ -837,16 +872,16 @@ mod tests {
 
     #[test]
     fn unknown_provider_name_is_rejected() {
-        let yaml = "selection:\n  mode: require\n  provider: quantum-vault\n";
-        assert!(Policy::from_yaml_str(yaml).is_err());
+        let doc = "[selection]\nmode = \"require\"\nprovider = \"quantum-vault\"\n";
+        assert!(Policy::from_toml_str(doc).is_err());
     }
 
     // ---- Require mode ----
 
     #[test]
     fn require_tpm_success() {
-        let yaml = "selection:\n  mode: require\n  provider: tpm2\n";
-        let policy = Policy::from_yaml_str(yaml).unwrap();
+        let doc = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n";
+        let policy = Policy::from_toml_str(doc).unwrap();
         let allowed = policy
             .allowed_providers(&compiled(&[ProviderType::Tpm2, ProviderType::ExternalSecret, ProviderType::Ephemeral]))
             .unwrap();
@@ -855,8 +890,8 @@ mod tests {
 
     #[test]
     fn require_tpm_failure_when_not_compiled_in() {
-        let yaml = "selection:\n  mode: require\n  provider: tpm2\n";
-        let policy = Policy::from_yaml_str(yaml).unwrap();
+        let doc = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n";
+        let policy = Policy::from_toml_str(doc).unwrap();
         // TPM2 simply isn't part of this build -- policy must refuse to
         // silently substitute anything else.
         let err = policy
@@ -869,8 +904,8 @@ mod tests {
 
     #[test]
     fn require_hardware_success_via_tpm() {
-        let yaml = "selection:\n  mode: require-level\n  level: hardware\n";
-        let policy = Policy::from_yaml_str(yaml).unwrap();
+        let doc = "[selection]\nmode = \"require-level\"\nlevel = \"hardware\"\n";
+        let policy = Policy::from_toml_str(doc).unwrap();
         let allowed = policy
             .allowed_providers(&compiled(&[ProviderType::Tpm2, ProviderType::ExternalSecret]))
             .unwrap();
@@ -879,8 +914,8 @@ mod tests {
 
     #[test]
     fn require_hardware_success_via_pkcs11() {
-        let yaml = "selection:\n  mode: require-level\n  level: hardware\n";
-        let policy = Policy::from_yaml_str(yaml).unwrap();
+        let doc = "[selection]\nmode = \"require-level\"\nlevel = \"hardware\"\n";
+        let policy = Policy::from_toml_str(doc).unwrap();
         let allowed = policy
             .allowed_providers(&compiled(&[ProviderType::Pkcs11, ProviderType::ExternalSecret]))
             .unwrap();
@@ -889,8 +924,8 @@ mod tests {
 
     #[test]
     fn require_hardware_failure_with_only_external_secret() {
-        let yaml = "selection:\n  mode: require-level\n  level: hardware\n";
-        let policy = Policy::from_yaml_str(yaml).unwrap();
+        let doc = "[selection]\nmode = \"require-level\"\nlevel = \"hardware\"\n";
+        let policy = Policy::from_toml_str(doc).unwrap();
         // Not an Err here (the policy itself is fine) -- an empty allowed
         // list, which is what makes the actual selection chain fail
         // closed downstream.
@@ -902,8 +937,8 @@ mod tests {
 
     #[test]
     fn require_level_accepts_both_hardware_providers_together() {
-        let yaml = "selection:\n  mode: require-level\n  level: hardware\n";
-        let policy = Policy::from_yaml_str(yaml).unwrap();
+        let doc = "[selection]\nmode = \"require-level\"\nlevel = \"hardware\"\n";
+        let policy = Policy::from_toml_str(doc).unwrap();
         let allowed = policy
             .allowed_providers(&compiled(&[
                 ProviderType::Tpm2,
@@ -919,8 +954,8 @@ mod tests {
 
     #[test]
     fn prefer_mode_fallback_ordering() {
-        let yaml = "selection:\n  mode: prefer\npreferred_order:\n  - tpm2\n  - pkcs11\n  - external-secret\n  - ephemeral\n";
-        let policy = Policy::from_yaml_str(yaml).unwrap();
+        let doc = "preferred_order = [\"tpm2\", \"pkcs11\", \"external-secret\", \"ephemeral\"]\n[selection]\nmode = \"prefer\"\n";
+        let policy = Policy::from_toml_str(doc).unwrap();
         // Only ephemeral and external-secret are actually compiled into
         // this build; the allowed order must still reflect
         // preferred_order's relative ordering, not the default
@@ -937,8 +972,8 @@ mod tests {
         // about the fallback-to-compiled-order behavior specifically, kept
         // separate from Ephemeral's own always-excluded-unless-named rule
         // (covered by `ephemeral_disallowed_by_default_even_without_preferred_order`).
-        let yaml = "selection:\n  mode: prefer\n";
-        let policy = Policy::from_yaml_str(yaml).unwrap();
+        let doc = "[selection]\nmode = \"prefer\"\n";
+        let policy = Policy::from_toml_str(doc).unwrap();
         let allowed = policy
             .allowed_providers(&compiled(&[ProviderType::Tpm2, ProviderType::ExternalSecret]))
             .unwrap();
@@ -949,8 +984,8 @@ mod tests {
 
     #[test]
     fn minimum_protection_enforcement() {
-        let yaml = "key_requirements:\n  minimum_protection: external\nselection:\n  mode: prefer\n";
-        let policy = Policy::from_yaml_str(yaml).unwrap();
+        let doc = "[key_requirements]\nminimum_protection = \"external\"\n[selection]\nmode = \"prefer\"\n";
+        let policy = Policy::from_toml_str(doc).unwrap();
         let allowed = policy
             .allowed_providers(&compiled(&[
                 ProviderType::ExternalSecret,
@@ -962,8 +997,8 @@ mod tests {
 
     #[test]
     fn minimum_protection_external_rejects_ephemeral_only_build() {
-        let yaml = "key_requirements:\n  minimum_protection: external\nselection:\n  mode: prefer\n";
-        let policy = Policy::from_yaml_str(yaml).unwrap();
+        let doc = "[key_requirements]\nminimum_protection = \"external\"\n[selection]\nmode = \"prefer\"\n";
+        let policy = Policy::from_toml_str(doc).unwrap();
         let allowed = policy.allowed_providers(&compiled(&[ProviderType::Ephemeral])).unwrap();
         assert_eq!(allowed, Vec::<ProviderType>::new());
     }
@@ -972,8 +1007,8 @@ mod tests {
 
     #[test]
     fn ephemeral_disallowed_by_default() {
-        let yaml = "selection:\n  mode: prefer\n";
-        let policy = Policy::from_yaml_str(yaml).unwrap();
+        let doc = "[selection]\nmode = \"prefer\"\n";
+        let policy = Policy::from_toml_str(doc).unwrap();
         let allowed = policy
             .allowed_providers(&compiled(&[ProviderType::ExternalSecret, ProviderType::Ephemeral]))
             .unwrap();
@@ -982,8 +1017,8 @@ mod tests {
 
     #[test]
     fn ephemeral_allowed_when_explicitly_named() {
-        let yaml = "selection:\n  mode: prefer\npreferred_order:\n  - external-secret\n  - ephemeral\n";
-        let policy = Policy::from_yaml_str(yaml).unwrap();
+        let doc = "preferred_order = [\"external-secret\", \"ephemeral\"]\n[selection]\nmode = \"prefer\"\n";
+        let policy = Policy::from_toml_str(doc).unwrap();
         let allowed = policy
             .allowed_providers(&compiled(&[ProviderType::ExternalSecret, ProviderType::Ephemeral]))
             .unwrap();
@@ -992,14 +1027,14 @@ mod tests {
 
     #[test]
     fn container_policy_accepts_a_positive_max_lifetime() {
-        let yaml = "selection:\n  mode: prefer\ncontainer_policy:\n  max_ephemeral_lifetime_seconds: 3600\n";
-        assert!(Policy::from_yaml_str(yaml).is_ok());
+        let doc = "[selection]\nmode = \"prefer\"\n[container_policy]\nmax_ephemeral_lifetime_seconds = 3600\n";
+        assert!(Policy::from_toml_str(doc).is_ok());
     }
 
     #[test]
     fn container_policy_rejects_zero_max_lifetime() {
-        let yaml = "selection:\n  mode: prefer\ncontainer_policy:\n  max_ephemeral_lifetime_seconds: 0\n";
-        assert!(Policy::from_yaml_str(yaml).is_err());
+        let doc = "[selection]\nmode = \"prefer\"\n[container_policy]\nmax_ephemeral_lifetime_seconds = 0\n";
+        assert!(Policy::from_toml_str(doc).is_err());
     }
 
     #[test]
@@ -1009,8 +1044,8 @@ mod tests {
         // naming it explicitly -- see `Policy::ephemeral_explicitly_listed`),
         // so a policy still written in the old style fails closed instead
         // of silently doing nothing.
-        let yaml = "selection:\n  mode: prefer\ncontainer_policy:\n  allow_ephemeral: true\n";
-        assert!(Policy::from_yaml_str(yaml).is_err());
+        let doc = "[selection]\nmode = \"prefer\"\n[container_policy]\nallow_ephemeral = true\n";
+        assert!(Policy::from_toml_str(doc).is_err());
     }
 
     // ---- Invalid configuration rejection ----
@@ -1019,40 +1054,46 @@ mod tests {
     fn invalid_configuration_rejection() {
         let cases = [
             // require without a provider
-            "selection:\n  mode: require\n",
+            "[selection]\nmode = \"require\"\n",
             // require-level without a level
-            "selection:\n  mode: require-level\n",
+            "[selection]\nmode = \"require-level\"\n",
             // require with a stray level field
-            "selection:\n  mode: require\n  provider: tpm2\n  level: hardware\n",
+            "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\nlevel = \"hardware\"\n",
             // require-level with a stray provider field
-            "selection:\n  mode: require-level\n  level: hardware\n  provider: tpm2\n",
+            "[selection]\nmode = \"require-level\"\nlevel = \"hardware\"\nprovider = \"tpm2\"\n",
             // prefer with a stray provider field
-            "selection:\n  mode: prefer\n  provider: tpm2\n",
+            "[selection]\nmode = \"prefer\"\nprovider = \"tpm2\"\n",
             // unknown selection mode
-            "selection:\n  mode: strongly-suggest\n",
+            "[selection]\nmode = \"strongly-suggest\"\n",
             // unknown top-level field (typo)
-            "selection:\n  mode: prefer\npreferred_ordr:\n  - tpm2\n",
+            "preferred_ordr = [\"tpm2\"]\n[selection]\nmode = \"prefer\"\n",
             // duplicate entries in preferred_order
-            "selection:\n  mode: prefer\npreferred_order:\n  - tpm2\n  - tpm2\n",
+            "preferred_order = [\"tpm2\", \"tpm2\"]\n[selection]\nmode = \"prefer\"\n",
             // the removed allow_ephemeral field (see
             // container_policy_rejects_the_removed_allow_ephemeral_field)
-            "selection:\n  mode: prefer\ncontainer_policy:\n  allow_ephemeral: true\n",
+            "[selection]\nmode = \"prefer\"\n[container_policy]\nallow_ephemeral = true\n",
             // require a provider below the stated minimum protection
-            "key_requirements:\n  minimum_protection: hardware\nselection:\n  mode: require\n  provider: external-secret\n",
-            // not valid YAML at all
-            "not: [valid, yaml",
+            "[key_requirements]\nminimum_protection = \"hardware\"\n[selection]\nmode = \"require\"\nprovider = \"external-secret\"\n",
+            // not valid TOML at all
+            "not = [valid, toml",
+            // a top-level key written below a table header belongs to that
+            // table in TOML -- here `selection.preferred_order` -- and must
+            // be rejected, not silently dropped
+            "[selection]\nmode = \"prefer\"\npreferred_order = [\"tpm2\"]\n",
+            // a duplicate key
+            "[selection]\nmode = \"prefer\"\nmode = \"require\"\n",
             // missing the required `selection` section entirely
-            "key_requirements:\n  minimum_protection: hardware\n",
+            "[key_requirements]\nminimum_protection = \"hardware\"\n",
         ];
-        for (i, yaml) in cases.iter().enumerate() {
-            assert!(Policy::from_yaml_str(yaml).is_err(), "case {i} should have been rejected: {yaml}");
+        for (i, doc) in cases.iter().enumerate() {
+            assert!(Policy::from_toml_str(doc).is_err(), "case {i} should have been rejected: {doc}");
         }
     }
 
     #[test]
     fn require_ephemeral_succeeds_since_naming_it_under_require_is_itself_explicit() {
-        let yaml = "selection:\n  mode: require\n  provider: ephemeral\n";
-        let policy = Policy::from_yaml_str(yaml).unwrap();
+        let doc = "[selection]\nmode = \"require\"\nprovider = \"ephemeral\"\n";
+        let policy = Policy::from_toml_str(doc).unwrap();
         let allowed = policy.allowed_providers(&compiled(&[ProviderType::Ephemeral])).unwrap();
         assert_eq!(allowed, vec![ProviderType::Ephemeral]);
     }
@@ -1063,16 +1104,16 @@ mod tests {
         // every provider -- but Ephemeral itself is still excluded unless
         // separately named in preferred_order, since qualifying by tier
         // is not the same as being explicitly listed.
-        let yaml = "selection:\n  mode: require-level\n  level: ephemeral\n";
-        let policy = Policy::from_yaml_str(yaml).unwrap();
+        let doc = "[selection]\nmode = \"require-level\"\nlevel = \"ephemeral\"\n";
+        let policy = Policy::from_toml_str(doc).unwrap();
         let allowed = policy
             .allowed_providers(&compiled(&[ProviderType::ExternalSecret, ProviderType::Ephemeral]))
             .unwrap();
         assert_eq!(allowed, vec![ProviderType::ExternalSecret]);
 
         // Naming it in preferred_order admits it, same as `prefer` mode.
-        let yaml_named = "selection:\n  mode: require-level\n  level: ephemeral\npreferred_order:\n  - ephemeral\n  - external-secret\n";
-        let policy_named = Policy::from_yaml_str(yaml_named).unwrap();
+        let doc_named = "preferred_order = [\"ephemeral\", \"external-secret\"]\n[selection]\nmode = \"require-level\"\nlevel = \"ephemeral\"\n";
+        let policy_named = Policy::from_toml_str(doc_named).unwrap();
         let allowed_named = policy_named
             .allowed_providers(&compiled(&[ProviderType::ExternalSecret, ProviderType::Ephemeral]))
             .unwrap();
@@ -1083,44 +1124,44 @@ mod tests {
 
     #[test]
     fn setup_min_delay_defaults_to_one_second_when_absent() {
-        let yaml = "selection:\n  mode: require\n  provider: tpm2\n";
-        let policy = Policy::from_yaml_str(yaml).unwrap();
+        let doc = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n";
+        let policy = Policy::from_toml_str(doc).unwrap();
         assert_eq!(policy.setup_min_delay(), Duration::from_millis(DEFAULT_SETUP_MIN_DELAY_MS));
 
         // Also when startup_behavior is present but doesn't mention it.
-        let yaml = "selection:\n  mode: require\n  provider: tpm2\nstartup_behavior:\n  fail_if_requirement_unmet: true\n";
-        let policy = Policy::from_yaml_str(yaml).unwrap();
+        let doc = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[startup_behavior]\nfail_if_requirement_unmet = true\n";
+        let policy = Policy::from_toml_str(doc).unwrap();
         assert_eq!(policy.setup_min_delay(), Duration::from_millis(DEFAULT_SETUP_MIN_DELAY_MS));
     }
 
     #[test]
     fn setup_min_delay_is_read_from_the_policy() {
-        let yaml = "selection:\n  mode: require\n  provider: tpm2\nstartup_behavior:\n  setup_min_delay_ms: 2500\n";
-        let policy = Policy::from_yaml_str(yaml).unwrap();
+        let doc = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[startup_behavior]\nsetup_min_delay_ms = 2500\n";
+        let policy = Policy::from_toml_str(doc).unwrap();
         assert_eq!(policy.setup_min_delay(), Duration::from_millis(2500));
     }
 
     #[test]
     fn setup_min_delay_can_be_disabled_with_zero() {
-        let yaml = "selection:\n  mode: require\n  provider: tpm2\nstartup_behavior:\n  setup_min_delay_ms: 0\n";
-        let policy = Policy::from_yaml_str(yaml).unwrap();
+        let doc = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[startup_behavior]\nsetup_min_delay_ms = 0\n";
+        let policy = Policy::from_toml_str(doc).unwrap();
         assert_eq!(policy.setup_min_delay(), Duration::ZERO);
     }
 
     #[test]
     fn setup_min_delay_above_the_cap_is_rejected() {
-        let yaml = format!(
-            "selection:\n  mode: require\n  provider: tpm2\nstartup_behavior:\n  setup_min_delay_ms: {}\n",
+        let doc = format!(
+            "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[startup_behavior]\nsetup_min_delay_ms = {}\n",
             MAX_SETUP_MIN_DELAY_MS + 1
         );
-        assert!(Policy::from_yaml_str(&yaml).is_err());
+        assert!(Policy::from_toml_str(&doc).is_err());
 
         // ...and the cap itself is still accepted.
-        let yaml = format!(
-            "selection:\n  mode: require\n  provider: tpm2\nstartup_behavior:\n  setup_min_delay_ms: {MAX_SETUP_MIN_DELAY_MS}\n"
+        let doc = format!(
+            "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[startup_behavior]\nsetup_min_delay_ms = {MAX_SETUP_MIN_DELAY_MS}\n"
         );
         assert_eq!(
-            Policy::from_yaml_str(&yaml).unwrap().setup_min_delay(),
+            Policy::from_toml_str(&doc).unwrap().setup_min_delay(),
             Duration::from_millis(MAX_SETUP_MIN_DELAY_MS)
         );
     }
@@ -1128,8 +1169,8 @@ mod tests {
     #[test]
     fn setup_min_delay_rejects_negative_and_non_integer_values() {
         for bad in ["-1", "1.5", "\"1000\"", "fast"] {
-            let yaml = format!("selection:\n  mode: require\n  provider: tpm2\nstartup_behavior:\n  setup_min_delay_ms: {bad}\n");
-            assert!(Policy::from_yaml_str(&yaml).is_err(), "{bad} should not parse as a delay");
+            let doc = format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[startup_behavior]\nsetup_min_delay_ms = {bad}\n");
+            assert!(Policy::from_toml_str(&doc).is_err(), "{bad} should not parse as a delay");
         }
     }
 
@@ -1146,8 +1187,8 @@ mod tests {
     #[serial_test::serial]
     fn setup_min_delay_helper_reads_the_configured_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("policy.yaml");
-        crate::secure_file::write_world_readable_for_tests(&path, "selection:\n  mode: require\n  provider: tpm2\nstartup_behavior:\n  setup_min_delay_ms: 42\n");
+        let path = dir.path().join("policy.toml");
+        crate::secure_file::write_world_readable_for_tests(&path, "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[startup_behavior]\nsetup_min_delay_ms = 42\n");
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
         let delay = setup_min_delay();
         std::env::remove_var("HKDFGUARD_POLICY_FILE");
@@ -1160,8 +1201,8 @@ mod tests {
         // A malformed policy must not become a way to remove the floor
         // (the gated call fails closed on the same policy regardless).
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("policy.yaml");
-        crate::secure_file::write_world_readable_for_tests(&path, "selection:\n  mode: require\nstartup_behavior:\n  setup_min_delay_ms: 0\n");
+        let path = dir.path().join("policy.toml");
+        crate::secure_file::write_world_readable_for_tests(&path, "[selection]\nmode = \"require\"\n[startup_behavior]\nsetup_min_delay_ms = 0\n");
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
         let delay = setup_min_delay();
         std::env::remove_var("HKDFGUARD_POLICY_FILE");
@@ -1174,23 +1215,41 @@ mod tests {
 
     #[test]
     fn tpm_section_defaults_to_no_requirement_and_no_pins() {
-        let policy = Policy::from_yaml_str("selection:\n  mode: require\n  provider: tpm2\n").unwrap();
+        let policy = Policy::from_toml_str("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n").unwrap();
         assert!(!policy.require_tpm_derivation_secret());
+        assert!(!policy.require_tpm_pinned_names(), "the allowlist must be opt-in");
+        assert_eq!(policy.pinned_tpm_name("com.company.orders"), None);
+    }
+
+    #[test]
+    fn tpm_require_pinned_names_is_read() {
+        let doc = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nrequire_pinned_names = true\n";
+        assert!(Policy::from_toml_str(doc).unwrap().require_tpm_pinned_names());
+    }
+
+    #[test]
+    fn require_pinned_names_with_no_pins_is_a_valid_policy() {
+        // The first step of rolling the allowlist out: turn it on, then run
+        // `provision` for each service to learn the Name to pin. Every TPM
+        // service is refused until then, which is the point.
+        let doc = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nrequire_pinned_names = true\n";
+        let policy = Policy::from_toml_str(doc).unwrap();
+        assert!(policy.require_tpm_pinned_names());
         assert_eq!(policy.pinned_tpm_name("com.company.orders"), None);
     }
 
     #[test]
     fn tpm_require_derivation_secret_is_read() {
-        let yaml = "selection:\n  mode: require\n  provider: tpm2\ntpm:\n  require_derivation_secret: true\n";
-        assert!(Policy::from_yaml_str(yaml).unwrap().require_tpm_derivation_secret());
+        let doc = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nrequire_derivation_secret = true\n";
+        assert!(Policy::from_toml_str(doc).unwrap().require_tpm_derivation_secret());
     }
 
     #[test]
     fn pinned_name_is_decoded_and_matched_case_insensitively() {
-        let yaml = format!(
-            "selection:\n  mode: require\n  provider: tpm2\ntpm:\n  pinned_names:\n    com.company.Orders: \"{A_NAME}\"\n"
+        let doc = format!(
+            "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm.pinned_names]\n\"com.company.Orders\" = \"{A_NAME}\"\n"
         );
-        let policy = Policy::from_yaml_str(&yaml).unwrap();
+        let policy = Policy::from_toml_str(&doc).unwrap();
 
         let pinned = policy.pinned_tpm_name("com.company.orders").expect("pin should be present");
         assert_eq!(pinned.len(), SHA256_TPM_NAME_LEN);
@@ -1212,28 +1271,46 @@ mod tests {
             "000b0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021", // one byte too long
             "000b0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2",    // odd length
         ] {
-            let yaml = format!(
-                "selection:\n  mode: require\n  provider: tpm2\ntpm:\n  pinned_names:\n    com.company.orders: \"{bad}\"\n"
+            let doc = format!(
+                "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm.pinned_names]\n\"com.company.orders\" = \"{bad}\"\n"
             );
             assert!(
-                Policy::from_yaml_str(&yaml).is_err(),
+                Policy::from_toml_str(&doc).is_err(),
                 "{bad} must be rejected as a pinned TPM Name"
             );
         }
     }
 
     #[test]
-    fn pinned_names_reject_a_duplicate_after_normalization() {
-        let yaml = format!(
-            "selection:\n  mode: require\n  provider: tpm2\ntpm:\n  pinned_names:\n    com.company.orders: \"{A_NAME}\"\n    com.company.ORDERS: \"{A_NAME}\"\n"
+    fn pinned_names_reject_an_unquoted_dotted_service_name() {
+        // In TOML an unquoted `com.company.orders = ...` is a dotted key --
+        // nested tables `com` -> `company` -> `orders` -- not one key
+        // containing dots. That must fail to parse rather than quietly pin
+        // nothing, which would leave the service unpinned (and, under
+        // require_pinned_names, unprovisioned) with no error to say why.
+        let doc = format!(
+            "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm.pinned_names]\ncom.company.orders = \"{A_NAME}\"\n"
         );
-        assert!(Policy::from_yaml_str(&yaml).is_err(), "two keys differing only in case must be rejected");
+        assert!(Policy::from_toml_str(&doc).is_err(), "an unquoted dotted key must be rejected");
+
+        let quoted = format!(
+            "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm.pinned_names]\n\"com.company.orders\" = \"{A_NAME}\"\n"
+        );
+        assert!(Policy::from_toml_str(&quoted).unwrap().pinned_tpm_name("com.company.orders").is_some());
+    }
+
+    #[test]
+    fn pinned_names_reject_a_duplicate_after_normalization() {
+        let doc = format!(
+            "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm.pinned_names]\n\"com.company.orders\" = \"{A_NAME}\"\n\"com.company.ORDERS\" = \"{A_NAME}\"\n"
+        );
+        assert!(Policy::from_toml_str(&doc).is_err(), "two keys differing only in case must be rejected");
     }
 
     #[test]
     fn unknown_key_in_the_tpm_section_is_rejected() {
-        let yaml = "selection:\n  mode: require\n  provider: tpm2\ntpm:\n  require_drivation_secret: true\n"; // typo
-        assert!(Policy::from_yaml_str(yaml).is_err());
+        let doc = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nrequire_drivation_secret = true\n"; // typo
+        assert!(Policy::from_toml_str(doc).is_err());
     }
 
     #[test]
@@ -1241,9 +1318,11 @@ mod tests {
     fn tpm_helpers_default_permissively_without_a_policy_file() {
         std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
         let required = require_tpm_derivation_secret();
+        let allowlist = require_tpm_pinned_names();
         let pinned = pinned_tpm_name("com.company.orders");
         std::env::remove_var("HKDFGUARD_POLICY_FILE");
         assert!(!required, "no policy must not silently mandate a derivation secret");
+        assert!(!allowlist, "no policy must not silently make the TPM refuse every service");
         assert_eq!(pinned.unwrap(), None);
     }
 
@@ -1254,13 +1333,15 @@ mod tests {
         // control is skipped: requiring becomes true, and pinning errors
         // rather than reporting "nothing pinned".
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("policy.yaml");
-        crate::secure_file::write_world_readable_for_tests(&path, "selection:\n  mode: require\n"); // missing `provider`
+        let path = dir.path().join("policy.toml");
+        crate::secure_file::write_world_readable_for_tests(&path, "[selection]\nmode = \"require\"\n"); // missing `provider`
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
         let required = require_tpm_derivation_secret();
+        let allowlist = require_tpm_pinned_names();
         let pinned = pinned_tpm_name("com.company.orders");
         std::env::remove_var("HKDFGUARD_POLICY_FILE");
         assert!(required, "a broken policy must fail closed to requiring the secret");
+        assert!(allowlist, "a broken policy must fail closed to the allowlist");
         assert!(pinned.is_err(), "a broken policy must not report 'nothing pinned'");
     }
 
@@ -1268,10 +1349,10 @@ mod tests {
     #[serial_test::serial]
     fn tpm_helpers_read_the_configured_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("policy.yaml");
+        let path = dir.path().join("policy.toml");
         crate::secure_file::write_world_readable_for_tests(
             &path,
-            format!("selection:\n  mode: require\n  provider: tpm2\ntpm:\n  require_derivation_secret: true\n  pinned_names:\n    com.company.orders: \"{A_NAME}\"\n"),
+            format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nrequire_derivation_secret = true\n[tpm.pinned_names]\n\"com.company.orders\" = \"{A_NAME}\"\n"),
         );
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
         let required = require_tpm_derivation_secret();
@@ -1299,7 +1380,7 @@ mod tests {
 
     #[test]
     fn session_encryption_defaults_to_auto_with_no_pin() {
-        let policy = Policy::from_yaml_str("selection:\n  mode: require\n  provider: tpm2\n").unwrap();
+        let policy = Policy::from_toml_str("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n").unwrap();
         assert_eq!(policy.tpm_session_encryption(), SessionEncryption::Auto);
         assert_eq!(policy.pinned_session_salt_key_name(), None);
     }
@@ -1310,25 +1391,25 @@ mod tests {
             ("auto", SessionEncryption::Auto),
             ("off", SessionEncryption::Off),
         ] {
-            let yaml = format!("selection:\n  mode: require\n  provider: tpm2\ntpm:\n  session_encryption: {text}\n");
-            assert_eq!(Policy::from_yaml_str(&yaml).unwrap().tpm_session_encryption(), expected, "{text}");
+            let doc = format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"{text}\"\n");
+            assert_eq!(Policy::from_toml_str(&doc).unwrap().tpm_session_encryption(), expected, "{text}");
         }
-        let yaml = "selection:\n  mode: require\n  provider: tpm2\ntpm:\n  session_encryption: sometimes\n";
-        assert!(Policy::from_yaml_str(yaml).is_err(), "unknown mode must be rejected");
+        let doc = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"sometimes\"\n";
+        assert!(Policy::from_toml_str(doc).is_err(), "unknown mode must be rejected");
     }
 
     #[test]
     fn required_session_encryption_needs_a_pinned_salt_key() {
-        let without_pin = "selection:\n  mode: require\n  provider: tpm2\ntpm:\n  session_encryption: required\n";
+        let without_pin = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"required\"\n";
         assert!(
-            Policy::from_yaml_str(without_pin).is_err(),
+            Policy::from_toml_str(without_pin).is_err(),
             "required without a pinned salt key is a MITM-able session and must be refused"
         );
 
         let with_pin = format!(
-            "selection:\n  mode: require\n  provider: tpm2\ntpm:\n  session_encryption: required\n  pinned_session_salt_key_name: \"{A_NAME}\"\n"
+            "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"required\"\npinned_session_salt_key_name = \"{A_NAME}\"\n"
         );
-        let policy = Policy::from_yaml_str(&with_pin).unwrap();
+        let policy = Policy::from_toml_str(&with_pin).unwrap();
         assert_eq!(policy.tpm_session_encryption(), SessionEncryption::Required);
         assert_eq!(policy.pinned_session_salt_key_name().unwrap().len(), SHA256_TPM_NAME_LEN);
     }
@@ -1336,10 +1417,10 @@ mod tests {
     #[test]
     fn pinned_salt_key_name_is_validated_like_other_names() {
         for bad in ["nothex", "000b01"] {
-            let yaml = format!(
-                "selection:\n  mode: require\n  provider: tpm2\ntpm:\n  pinned_session_salt_key_name: \"{bad}\"\n"
+            let doc = format!(
+                "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\npinned_session_salt_key_name = \"{bad}\"\n"
             );
-            assert!(Policy::from_yaml_str(&yaml).is_err(), "{bad} must be rejected");
+            assert!(Policy::from_toml_str(&doc).is_err(), "{bad} must be rejected");
         }
     }
 
@@ -1356,8 +1437,8 @@ mod tests {
 
         // Broken policy: required (never "off"), and pinning errors.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("policy.yaml");
-        crate::secure_file::write_world_readable_for_tests(&path, "selection:\n  mode: require\ntpm:\n  session_encryption: off\n");
+        let path = dir.path().join("policy.toml");
+        crate::secure_file::write_world_readable_for_tests(&path, "[selection]\nmode = \"require\"\n[tpm]\nsession_encryption = \"off\"\n");
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
         let mode = tpm_session_encryption();
         let pin = pinned_session_salt_key_name();
@@ -1380,8 +1461,8 @@ mod tests {
     #[serial_test::serial]
     fn load_reads_and_validates_the_configured_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("policy.yaml");
-        crate::secure_file::write_world_readable_for_tests(&path, "selection:\n  mode: require\n  provider: tpm2\n");
+        let path = dir.path().join("policy.toml");
+        crate::secure_file::write_world_readable_for_tests(&path, "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n");
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
 
         match load() {
@@ -1398,8 +1479,8 @@ mod tests {
     #[serial_test::serial]
     fn load_fails_closed_on_a_malformed_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("policy.yaml");
-        crate::secure_file::write_world_readable_for_tests(&path, "selection:\n  mode: require\n"); // missing required `provider`
+        let path = dir.path().join("policy.toml");
+        crate::secure_file::write_world_readable_for_tests(&path, "[selection]\nmode = \"require\"\n"); // missing required `provider`
         std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
 
         match load() {
@@ -1431,8 +1512,8 @@ mod tests {
         }
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("policy.yaml");
-        std::fs::write(&path, "selection:\n  mode: require\n  provider: tpm2\n").unwrap();
+        let path = dir.path().join("policy.toml");
+        std::fs::write(&path, "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         assert_load_fails_closed(&path, "a present-but-unreadable policy must not disable policy");
     }
@@ -1449,8 +1530,8 @@ mod tests {
     fn load_fails_closed_on_a_group_or_world_writable_file() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("policy.yaml");
-        std::fs::write(&path, "selection:\n  mode: require\n  provider: tpm2\n").unwrap();
+        let path = dir.path().join("policy.toml");
+        std::fs::write(&path, "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n").unwrap();
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
         assert_load_fails_closed(&path, "a group-writable policy must be rejected");
@@ -1463,7 +1544,7 @@ mod tests {
     #[serial_test::serial]
     fn load_fails_closed_on_an_oversized_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("policy.yaml");
+        let path = dir.path().join("policy.toml");
         crate::secure_file::write_world_readable_for_tests(&path, vec![b'#'; MAX_POLICY_FILE_LEN + 1]);
         assert_load_fails_closed(&path, "an oversized policy must be rejected, not truncated");
     }

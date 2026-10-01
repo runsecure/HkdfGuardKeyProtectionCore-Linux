@@ -1,0 +1,14 @@
+# cargo-deny configuration: supply-chain advisory gate.
+#
+# Scope is deliberately narrow -- advisories only, run as
+# `cargo deny check advisories` in CI (.github/workflows/build.yml). License
+# and source-registry policy are a separate decision this project hasn't
+# made yet and aren't enforced here.
+#
+# Fails the build when any crate in Cargo.lock has a RustSec advisory (a
+# vulnerability, or an unmaintained/unsound notice) or a yanked version. An
+# advisory that is reviewed and judged not to apply goes in `ignore` below,
+# by ID, with the reasoning next to it -- never silently.
+[advisories]
+yanked = "deny"
+ignore = []

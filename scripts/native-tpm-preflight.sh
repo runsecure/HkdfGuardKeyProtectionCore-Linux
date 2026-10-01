@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Read-only environment check for testing hkdfguard's TPM2 provider on a
 # native Linux machine with a real TPM (Intel PTT, AMD fTPM, or a discrete
-# part). Reports what it finds, says what `tpm.session_encryption: auto`
+# part). Reports what it finds, says what `tpm.session_encryption = "auto"`
 # will decide on this hardware, and exits non-zero if a hard requirement
 # is missing. Changes nothing.
 #
@@ -86,7 +86,7 @@ if [ -n "$TCTI" ] && command -v tpm2_getcap >/dev/null 2>&1 && [ "$FAILED" -eq 0
         ok "TPM manufacturer: ${MANUFACTURER:-unknown}${vendor:+ ($vendor)}${fw:+, firmware $fw}"
         case "${MANUFACTURER}" in
             INTC|AMD|QCOM)
-                ok "firmware TPM (inside the SoC): no external bus to probe -> 'tpm.session_encryption: auto' will SKIP parameter encryption here"
+                ok "firmware TPM (inside the SoC): no external bus to probe -> 'tpm.session_encryption = \"auto\"' will SKIP parameter encryption here"
                 ;;
             MSFT|IBM|GOOG|VMW)
                 ok "virtual/software TPM: no external bus -> 'auto' will SKIP parameter encryption"
