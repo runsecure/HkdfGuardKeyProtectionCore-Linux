@@ -22,9 +22,14 @@ services:
       dockerfile: docker/Dockerfile.swtpm
     volumes:
       - swtpm-state:/var/lib/swtpm
+    # The test runner reaches swtpm over the compose network; these only
+    # expose it to tools on the host (tpm2-tools, a local test build), and
+    # only on loopback. Neither port has any authentication -- the control port
+    # can power-cycle and reset the TPM -- so never publish them on
+    # 0.0.0.0.
     ports:
-      - "2321:2321" # TPM command port
-      - "2322:2322" # TPM control port
+      - "127.0.0.1:2321:2321" # TPM command port
+      - "127.0.0.1:2322:2322" # TPM control port
     command:
       - socket
       - --tpmstate

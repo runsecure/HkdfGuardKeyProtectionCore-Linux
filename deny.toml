@@ -1,10 +1,14 @@
-# cargo-deny configuration: supply-chain advisory gate.
+# cargo-deny configuration: the supply-chain gate run in CI as
+# `cargo deny check advisories bans sources` (.github/workflows/build.yml).
 #
-# Scope is deliberately narrow -- advisories only, run as
-# `cargo deny check advisories` in CI (.github/workflows/build.yml). License
-# and source-registry policy are a separate decision this project hasn't
-# made yet and aren't enforced here.
-#
+# License policy is a separate decision this project hasn't made yet and
+# isn't enforced here.
+
+# Every feature and every target, so a crate pulled in only by `tpm2` or
+# `pkcs11`, or only on one architecture, is still checked.
+[graph]
+all-features = true
+
 # Fails the build when any crate in Cargo.lock has a RustSec advisory (a
 # vulnerability, or an unmaintained/unsound notice) or a yanked version. An
 # advisory that is reviewed and judged not to apply goes in `ignore` below,
@@ -12,3 +16,26 @@
 [advisories]
 yanked = "deny"
 ignore = []
+
+# A second version of a crate is a second copy of code to audit -- and for
+# the RustCrypto stack, a second implementation of the same primitive. New
+# duplicates fail; the ones below are reviewed, exact-version exceptions,
+# so a bump to either side is looked at again.
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+skip = [
+    # p256 0.13's RustCrypto stack (rand_core 0.6) uses getrandom 0.2;
+    # tss-esapi 7.7 uses 0.4. Both are thin wrappers over getrandom(2).
+    { crate = "getrandom@0.2.17", reason = "rand_core 0.6 (p256 0.13) needs 0.2; tss-esapi 7.7 needs 0.4" },
+    # Proc-macro only: compile-time code, nothing linked into the library.
+    { crate = "syn@2.0.119", reason = "proc-macro deps of tss-esapi (enumflags2, num-derive) and thiserror 1 are on syn 2" },
+]
+
+# Every crate must come from crates.io: no other registry, and no git
+# dependencies, whose contents a lockfile hash doesn't pin to a release.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

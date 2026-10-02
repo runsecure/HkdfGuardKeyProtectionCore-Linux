@@ -15,8 +15,8 @@
 #      and a Sigstore build-provenance attestation (verify with
 #      `gh attestation verify <file> --repo <owner>/<repo>`).
 #
-# A separate, independent job runs `cargo deny check advisories` against
-# Cargo.lock (see deny.toml) as a supply-chain gate.
+# A separate, independent job runs `cargo deny check advisories bans
+# sources` against Cargo.lock (see deny.toml) as a supply-chain gate.
 #
 # On a `v*` tag, a release job attaches both archives (and their checksums)
 # to a GitHub Release.
@@ -42,7 +42,7 @@ concurrency:
 
 jobs:
   supply-chain:
-    name: cargo deny (advisories)
+    name: cargo deny (advisories, bans, sources)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -51,7 +51,7 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
-          command-arguments: advisories
+          command-arguments: advisories bans sources
 
   build:
     name: build (${{ matrix.arch }})
@@ -139,7 +139,11 @@ jobs:
       # The SHA-256 above is integrity ("these bytes are unmodified"); this
       # is authenticity ("these bytes came from this repo's CI"). Verify
       # with: gh attestation verify <file>.tar.gz --repo <owner>/<repo>
+      #
+      # Not on pull requests: a PR build is never published, and a PR from
+      # a fork gets no id-token, so the step could only fail there.
       - name: Attest build provenance
+        if: github.event_name != 'pull_request'
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: ${{ steps.package.outputs.name }}.tar.gz

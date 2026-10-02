@@ -1,2 +1,15 @@
+# Only what the image needs goes into the build context: sources, tests,
+# examples, headers, scripts, and the docker/ files. Build output, VCS and
+# editor state, and anything that could hold a local secret stay out.
 target/
+dist/
+pkg/
 .git/
+.github/
+.idea/
+.vscode/
+*.log
+.env
+.env.*
+*.pem
+*.key

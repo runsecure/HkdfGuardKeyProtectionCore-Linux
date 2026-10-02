@@ -41,10 +41,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         opensc \
     && rm -rf /var/lib/apt/lists/*
 
-# Toolchain version must match rust-toolchain.toml at the repo root.
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-        sh -s -- -y --profile minimal --default-toolchain 1.98.1 \
-    && rustup component add clippy
+# rustup-init is fetched by exact version and checked against a SHA-256
+# pinned here, not piped from sh.rustup.rs into a shell: this image builds
+# the release binaries CI attests, so a compromised download must fail the
+# build rather than end up inside a signed artifact. To update, take the
+# new version's hashes from
+#   https://static.rust-lang.org/rustup/archive/<version>/<target>/rustup-init.sha256
+# and check them against a download of the binary itself. (rustup then
+# verifies each toolchain component against the release manifest's own
+# SHA-256 sums.) The toolchain version must match rust-toolchain.toml at
+# the repo root.
+ARG RUSTUP_VERSION=1.29.1
+RUN set -eu; \
+    case "$(dpkg --print-architecture)" in \
+        amd64) target=x86_64-unknown-linux-gnu;  sha256=dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71 ;; \
+        arm64) target=aarch64-unknown-linux-gnu; sha256=15f6e4ce9f583b929c996c91562bad6d4454f3281de858b02cdfdef615fac433 ;; \
+        *) echo "no pinned rustup-init for $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    curl --proto '=https' --tlsv1.2 -sSfo /tmp/rustup-init \
+        "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${target}/rustup-init"; \
+    echo "${sha256}  /tmp/rustup-init" | sha256sum --check --strict -; \
+    chmod 0755 /tmp/rustup-init; \
+    /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain 1.98.1; \
+    rm /tmp/rustup-init; \
+    rustup component add clippy
 
 # The tests run as `ci`, an unprivileged user in the `tss` group (the
 # group that owns /dev/tpmrm0 on a real host), not as root: as root every
