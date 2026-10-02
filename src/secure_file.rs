@@ -302,6 +302,26 @@ pub(crate) fn private_tempdir() -> tempfile::TempDir {
         .unwrap()
 }
 
+/// Test-only: whether a test that can only run as a non-root user should
+/// skip, because this process is root (every file it creates is
+/// root-owned, and root reads mode-000 files, so there is nothing to
+/// refuse). Set `HKDFGUARD_TESTS_MUST_NOT_RUN_AS_ROOT=1` where the suite is
+/// meant to run unprivileged -- the Docker image does -- and a root run
+/// fails here instead of passing these tests without running them.
+#[cfg(test)]
+pub(crate) fn skip_as_root() -> bool {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return false;
+    }
+    assert!(
+        std::env::var_os("HKDFGUARD_TESTS_MUST_NOT_RUN_AS_ROOT").is_none(),
+        "running as root, but HKDFGUARD_TESTS_MUST_NOT_RUN_AS_ROOT is set: \
+         this test only proves anything as a non-root user"
+    );
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,7 +401,7 @@ mod tests {
 
     #[test]
     fn dir_chain_with_root_owner_refuses_a_user_owned_dir() {
-        if is_root() {
+        if crate::secure_file::skip_as_root() {
             return;
         }
         let base = crate::secure_file::private_tempdir();
@@ -467,7 +487,7 @@ mod tests {
 
     #[test]
     fn root_only_owner_rejects_non_root_file() {
-        if is_root() {
+        if crate::secure_file::skip_as_root() {
             return; // running as root, so any temp file is root-owned; nothing to reject
         }
         let f = temp_file_with(b"x", 0o600);

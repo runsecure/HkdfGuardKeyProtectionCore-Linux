@@ -564,6 +564,12 @@ any file far larger than a wrapped key. The overwrite is best-effort: on
 copy-on-write or log-structured filesystems (btrfs, ZFS) and on flash
 storage, old blocks can survive it.
 
+The key file is written `0600`, owned by whoever runs the command. It is
+ciphertext, but anyone who can read it *and* reach the provider — on a TPM
+host, any member of `tss` — can unwrap it, so nothing beyond its owner is
+granted by default. If the service that reads it runs as a different user,
+run `wrap` as that user, or `chown`/`chmod` the file deliberately.
+
 A `--dek-file` must be a regular file, not a symlink, owned by root or by
 the invoking user, with no group or other access (e.g. `0400`/`0600`) — the
 same rules the library applies to the PKCS#11 PIN and the TPM derivation

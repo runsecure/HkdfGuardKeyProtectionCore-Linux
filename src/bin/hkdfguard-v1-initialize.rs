@@ -86,9 +86,11 @@ use HkdfGuardKeyProtectionLinux::{
     hkdfguard_create_kek, hkdfguard_harden_process, hkdfguard_kek_exists, hkdfguard_wrap_dek, status,
 };
 
-// rw-r-----: readable by the owning deployment user and its group, writable
-// only by the owner, inaccessible to everyone else.
-const KEY_FILE_MODE: u32 = 0o640;
+// rw-------: the owning deployment user only. The payload is ciphertext,
+// but anyone who can both read it and reach the provider (a `tss` group
+// member, on a TPM host) can unwrap it, so group read is not the default.
+// A deployment that wants a group to read it grants that deliberately.
+const KEY_FILE_MODE: u32 = 0o600;
 
 // Number of (all-zero pass, random pass) rounds `secure_delete` runs before
 // removing the file -- 2 passes per round, so this yields 8 total

@@ -56,6 +56,8 @@ services:
     # own swtpm): here we only want the TPM conformance suite, run against
     # the separate `swtpm` service above. The TPM is named in a scratch
     # policy, read by a `--cfg hkdfguard_test_paths` test build.
+    # As the image's unprivileged test user, like entrypoint-test.sh's tests.
+    user: ci
     entrypoint: ["bash", "-lc"]
     command:
       - |

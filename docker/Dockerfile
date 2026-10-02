@@ -46,14 +46,29 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
         sh -s -- -y --profile minimal --default-toolchain 1.98.1 \
     && rustup component add clippy
 
-# SoftHSM2 needs a writable config + token directory; the default
-# /etc/softhsm/softhsm2.conf + /var/lib/softhsm/tokens are root-owned,
-# which is fine since tests run as root in this throwaway container.
-ENV SOFTHSM2_CONF=/etc/softhsm/softhsm2.conf
-RUN mkdir -p /var/lib/softhsm/tokens
+# The tests run as `ci`, an unprivileged user in the `tss` group (the
+# group that owns /dev/tpmrm0 on a real host), not as root: as root every
+# file a test creates is root-owned and every mode-000 file is readable,
+# so the tests that prove root-only config and owner-only secrets are
+# refused would have nothing to refuse. HKDFGUARD_TESTS_MUST_NOT_RUN_AS_ROOT
+# makes those tests fail, rather than skip, if they ever run as root here.
+#
+# The container itself still starts as root: docker/entrypoint-test.sh
+# installs root-owned configuration under /etc/hkdfguard, exactly as a
+# deployment would, and runs everything else as `ci` (setpriv). `ci` owns
+# the source tree, the cargo registry cache, and its own SoftHSM2 token
+# store.
+RUN groupadd --force tss \
+    && useradd --create-home --groups tss ci \
+    && chown -R ci:ci "$CARGO_HOME" \
+    && install -d -o ci -g ci -m 0700 /home/ci/softhsm-tokens \
+    && printf 'directories.tokendir = /home/ci/softhsm-tokens\nobjectstore.backend = file\n' > /etc/softhsm2-ci.conf \
+    && chmod 0644 /etc/softhsm2-ci.conf
+ENV SOFTHSM2_CONF=/etc/softhsm2-ci.conf \
+    HKDFGUARD_TESTS_MUST_NOT_RUN_AS_ROOT=1
 
 WORKDIR /work
-COPY . /work
+COPY --chown=ci:ci . /work
 
 RUN chmod +x docker/entrypoint-test.sh docker/entrypoint-build.sh
 

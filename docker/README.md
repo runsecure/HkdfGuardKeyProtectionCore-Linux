@@ -14,8 +14,14 @@ built, linked, and exercised end-to-end.
 docker/run-tests.sh
 ```
 
-This builds the image and runs [`entrypoint-test.sh`](entrypoint-test.sh),
-which:
+This builds the image and runs [`entrypoint-test.sh`](entrypoint-test.sh).
+The container starts as root only to install root-owned configuration
+under `/etc/hkdfguard` and start `swtpm`; every build, test, and run of
+the library or CLI happens as `ci`, an unprivileged user in the `tss`
+group. That is what makes the ownership checks testable: as root every
+file is root-owned, so there would be nothing to refuse. The image sets
+`HKDFGUARD_TESTS_MUST_NOT_RUN_AS_ROOT=1`, so those tests fail rather than
+skip if they ever run as root. The script:
 
 1. `cargo build` / `cargo test` with the default features (external-secret,
    ephemeral) -- unit tests plus the CLI integration tests

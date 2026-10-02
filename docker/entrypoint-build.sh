@@ -14,14 +14,19 @@ DIST_DIR=/dist
 
 section() { printf '\n\033[1;36m== %s ==\033[0m\n' "$1"; }
 
+# Builds and tests run as the image's unprivileged `ci` user (see
+# docker/Dockerfile); only collecting into the bind-mounted /dist runs as
+# root.
+as_ci() { setpriv --reuid=ci --regid=ci --init-groups env HOME=/home/ci USER=ci LOGNAME=ci "$@"; }
+
 section "cargo test (default features)"
-cargo test
+as_ci cargo test
 
 section "cargo test --all-features (also confirms real link against libtss2-esys + cryptoki)"
-cargo test --all-features
+as_ci cargo test --all-features
 
 section "cargo build --release --all-features"
-cargo build --release --all-features
+as_ci cargo build --release --all-features
 
 section "collecting release artifacts into $DIST_DIR"
 mkdir -p "$DIST_DIR"

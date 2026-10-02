@@ -751,8 +751,7 @@ mod tests {
 
     #[test]
     fn module_path_owned_by_non_root_is_rejected() {
-        // SAFETY: geteuid has no preconditions.
-        if unsafe { libc::geteuid() } == 0 {
+        if crate::secure_file::skip_as_root() {
             return; // as root, any temp file is root-owned, so there's nothing to reject
         }
         let f = pin_file(b"not really a module", 0o755);

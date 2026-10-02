@@ -1895,8 +1895,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn load_fails_closed_on_an_unreadable_file() {
-        // SAFETY: geteuid has no preconditions.
-        if unsafe { libc::geteuid() } == 0 {
+        if crate::secure_file::skip_as_root() {
             return; // root can read a mode-000 file, so this scenario can't be set up
         }
         use std::os::unix::fs::PermissionsExt;

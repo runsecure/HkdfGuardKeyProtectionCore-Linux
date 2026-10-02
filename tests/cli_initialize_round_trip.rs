@@ -170,7 +170,7 @@ fn cli_provision_then_wrap_unwraps_to_original_input() {
 
         let wrapped = fs::read(&key_path).expect("wrapped key file should exist");
         let mode = fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o640, "wrapped key file must be written with mode 0640");
+        assert_eq!(mode, 0o600, "wrapped key file must be written owner-only (0600)");
 
         let (rc, recovered) = unwrap_via_library("com.example.orders", &wrapped);
         assert_eq!(rc, status::OK, "hkdfguard_unwrap_dek failed with status {rc}");

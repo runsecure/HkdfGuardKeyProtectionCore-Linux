@@ -6,7 +6,9 @@
 #
 #   scripts/native-tpm-test.sh                 full matrix (default)
 #   scripts/native-tpm-test.sh reboot capture  wrap a DEK on the TPM, save state, then reboot the machine
-#   scripts/native-tpm-test.sh reboot verify   after the reboot: the same KEK must re-derive and unwrap it
+#   scripts/native-tpm-test.sh reboot verify   after the reboot: the same KEK must re-derive and unwrap it,
+#                                              then delete the saved state
+#   scripts/native-tpm-test.sh reboot clean    delete the saved state without verifying
 #
 # What it does, in order:
 #   1. Preflight (scripts/native-tpm-preflight.sh).
@@ -39,10 +41,15 @@
 # (target/test-paths) so it never mixes with an ordinary build. Nothing that
 # ships is ever built with that flag.
 #
-# Nothing under /etc/hkdfguard is read or written: every policy and secret
-# file this script uses lives in a temp dir it removes on exit, and the
-# TPM is only ever asked to derive transient primaries (flushed after
-# use). It leaves no state on the TPM.
+# Nothing under /etc/hkdfguard is read or written, and the TPM is only ever
+# asked to derive transient primaries (flushed after use), so nothing is
+# left on the TPM. A full run keeps every policy and secret file in a temp
+# dir it removes on exit. `reboot` cannot: what it captures must survive
+# the reboot, so `reboot capture` saves a derivation secret, a plaintext
+# test DEK, and its wrapped copy in the state dir (below) -- together
+# enough to re-derive that test service's key on this TPM. `reboot verify`
+# deletes them once it passes (it keeps them on failure, so it can be
+# rerun), and `reboot clean` deletes them without verifying.
 #
 # Options (read by this script; the library reads none of them):
 #   HKDFGUARD_TCTI               override the TCTI (default from preflight)
@@ -160,6 +167,33 @@ if [ "$MODE" = "reboot" ]; then
     SECRET="${SECRET:-$STATE/tpm.derivation-secret}"
     use_policy $'[selection]\nmode = "require"\nprovider = "tpm2"'
 
+    # Deletes exactly the files capture writes -- never anything else in
+    # the state dir, which HKDFGUARD_NATIVE_TEST_STATE may point anywhere
+    # -- then the dir itself if that left it empty. A derivation secret
+    # the caller supplied (HKDFGUARD_TPM_DERIVATION_SECRET_FILE) is theirs
+    # and is left alone.
+    STATE_FILES=(dek.bin wrapped.key service-name.hex tpm.derivation-secret)
+    remove_state() {
+        [ -d "$STATE" ] || { note "no saved state in $STATE"; return 0; }
+        local f
+        for f in "${STATE_FILES[@]}"; do
+            f="$STATE/$f"
+            [ -f "$f" ] && [ ! -L "$f" ] || continue
+            # Best effort: overwriting in place means little on SSDs and
+            # copy-on-write filesystems, but costs nothing elsewhere.
+            shred --zero "$f" 2>/dev/null || true
+            rm -f "$f"
+        done
+        note "deleted the saved state files in $STATE"
+        rmdir "$STATE" 2>/dev/null || note "left $STATE itself in place: it holds files this script did not create"
+    }
+
+    if [ "$PHASE" = "clean" ]; then
+        section "reboot clean"
+        remove_state
+        exit 0
+    fi
+
     section "build (--features tpm2)"
     cargo build --features tpm2
     build_c examples/cli_unwrap_check.c "$WORK/cli_unwrap_check"
@@ -181,6 +215,7 @@ if [ "$MODE" = "reboot" ]; then
             note "service key Name: $(cat "$STATE/service-name.hex")"
             note "wrapped DEK saved. Now REBOOT this machine, then run: scripts/native-tpm-test.sh reboot verify"
             note "derivation secret: $SECRET -- verify must use the same one"
+            note "this state stays in $STATE until 'reboot verify' passes or you run 'reboot clean'"
             exit 0
             ;;
         verify)
@@ -197,15 +232,16 @@ if [ "$MODE" = "reboot" ]; then
             note "service key Name identical across reboot: $after"
             LD_LIBRARY_PATH="$BIN" "$WORK/cli_unwrap_check" "$STATE/wrapped.key" "$SERVICE" "$STATE/dek.bin"
             echo "PASS: the DEK wrapped before the reboot unwraps under the re-derived TPM KEK"
+            remove_state
             exit 0
             ;;
         *)
-            echo "usage: $0 reboot capture|verify" >&2; exit 2
+            echo "usage: $0 reboot capture|verify|clean" >&2; exit 2
             ;;
     esac
 fi
 
-[ "$MODE" = "full" ] || { echo "usage: $0 [full | reboot capture|verify]" >&2; exit 2; }
+[ "$MODE" = "full" ] || { echo "usage: $0 [full | reboot capture|verify|clean]" >&2; exit 2; }
 
 # ---------------------------------------------------------------------
 # 2-3. Build + unit tests
