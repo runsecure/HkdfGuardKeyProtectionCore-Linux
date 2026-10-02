@@ -244,6 +244,29 @@ fn allowed_types() -> Result<Vec<ProviderType>> {
 /// warning is logged once per process rather than on every wrap call.
 static EPHEMERAL_WARNED: OnceLock<()> = OnceLock::new(); // `set()` succeeds exactly once per process; later calls fail harmlessly
 
+/// Warnings already logged by [`warn_once`], by their exact text.
+static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Logs `message` at warn level the first time this process sees it, and
+/// never again. For events that are worth an operator's attention but
+/// would repeat on every call -- a fallback, a migration hint -- so the
+/// log shows each distinct one once instead of flooding. Messages never
+/// carry a service name (see the C ABI's "(redacted)" lines), so this is
+/// bounded by the number of provider combinations, not of services.
+fn warn_once(message: String) {
+    let mut warned = WARNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !warned.contains(&message) {
+        log::warn!("{message}");
+        warned.push(message);
+    }
+}
+
+/// Test-only: forget which warnings were logged, so a test can see its own.
+#[cfg(test)]
+fn reset_warn_once() {
+    WARNED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+}
+
 /// Shared walk behind [`create_kek`] and [`select_existing`]: for each
 /// policy-allowed type in priority order, constructs that one provider
 /// (see [`construct_provider`]), probes it, and calls
@@ -269,6 +292,9 @@ fn walk_chain(
     create_if_missing: bool,
     not_found_err: Error,
 ) -> Result<(Arc<dyn KekProvider>, Box<dyn KekHandle>)> {
+    // Every provider this call passed over, and why: if a later one serves
+    // the call, an operator should know a preferred one didn't.
+    let mut passed_over: Vec<String> = Vec::new();
     for provider_type in allowed_types()? {
         // priority order, per the configured policy (or the default compiled-in order)
         let Some(provider) = construct_provider(provider_type) else {
@@ -276,12 +302,22 @@ fn walk_chain(
         };
         if !provider.probe() {
             log::debug!("hkdfguard: provider {} not present, trying next", provider_type.as_str());
+            passed_over.push(format!("{}: not present", provider_type.as_str()));
             continue;
         }
 
         match provider.load_kek(service, create_if_missing) {
             Ok(handle) => {
                 log::debug!("hkdfguard: using provider {} for this call", provider_type.as_str());
+                if !passed_over.is_empty() {
+                    warn_once(format!(
+                        "hkdfguard: {} is serving calls in place of a provider earlier in the policy order ({}); \
+                         if that isn't intended, make the earlier provider available, or take it out of \
+                         preferred_order (logged once per process)",
+                        provider_type.as_str(),
+                        passed_over.join("; ")
+                    ));
+                }
                 if matches!(provider_type, ProviderType::Ephemeral) && EPHEMERAL_WARNED.set(()).is_ok() {
                     // `.set()` only returns Ok the first time; subsequent calls see it already set
                     log::warn!(
@@ -297,6 +333,7 @@ fn walk_chain(
                     "hkdfguard: provider {} has no key for this service ({msg}), trying next",
                     provider_type.as_str()
                 );
+                passed_over.push(format!("{}: {msg}", provider_type.as_str()));
             }
             Err(e) => return Err(attribute(provider_type, e)),
         }
@@ -374,9 +411,10 @@ pub fn kek_exists(service: &str) -> Result<bool> {
 /// produced, matching how disabling a TLS cipher suite stops it being used
 /// for new and resumed connections alike.
 ///
-/// Also logs a (debug-level) migration hint if `provider_type` isn't the
-/// policy's first choice, so operators can see when it's time to re-wrap
-/// DEKs onto a stronger provider. "First choice" here is by policy order,
+/// Also logs a migration hint -- a warning, once per process for each pair
+/// of providers -- if `provider_type` isn't the policy's first choice, so
+/// operators can see DEKs still held under a provider they no longer
+/// prefer. "First choice" here is by policy order,
 /// not by probing what's reachable -- probing would mean constructing (and
 /// connecting to) every stronger provider on every unwrap purely to decide
 /// whether to log a hint.
@@ -388,12 +426,13 @@ pub fn get_by_type(provider_type: ProviderType) -> Result<Arc<dyn KekProvider>> 
     if let Some(&preferred) = allowed.first() {
         if preferred != provider_type {
             // the DEK was wrapped under a different (usually weaker) provider than what policy prefers today
-            log::debug!(
-                "hkdfguard: migration event - DEK was wrapped with {} but {} is now the \
-                 policy-preferred provider; consider re-wrapping",
+            warn_once(format!(
+                "hkdfguard: unwrapping a DEK wrapped under {}, but policy now prefers {}; \
+                 DEKs wrapped from now on go to the preferred provider when it is available \
+                 (logged once per process)",
                 provider_type.as_str(),
                 preferred.as_str()
-            );
+            ));
         }
     }
     construct_provider(provider_type).ok_or(Error::NoProviderAvailable)
@@ -816,6 +855,33 @@ mod tests {
 
             assert_eq!(lines.len(), 1, "the failure must be logged exactly once, got: {lines:#?}");
             assert!(lines[0].contains("EXTERNAL_SECRET"), "the one line must still name the provider: {}", lines[0]);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn serving_from_a_later_provider_is_a_warning_logged_once() {
+        #[cfg(all(feature = "external-secret", feature = "ephemeral"))]
+        {
+            // External-secret is first and present, but has no key for this
+            // service, so Ephemeral serves it: the call succeeds, and an
+            // operator must still be told -- once, not on every call.
+            let empty_mount = crate::secure_file::private_tempdir();
+            let _mount = crate::policy::test_support::secret_mount(empty_mount.path());
+            let _policy = crate::policy::allow_ephemeral_policy_for_tests(); // external-secret, then ephemeral
+            reset_warn_once();
+
+            let lines = logged_lines_containing("in place of a provider earlier", || {
+                for _ in 0..3 {
+                    let (provider, _handle) = create_kek("com.company.fallbackwarn")
+                        .unwrap_or_else(|e| panic!("ephemeral should serve the call: {e}"));
+                    assert_eq!(provider.provider_type(), ProviderType::Ephemeral);
+                }
+            });
+            assert_eq!(lines.len(), 1, "logged once per process, not per call: {lines:#?}");
+            assert!(lines[0].contains("EPHEMERAL"), "names the provider that served the call: {}", lines[0]);
+            assert!(lines[0].contains("EXTERNAL_SECRET: "), "says what was passed over, and why: {}", lines[0]);
+            assert!(!lines[0].contains("fallbackwarn"), "never names the service: {}", lines[0]);
         }
     }
 

@@ -722,7 +722,8 @@ mod ffi_tests {
     #[serial]
     fn setup_floor_applies_equally_to_a_missing_kek() {
         // The floor is on latency, not on success: "doesn't exist" must
-        // cost the same as "exists", or kek_exists is a fast oracle.
+        // cost the same as "exists", or a failing kek_exists would be a
+        // cheap way around the floor's limit on provider load.
         with_isolated_ephemeral_provider(|| {
             with_setup_delay(Some(Duration::from_millis(50)), || {
                 let service = CString::new("com.company.nevercreated.setupfloor").unwrap();

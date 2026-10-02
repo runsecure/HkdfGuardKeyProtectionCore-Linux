@@ -882,11 +882,13 @@ pub fn load() -> Option<Result<Policy>> {
 /// notice and buys several things at once: it bounds how fast a buggy or
 /// hot-looping caller can drive the TPM/HSM (each call is a fresh
 /// connection plus a key derivation -- see `provider::construct_provider`),
-/// bounds Ephemeral key-map growth to one entry per second, and turns the
-/// two enumeration oracles (`kek_exists` for "which services have a key",
-/// and by extension the fingerprint pre-check) into something impractical
-/// at scale. It's a floor on *latency*, not just spacing between calls, so
-/// "exists" and "doesn't exist" take the same time as well.
+/// and bounds Ephemeral key-map growth to one entry per second. It's a
+/// floor on *latency*, not just spacing between calls, so "exists" and
+/// "doesn't exist" take the same time as well. It is not a secrecy
+/// control: `wrap` is ungated (it's the hot path) and reports
+/// `KEK_NOT_FOUND` immediately, so whether a service has a key is never
+/// hidden from anything that can call the library -- service names are
+/// public identifiers.
 ///
 /// A policy file that exists but is invalid still yields the default here
 /// -- the call that's being gated is about to fail closed on that same

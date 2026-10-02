@@ -192,11 +192,16 @@ per application startup, so each takes **at least one second** of
 wall-clock time whatever its outcome (found, not found, or error), and
 they are serialized with each other across threads. This bounds how fast
 a buggy or hot-looping caller can drive the TPM/HSM (every call is a
-fresh connection plus a key derivation), caps Ephemeral key-map growth,
-and makes `kek_exists` useless as a fast "which services have a key"
-oracle. Argument errors (bad pointer, invalid service name) still return
+fresh connection plus a key derivation) and caps Ephemeral key-map growth.
+Argument errors (bad pointer, invalid service name) still return
 immediately since they never reach a provider. The library logs a warning
 once a process has made more than 10 setup calls.
+
+The floor is about load, not secrecy. It does not hide which services
+have a key: `hkdfguard_wrap_dek` is not rate-limited — it is the hot path
+— and answers `KEK_NOT_FOUND` (`-3`) at once for a service with none, so
+anything that can call the library can find out quickly. Treat service
+names as public identifiers, never as secrets.
 
 The floor is set by the policy file and can be tuned per host (up to
 60 000 ms; `0` disables it):
