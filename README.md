@@ -183,7 +183,7 @@ delete it to switch policy off. Only a *missing* file in a trusted
 directory means "no policy"; a file that exists but is unreadable, too
 broadly writable, wrongly owned, or malformed -- or one in a directory
 someone untrusted could change -- makes every operation fail closed.
-(Debug builds also accept the process's own user, for tests.)
+(Only test builds -- see "Testing against scratch configuration" -- also accept the process's own user.)
 
 ### Setup calls are deliberately slow
 
@@ -575,32 +575,59 @@ secret. One trailing newline is ignored on both paths.
 
 ## Configuration
 
-In release builds every security setting -- which policy, which TPM, which
-derivation secret, which secret mount, which PKCS#11 module, token and PIN
-file -- comes only from root-owned configuration: the policy file at
-`/etc/hkdfguard/policy.toml` (see "Policy file reference"), or a built-in
-default. The environment variables below are **debug builds only**. They
-exist so tests and development can point at scratch files, simulators and
-SoftHSM2; a release build that sees one set ignores it and logs a warning.
-The environment is often set by lower-trust configuration than
-`/etc/hkdfguard` (a unit drop-in, a pod spec), and must not be able to
-redirect these. Release is the only supported shipping profile.
+Every setting -- which TPM, which derivation secret, which secret mount,
+which PKCS#11 module, token and PIN file -- comes from one root-owned file,
+the policy at `/etc/hkdfguard/policy.toml` (see "Policy file reference"), or
+a built-in default. Nothing in the environment can redirect any of it, in
+any build that ships -- release or debug. The environment is often set by
+lower-trust configuration than `/etc/hkdfguard` (a unit drop-in, a pod
+spec), and whoever picks the TPM picks who knows its seed. A build that
+finds `HKDFGUARD_POLICY_FILE` set ignores it and logs a warning.
 
-| Env var | Used by | Purpose |
-|---|---|---|
-| `HKDFGUARD_EXTERNAL_SECRET_DIR` | External Secret | **Debug builds only**, when the policy sets no `external_secret.dir`. Release builds use `external_secret.dir`, or else the first of `/var/run/secrets/hkdfguard`, `/run/secrets/hkdfguard`, `/vault/secrets/hkdfguard`, `/mnt/secrets-store/hkdfguard` that exists. |
-| `HKDFGUARD_PKCS11_MODULE` | PKCS#11 | **Debug builds only**, when the policy sets no `pkcs11.module`; debug builds also fall back to common SoftHSM2 install paths. **Release builds use PKCS#11 only when `pkcs11.module` is set**: SoftHSM2 is a software token and must not be picked up, and counted as hardware, just for being installed. |
-| `HKDFGUARD_PKCS11_SLOT` | PKCS#11 | **Debug builds only.** Token index among initialized tokens. Release builds select by `pkcs11.token_label` / `token_serial`, or require exactly one initialized token -- slot numbers aren't stable across reboots or hot-plugging. |
-| `HKDFGUARD_PKCS11_PIN_FILE` | PKCS#11 | **Debug builds only**, when the policy sets no `pkcs11.pin_file`. Release builds use `pkcs11.pin_file`, or `/etc/hkdfguard/pkcs11.pin`. The retired `HKDFGUARD_PKCS11_PIN` is ignored, with a warning: a PIN is never read from the environment. |
-| `HKDFGUARD_POLICY_FILE` | Policy | **Debug builds only.** Read a different policy file. Release builds always read `/etc/hkdfguard/policy.toml`. |
-| `HKDFGUARD_TPM_DERIVATION_SECRET_FILE` | TPM2 | **Debug builds only.** Read the TPM derivation secret from a different path. Release builds always read `/etc/hkdfguard/tpm.derivation-secret`, which must be owned by root, with no access for others and at most group read (`0400`, or `0440` with the service's group), and must not be a symlink. See "Hardening the TPM key" above. |
-| `TPM2TOOLS_TCTI` / `TCTI` / `TEST_TCTI` | TPM2 | **Debug builds only**, and only when the policy sets no `tpm.tcti`. Standard `tpm2-tools`-style TCTI selector (e.g. `swtpm:host=localhost,port=2321`). Release builds use `tpm.tcti` from the policy, or `device:/dev/tpmrm0`. |
-| `TSS2_LOG` | TPM2 (read by tpm2-tss) | tpm2-tss's own log level. If it sets `debug` or `trace` for any module, the TPM provider **refuses to run**: at those levels tpm2-tss logs raw TPM commands and responses (including ECDH shared secrets), session keys, and plaintext parameters, and `TSS2_LOGFILE` can send that to any path. `info` and below are fine. |
+The only environment variable the library acts on:
+
+| Env var | Purpose |
+|---|---|
+| `TSS2_LOG` | tpm2-tss's own log level. If it sets `debug` or `trace` for any module, the TPM provider **refuses to run**: at those levels tpm2-tss logs raw TPM commands and responses (including ECDH shared secrets), session keys, and plaintext parameters, and `TSS2_LOGFILE` can send that to any path. `info` and below are fine. |
+
+### Testing against scratch configuration
+
+Tests need their own policies, pointing at simulators, scratch secrets and
+SoftHSM2. They get them without anything being redirectable in a real
+build:
+
+- **This crate's unit tests** use `policy::test_support::TestPolicy`, which
+  exists only under `cfg(test)`. Each test writes its own policy into a
+  private temp directory -- layered over the harness's, below -- and the
+  library reads it through exactly the production path (ownership,
+  location, and parse checks included). It is removed when the test ends.
+  With no harness policy, unit tests read *no* policy, so a real
+  `/etc/hkdfguard` on the machine never leaks in.
+- **Everything run as a separate process** -- the CLI's own tests, the
+  integration tests, the C examples -- uses a library built with
+  `RUSTFLAGS="--cfg hkdfguard_test_paths"`. Only such a build reads
+  `HKDFGUARD_POLICY_FILE` (and accepts config owned by the invoking user
+  rather than root), and it says so in its log. No ordinary build setting
+  -- a cargo feature, a profile, `--all-features` -- can turn it on, and
+  nothing that ships is built with it. Without it, the tests that need it
+  are reported as ignored, naming the flag.
+
+`scripts/native-tpm-test.sh`, `docker/entrypoint-test.sh` and CI build these
+into `target/test-paths`, write a harness policy naming the TPM, a scratch
+derivation secret and the SoftHSM2 token, and point
+`HKDFGUARD_POLICY_FILE` at it. To do the same by hand:
+
+```sh
+RUSTFLAGS="--cfg hkdfguard_test_paths" CARGO_TARGET_DIR=target/test-paths \
+  HKDFGUARD_POLICY_FILE=/path/to/scratch-policy.toml \
+  cargo test --features tpm2 -- --ignored --test-threads=1
+```
 
 Secrets are never read from environment variables (`/proc/<pid>/environ`
 is readable by same-user processes and inherited by children); every
-secret above is a file path, and every such file is checked on the opened
-descriptor for ownership, mode, and type before its contents are trusted.
+secret is a file named in the policy, and every such file is checked on the
+opened descriptor for ownership, mode, and type before its contents are
+trusted.
 
 ### Policy file reference
 
@@ -643,6 +670,7 @@ require_pinned_names = false        # true: only services in pinned_names exist 
 session_encryption = "auto"         # auto | required | off  (see "Session parameter encryption")
 pinned_session_salt_key_name = "000b<64 hex>"   # mandatory under `required`
 tcti = "device:/dev/tpmrm0"         # which TPM: device:<path> | tabrmd:<conf> | mssim:<conf> | swtpm:<conf>
+derivation_secret_file = "/etc/hkdfguard/tpm.derivation-secret"  # absolute path; root-owned, 0400 (or 0440 with the service's group)
 
 [tpm.pinned_names]                  # per-service expected TPM Name; refuse any other key
 "com.company.orders" = "000b<64 hex>"
@@ -652,7 +680,7 @@ dir = "/var/run/secrets/hkdfguard"  # where <service> KEK files live; when set, 
                                     # (default: first existing of the four conventional mounts)
 
 [pkcs11]
-module = "/usr/lib/vendor/libhsm-pkcs11.so"   # required for PKCS#11 in release builds; root-owned
+module = "/usr/lib/vendor/libhsm-pkcs11.so"   # PKCS#11 is used only when this is set (no default search); root-owned
 pin_file = "/etc/hkdfguard/pkcs11.pin"        # root-owned 0400, or 0440 with the service's group; this is the default
 token_label = "hkdfguard-prod"      # choose the token by label and/or serial; exactly one must match.
 token_serial = "0123456789abcdef"   # with neither, exactly one initialized token must be present
@@ -748,7 +776,7 @@ its default.
   discipline (`src/secure_file.rs`): open, then `fstat` the descriptor for
   regular-file type, ownership, and mode, so nothing can be swapped between
   the check and the read. The policy, PIN, and derivation secret must be
-  root-owned in release builds, in directories only root can change, so
+  root-owned (in every build but the test ones), in directories only root can change, so
   the service's own uid can't rewrite (or delete) them. Secret contents are read into a single fixed
   allocation that is never grown (so no partially-filled buffer is ever
   freed un-wiped) and zeroed on every exit path.

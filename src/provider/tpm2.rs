@@ -105,9 +105,8 @@ use tss_esapi::{Context, TctiNameConf}; // the ESAPI connection handle and its c
 // wrapped before the secret was provisioned will fail their fingerprint
 // check (status -16) rather than decrypt to garbage. See README.
 
-/// Location of the TPM derivation secret. Debug builds may redirect it with
-/// `HKDFGUARD_TPM_DERIVATION_SECRET_FILE`; release builds read only this
-/// path (see [`crate::debug_only_env`]).
+/// Location of the TPM derivation secret when the policy names none
+/// (`tpm.derivation_secret_file`).
 const DEFAULT_DERIVATION_SECRET_FILE: &str = "/etc/hkdfguard/tpm.derivation-secret";
 
 /// Upper bound on the derivation-secret file's size. It only ever gets
@@ -118,52 +117,37 @@ const MAX_DERIVATION_SECRET_LEN: usize = 4096;
 /// other use of the same file's contents.
 const DERIVATION_SECRET_DOMAIN: &[u8] = b"hkdfguard-tpm2-derivation-secret-v1:";
 
-fn derivation_secret_path() -> PathBuf {
-    crate::debug_only_env("HKDFGUARD_TPM_DERIVATION_SECRET_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_DERIVATION_SECRET_FILE))
+/// `tpm.derivation_secret_file` from policy, else the default. `Err` on a
+/// policy that exists but can't be trusted.
+fn derivation_secret_path() -> Result<PathBuf> {
+    Ok(crate::policy::tpm_derivation_secret_file()?.unwrap_or_else(|| PathBuf::from(DEFAULT_DERIVATION_SECRET_FILE)))
 }
 
 fn derivation_secret_is_missing() -> bool {
-    matches!(std::fs::symlink_metadata(derivation_secret_path()), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    matches!(derivation_secret_path().map(std::fs::symlink_metadata), Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound)
 }
 
-/// The TCTI used when neither policy nor (in debug builds) the environment
-/// names one: the kernel's TPM resource manager.
+/// The TCTI used when the policy names none: the kernel's TPM resource
+/// manager.
 const DEFAULT_TCTI: &str = "device:/dev/tpmrm0";
 
-/// Which TPM to open, in order: `tpm.tcti` from the root-owned policy; in
-/// debug builds only, the tpm2-tools variables (`TPM2TOOLS_TCTI`, `TCTI`,
-/// `TEST_TCTI`, first set wins) so tests can reach swtpm; otherwise
-/// [`DEFAULT_TCTI`]. Release builds never take the TCTI from the
-/// environment: whoever chooses the TPM chooses who knows its seed.
+/// Whether the policy names a TCTI, rather than leaving [`DEFAULT_TCTI`] --
+/// i.e. whether someone pointed this process at a particular TPM on purpose.
+fn tcti_is_explicit() -> bool {
+    matches!(crate::policy::tpm_tcti(), Ok(Some(_)))
+}
+
+/// Which TPM to open: `tpm.tcti` from the root-owned policy, else
+/// [`DEFAULT_TCTI`]. Never the environment: whoever chooses the TPM
+/// chooses who knows its seed.
 ///
 /// A policy TCTI that can't be parsed, or a policy file that can't be
 /// trusted, is an error -- the TPM is then unavailable rather than opened
 /// at a default the administrator may have meant to avoid.
-/// Whether the TCTI came from policy or (debug builds) the environment,
-/// rather than being [`DEFAULT_TCTI`] -- i.e. whether someone pointed this
-/// process at a particular TPM on purpose.
-fn tcti_is_explicit() -> bool {
-    matches!(crate::policy::tpm_tcti(), Ok(Some(_)))
-        || ["TPM2TOOLS_TCTI", "TCTI", "TEST_TCTI"].into_iter().any(|name| crate::debug_only_env(name).is_some())
-}
-
 fn resolve_tcti() -> Result<TctiNameConf> {
-    // Read every variable even when policy decides, so a release build
-    // warns about each one that is set rather than ignoring it silently.
-    let from_env: Vec<(&str, String)> = ["TPM2TOOLS_TCTI", "TCTI", "TEST_TCTI"]
-        .into_iter()
-        .filter_map(|name| crate::debug_only_env(name).map(|v| (name, v.to_string_lossy().into_owned())))
-        .collect();
-
     if let Some(tcti) = crate::policy::tpm_tcti()? {
         return TctiNameConf::from_str(&tcti)
             .map_err(|e| Error::Provider(format!("tpm.tcti \"{tcti}\" in policy is not a usable TCTI: {e}")));
-    }
-    if let Some((name, value)) = from_env.first() {
-        return TctiNameConf::from_str(value)
-            .map_err(|e| Error::Provider(format!("{name}=\"{value}\" is not a usable TCTI: {e}")));
     }
     TctiNameConf::from_str(DEFAULT_TCTI).map_err(|e| Error::Provider(format!("default TCTI: {e}")))
 }
@@ -192,7 +176,7 @@ fn read_derivation_secret() -> Result<Option<Zeroizing<[u8; 32]>>> {
         check_location, config_owner, open_checked, FileRequirements, SecretBuffer, FORBID_GROUP_OTHER_ACCESS,
     };
 
-    let path = derivation_secret_path();
+    let path = derivation_secret_path()?;
     // Root-owned, like the policy: if the service could write it, any
     // process running as the service could change every TPM KEK, making
     // every DEK already wrapped permanently unopenable.
@@ -1264,6 +1248,7 @@ fn encode_peer_point(peer_public: &PublicKey) -> Result<EccPoint> {
 #[cfg(test)]
 mod tests {
     use super::*; // bring `Tpm2Provider` etc. into scope
+    use crate::policy::test_support::TestPolicy;
     use serial_test::serial; // the tests below set process-wide env vars
 
     // ---------------------------------------------------------------
@@ -1275,9 +1260,8 @@ mod tests {
     // `cargo test --features tpm2`.
     // ---------------------------------------------------------------
 
-    // Points HKDFGUARD_TPM_DERIVATION_SECRET_FILE at a fresh temp file
-    // holding `contents` with mode `mode`, runs `f`, and always clears the
-    // env var afterward. The TempDir is kept alive for the whole closure.
+    // Points `tpm.derivation_secret_file` at a fresh temp file holding
+    // `contents` with mode `mode`, for the duration of `f`.
     fn with_secret_file<T>(contents: &[u8], mode: u32, f: impl FnOnce(&std::path::Path) -> T) -> T {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
@@ -1292,27 +1276,15 @@ mod tests {
         with_secret_path(&path, || f(&path))
     }
 
-    // Points HKDFGUARD_TPM_DERIVATION_SECRET_FILE at `path` for the
-    // duration of `f`, then restores whatever was there before. Restoring,
-    // not removing, matters: the test harness exports a real secret, and
-    // the TPM refuses to run without one, so a helper that cleared the
-    // variable would make every later TPM test in the process fail.
-    fn with_secret_path<T>(path: impl AsRef<std::ffi::OsStr>, f: impl FnOnce() -> T) -> T {
-        struct Restore(Option<std::ffi::OsString>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(v) => std::env::set_var("HKDFGUARD_TPM_DERIVATION_SECRET_FILE", v),
-                    None => std::env::remove_var("HKDFGUARD_TPM_DERIVATION_SECRET_FILE"),
-                }
-            }
-        }
-        let _restore = Restore(std::env::var_os("HKDFGUARD_TPM_DERIVATION_SECRET_FILE"));
-        std::env::set_var("HKDFGUARD_TPM_DERIVATION_SECRET_FILE", path);
+    // Points `tpm.derivation_secret_file` at `path` for the duration of
+    // `f`, layered over the policy in force -- so the harness's TCTI, and
+    // any policy the test itself set, still apply.
+    fn with_secret_path<T>(path: impl AsRef<std::path::Path>, f: impl FnOnce() -> T) -> T {
+        let _secret = TestPolicy::write(&format!("[tpm]\nderivation_secret_file = \"{}\"\n", path.as_ref().display()));
         f()
     }
 
-    // Points the env var at a path that doesn't exist.
+    // Points the derivation secret at a path that doesn't exist.
     fn with_no_secret_file<T>(f: impl FnOnce() -> T) -> T {
         with_secret_path("/nonexistent-hkdfguard-tpm-secret-for-tests", f)
     }
@@ -1321,9 +1293,8 @@ mod tests {
     #[serial]
     fn absent_secret_is_an_error_by_default() {
         // No policy file at all: the secret is still required.
-        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
+        let _no_policy = TestPolicy::absent();
         let result = with_no_secret_file(read_derivation_secret);
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
         match result {
             Err(Error::Provider(msg)) => assert!(msg.contains("head -c 32 /dev/urandom"), "the error must say how to create it: {msg}"),
             other => panic!("a missing secret must be an error by default, got {:?}", other.map(|v| v.is_some())),
@@ -1343,15 +1314,8 @@ mod tests {
     #[test]
     #[serial]
     fn absent_secret_is_an_error_when_policy_requires_one() {
-        let dir = crate::secure_file::private_tempdir();
-        let policy = dir.path().join("policy.toml");
-        crate::secure_file::write_world_readable_for_tests(
-            &policy,
-            "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nrequire_derivation_secret = true\n",
-        );
-        std::env::set_var("HKDFGUARD_POLICY_FILE", &policy);
+        let _policy = TestPolicy::write("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nrequire_derivation_secret = true\n");
         let result = with_no_secret_file(read_derivation_secret);
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
         assert!(result.is_err(), "a required-but-missing secret must fail closed");
     }
 
@@ -1515,15 +1479,10 @@ mod tests {
         assert_ne!(name, computed_name(&billing).unwrap());
     }
 
-    // Writes `doc` as the policy for the duration of `f`.
+    // `doc`, layered over the policy in force, for the duration of `f`.
     fn with_policy<T>(doc: &str, f: impl FnOnce() -> T) -> T {
-        let dir = crate::secure_file::private_tempdir();
-        let path = dir.path().join("policy.toml");
-        crate::secure_file::write_world_readable_for_tests(&path, doc);
-        std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
-        let result = f();
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
-        result
+        let _policy = TestPolicy::write(doc);
+        f()
     }
 
     const SOME_NAME: &str = "000b0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
@@ -1531,9 +1490,8 @@ mod tests {
     #[test]
     #[serial]
     fn every_service_is_provisioned_without_the_allowlist() {
-        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
+        let _no_policy = TestPolicy::absent();
         let no_policy = service_is_provisioned("com.company.anything").unwrap();
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
         assert!(no_policy, "with no policy, the TPM serves every service (the historical behavior)");
 
         let off = with_policy("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n", || {
@@ -1787,9 +1745,7 @@ mod tests {
     #[serial]
     fn a_missing_derivation_secret_leaves_the_tpm_absent() {
         // Not set up for use on this host: the chain may move on.
-        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
         let present = with_no_secret_file(|| Tpm2Provider::new().probe());
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
         assert!(!present);
     }
 
@@ -1918,7 +1874,6 @@ mod tests {
         // a rotation between them would produce a payload whose
         // fingerprint names one KEK and whose ciphertext is under another
         // -- unopenable forever. The handle must use one snapshot for both.
-        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
         let service = "com.company.rotation";
         let peer = crate::crypto::payload_ecdh_point(&[0x42u8; 32]).unwrap();
 
@@ -1935,7 +1890,6 @@ mod tests {
             let z = handle.ecdh(&peer).unwrap();
             (before, after, *z)
         });
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
 
         assert_eq!(before, after, "public_key() must not change when the secret file is rotated mid-handle");
 
@@ -2020,28 +1974,7 @@ mod tests {
 
     // ---- session parameter encryption ----
 
-    // ---- TCTI selection: policy, then (debug builds) environment, then default ----
-
-    // Runs `f` with the three tpm2-tools TCTI variables cleared, except
-    // `TCTI` set to `tcti_env` when given, then restores their previous
-    // values -- the swtpm-backed tests in this module rely on TCTI.
-    fn with_tcti_env<T>(tcti_env: Option<&str>, f: impl FnOnce() -> T) -> T {
-        let saved: Vec<_> = ["TPM2TOOLS_TCTI", "TCTI", "TEST_TCTI"].iter().map(|n| (*n, std::env::var_os(n))).collect();
-        for (n, _) in &saved {
-            std::env::remove_var(n);
-        }
-        if let Some(v) = tcti_env {
-            std::env::set_var("TCTI", v);
-        }
-        let result = f();
-        for (n, v) in saved {
-            match v {
-                Some(v) => std::env::set_var(n, v),
-                None => std::env::remove_var(n),
-            }
-        }
-        result
-    }
+    // ---- TCTI selection: policy, else the default; never the environment ----
 
     fn tcti_of(result: Result<TctiNameConf>) -> String {
         format!("{:?}", result.expect("a TCTI should resolve"))
@@ -2050,31 +1983,39 @@ mod tests {
     #[test]
     #[serial]
     fn tcti_defaults_to_the_kernel_resource_manager() {
-        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
-        let resolved = with_tcti_env(None, resolve_tcti);
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
-        assert_eq!(tcti_of(resolved), tcti_of(TctiNameConf::from_str(DEFAULT_TCTI).map_err(|e| Error::Provider(e.to_string()))));
+        let _no_policy = TestPolicy::absent();
+        assert_eq!(tcti_of(resolve_tcti()), tcti_of(TctiNameConf::from_str(DEFAULT_TCTI).map_err(|e| Error::Provider(e.to_string()))));
     }
 
     #[test]
     #[serial]
-    fn policy_tcti_wins_over_the_environment() {
+    fn the_policy_tcti_is_used() {
         let doc = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\ntcti = \"swtpm:host=127.0.0.1,port=9999\"\n";
-        let resolved = with_policy(doc, || with_tcti_env(Some("device:/dev/somewhere-else"), resolve_tcti));
-        let shown = tcti_of(resolved);
+        let shown = tcti_of(with_policy(doc, resolve_tcti));
         assert!(shown.contains("9999"), "policy TCTI must be used, got {shown}");
     }
 
     #[test]
     #[serial]
-    fn environment_tcti_is_used_in_debug_builds_when_policy_sets_none() {
-        // This test binary is a debug build, so the variable is honored;
-        // release builds ignore it (crate::debug_only_env), which the
-        // Docker suite checks against the release library.
-        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
-        let resolved = with_tcti_env(Some("swtpm:host=127.0.0.1,port=7777"), resolve_tcti);
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
-        assert!(tcti_of(resolved).contains("7777"));
+    fn the_environment_never_chooses_the_tpm() {
+        // Whoever chooses the TPM chooses who knows its seed, so the
+        // tpm2-tools variables are ignored in every build -- this test
+        // binary included.
+        let _no_policy = TestPolicy::absent();
+        let saved: Vec<_> = ["TPM2TOOLS_TCTI", "TCTI", "TEST_TCTI"].iter().map(|n| (*n, std::env::var_os(n))).collect();
+        for (name, _) in &saved {
+            std::env::set_var(name, "swtpm:host=127.0.0.1,port=7777");
+        }
+        let resolved = resolve_tcti();
+        let explicit = tcti_is_explicit();
+        for (name, value) in saved {
+            match value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+        assert!(!tcti_of(resolved).contains("7777"), "an environment TCTI must be ignored");
+        assert!(!explicit);
     }
 
     #[test]
@@ -2082,12 +2023,10 @@ mod tests {
     fn an_unusable_policy_tcti_makes_the_tpm_unavailable_not_the_default() {
         // Passes the policy's kind check but can't be parsed as a TCTI.
         let doc = "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\ntcti = \"mssim:port=notaport\"\n";
-        let resolved = with_policy(doc, || with_tcti_env(None, resolve_tcti));
-        assert!(resolved.is_err(), "a bad policy TCTI must not fall back to the default device");
+        assert!(with_policy(doc, resolve_tcti).is_err(), "a bad policy TCTI must not fall back to the default device");
 
         // And a broken policy file is an error too, not the default.
-        let resolved = with_policy("[selection]\nmode = \"require\"\n", || with_tcti_env(None, resolve_tcti));
-        assert!(resolved.is_err());
+        assert!(with_policy("[selection]\nmode = \"require\"\n", resolve_tcti).is_err());
     }
 
     #[test]
@@ -2141,7 +2080,6 @@ mod tests {
         // caller sees identical bytes. If the salt key template weren't
         // an acceptable `tpmKey`, or the attributes were wrong, this is
         // where it would fail.
-        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
         let h = crate::crypto::payload_ecdh_point(&[0x42u8; 32]).unwrap();
         let peer = encode_peer_point(&h).unwrap();
 
@@ -2155,7 +2093,6 @@ mod tests {
             Ok((plain?, encrypted?))
         })
         .unwrap();
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
 
         assert_eq!(plain.x().value(), encrypted.x().value(), "Z must be identical through an encrypted session");
         assert_eq!(plain.y().value(), encrypted.y().value());
@@ -2165,7 +2102,6 @@ mod tests {
     #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
     #[serial]
     fn session_salt_key_is_deterministic_and_pinnable() {
-        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
         let names = with_tpm_context(|ctx| {
             let mut names = Vec::new();
             for _ in 0..2 {
@@ -2177,7 +2113,6 @@ mod tests {
             Ok(names)
         })
         .unwrap();
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
         assert_eq!(names[0], names[1], "the salt key must be stable, or it could never be pinned");
 
         // Pinned to the real Name under `required`: loads. Pinned to a
@@ -2188,21 +2123,18 @@ mod tests {
         let policy_for = |name_hex: &str| {
             format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"required\"\npinned_session_salt_key_name = \"{name_hex}\"\n")
         };
-        let dir = crate::secure_file::private_tempdir();
-        let path = dir.path().join("policy.toml");
-
-        crate::secure_file::write_world_readable_for_tests(&path, policy_for(&real));
-        std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
-        with_tpm_context(|ctx| {
-            let key = create_session_salt_key(ctx)?;
-            let _ = ctx.flush_context(key.into());
-            Ok(())
+        with_policy(&policy_for(&real), || {
+            with_tpm_context(|ctx| {
+                let key = create_session_salt_key(ctx)?;
+                let _ = ctx.flush_context(key.into());
+                Ok(())
+            })
         })
         .expect("a correctly pinned salt key must load");
 
-        crate::secure_file::write_world_readable_for_tests(&path, policy_for(&hex(&wrong)));
-        let refused = with_tpm_context(|ctx| create_session_salt_key(ctx).map(|k| { let _ = ctx.flush_context(k.into()); }));
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
+        let refused = with_policy(&policy_for(&hex(&wrong)), || {
+            with_tpm_context(|ctx| create_session_salt_key(ctx).map(|k| { let _ = ctx.flush_context(k.into()); }))
+        });
         assert!(refused.is_err(), "a salt key whose Name doesn't match the pin must be refused");
     }
 
@@ -2213,7 +2145,6 @@ mod tests {
         // swtpm reports manufacturer "IBM ", a known no-bus TPM, so `auto`
         // (the default, no policy file) skips encryption; `required` still
         // encrypts. Both paths must still produce a working ECDH.
-        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
         let (auto, reported) = with_tpm_context(|ctx| {
             let reported = ctx
                 .get_tpm_property(PropertyTag::Manufacturer)
@@ -2221,7 +2152,6 @@ mod tests {
             Ok((session_encryption_enabled(ctx)?, reported))
         })
         .unwrap();
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
         // Report what the TPM actually said, so a classification miss
         // explains itself instead of just failing.
         assert!(
@@ -2238,18 +2168,13 @@ mod tests {
             Ok(hex(name.value()))
         })
         .unwrap();
-        let dir = crate::secure_file::private_tempdir();
-        let path = dir.path().join("policy.toml");
-        crate::secure_file::write_world_readable_for_tests(
-            &path,
-            format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"required\"\npinned_session_salt_key_name = \"{real}\"\n"),
-        );
-        std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
+        let _policy = TestPolicy::write(&format!(
+            "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"required\"\npinned_session_salt_key_name = \"{real}\"\n"
+        ));
         let required = with_tpm_context(session_encryption_enabled).unwrap();
         // And the full production path -- load_kek + ecdh -- works under it.
         let h = crate::crypto::payload_ecdh_point(&[0x42u8; 32]).unwrap();
         let z = create_ecdh_secret("com.company.orders", &h);
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
         assert!(required, "required must encrypt regardless of manufacturer");
         assert_ne!(z.unwrap(), [0u8; 32], "ECDH through the encrypted session must succeed");
     }
@@ -2294,21 +2219,12 @@ mod tests {
         println!("SERVICE_KEY_NAME={}", hex(name.value()));
     }
 
-    // Writes a policy pinning `service` to `name_hex` and points
-    // HKDFGUARD_POLICY_FILE at it for the duration of `f`.
+    // A policy pinning `service` to `name_hex`, for the duration of `f`.
     fn with_pinned_name<T>(service: &str, name_hex: &str, f: impl FnOnce() -> T) -> T {
-        let dir = crate::secure_file::private_tempdir();
-        let path = dir.path().join("policy.toml");
-        crate::secure_file::write_world_readable_for_tests(
-            &path,
-            format!(
-                "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm.pinned_names]\n\"{service}\" = \"{name_hex}\"\n"
-            ),
-        );
-        std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
-        let result = f();
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
-        result
+        with_policy(
+            &format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm.pinned_names]\n\"{service}\" = \"{name_hex}\"\n"),
+            f,
+        )
     }
 
     #[test]

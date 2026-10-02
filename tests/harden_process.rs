@@ -2,14 +2,13 @@
 //! dumpable flag), so it gets its own test binary -- its own process --
 //! rather than running inside the shared unit-test process.
 
-use std::ffi::CString;
-use std::os::raw::c_int;
-use std::os::unix::fs::PermissionsExt;
-use HkdfGuardKeyProtectionLinux::{hkdfguard_harden_process, hkdfguard_unwrap_dek, hkdfguard_wrap_dek, status};
+use HkdfGuardKeyProtectionLinux::{hkdfguard_harden_process, status};
 
 // Only this user can write to it, whatever the umask: the library refuses
 // to trust a policy or secret mount in a group-writable directory.
+#[cfg(hkdfguard_test_paths)]
 fn private_tempdir() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
     tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().unwrap()
 }
 
@@ -30,36 +29,52 @@ fn hardening_takes_effect_and_the_library_still_works_afterwards() {
         assert_eq!(dumpable, 0, "the process must be non-dumpable");
     }
 
-    // A non-dumpable process loses some /proc/<pid> access. The
-    // external-secret provider re-checks an opened descriptor through
-    // /proc/self/fd, so prove a full wrap/unwrap through it still works.
-    let mount = private_tempdir();
-    let service = "com.company.hardened";
-    let key_path = mount.path().join(service);
-    std::fs::write(&key_path, p256::SecretKey::random(&mut rand_core::OsRng).to_bytes()).unwrap();
-    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // The rest needs this process's library to read the test's own policy,
+    // which only a `--cfg hkdfguard_test_paths` build does (the test scripts
+    // set it); a plain `cargo test` checks the hardening above only.
+    #[cfg(hkdfguard_test_paths)]
+    {
+        use std::ffi::CString;
+        use std::os::raw::c_int;
+        use std::os::unix::fs::PermissionsExt;
+        use HkdfGuardKeyProtectionLinux::{hkdfguard_unwrap_dek, hkdfguard_wrap_dek};
 
-    let policy_dir = private_tempdir();
-    let policy = policy_dir.path().join("policy.toml");
-    std::fs::write(&policy, "[selection]\nmode = \"require\"\nprovider = \"external-secret\"\n").unwrap();
-    std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // A non-dumpable process loses some /proc/<pid> access. The
+        // external-secret provider re-checks an opened descriptor through
+        // /proc/self/fd, so prove a full wrap/unwrap through it still works.
+        let mount = private_tempdir();
+        let service = "com.company.hardened";
+        let key_path = mount.path().join(service);
+        std::fs::write(&key_path, p256::SecretKey::random(&mut rand_core::OsRng).to_bytes()).unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-    std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", mount.path());
-    std::env::set_var("HKDFGUARD_POLICY_FILE", &policy);
+        let policy_dir = private_tempdir();
+        let policy = policy_dir.path().join("policy.toml");
+        std::fs::write(
+            &policy,
+            format!(
+                "[selection]\nmode = \"require\"\nprovider = \"external-secret\"\n[external_secret]\ndir = \"{}\"\n",
+                mount.path().display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::env::set_var("HKDFGUARD_POLICY_FILE", &policy);
 
-    let c_service = CString::new(service).unwrap();
-    let dek = [0x5Au8; 32];
-    let mut wrapped = [0u8; 512];
-    let mut wrapped_len = wrapped.len() as c_int;
-    assert_eq!(
-        hkdfguard_wrap_dek(c_service.as_ptr(), dek.as_ptr(), 32, wrapped.as_mut_ptr(), &mut wrapped_len),
-        status::OK
-    );
-    let mut out = [0u8; 32];
-    let mut out_len = out.len() as c_int;
-    assert_eq!(
-        hkdfguard_unwrap_dek(c_service.as_ptr(), wrapped.as_ptr(), wrapped_len, out.as_mut_ptr(), &mut out_len),
-        status::OK
-    );
-    assert_eq!(out, dek);
+        let c_service = CString::new(service).unwrap();
+        let dek = [0x5Au8; 32];
+        let mut wrapped = [0u8; 512];
+        let mut wrapped_len = wrapped.len() as c_int;
+        assert_eq!(
+            hkdfguard_wrap_dek(c_service.as_ptr(), dek.as_ptr(), 32, wrapped.as_mut_ptr(), &mut wrapped_len),
+            status::OK
+        );
+        let mut out = [0u8; 32];
+        let mut out_len = out.len() as c_int;
+        assert_eq!(
+            hkdfguard_unwrap_dek(c_service.as_ptr(), wrapped.as_ptr(), wrapped_len, out.as_mut_ptr(), &mut out_len),
+            status::OK
+        );
+        assert_eq!(out, dek);
+    }
 }

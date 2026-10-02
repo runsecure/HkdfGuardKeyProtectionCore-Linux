@@ -50,18 +50,24 @@ services:
       swtpm:
         condition: service_healthy
     environment:
-      TCTI: "swtpm:host=swtpm,port=2321"
-      TPM2TOOLS_TCTI: "swtpm:host=swtpm,port=2321"
+      TPM2TOOLS_TCTI: "swtpm:host=swtpm,port=2321" # tpm2-tools only; the library takes its TCTI from policy
     # Overrides docker/Dockerfile's own ENTRYPOINT (entrypoint-test.sh,
     # which runs the full single-container matrix, including starting its
     # own swtpm): here we only want the TPM conformance suite, run against
-    # the separate `swtpm` service above.
+    # the separate `swtpm` service above. The TPM is named in a scratch
+    # policy, read by a `--cfg hkdfguard_test_paths` test build.
     entrypoint: ["bash", "-lc"]
     command:
       - |
         set -euo pipefail
-        tpm2_startup -c -T "$$TCTI"
-        cargo test --features tpm2 -- --ignored --test-threads=1
+        tpm2_startup -c -T "$$TPM2TOOLS_TCTI"
+        H=$$(mktemp -d)
+        ( umask 077; head -c 32 /dev/urandom > "$$H/tpm.derivation-secret" )
+        printf '[selection]\nmode = "prefer"\n\n[tpm]\ntcti = "%s"\nderivation_secret_file = "%s"\n' \
+          "$$TPM2TOOLS_TCTI" "$$H/tpm.derivation-secret" > "$$H/policy.toml"
+        chmod 0644 "$$H/policy.toml"
+        HKDFGUARD_POLICY_FILE="$$H/policy.toml" RUSTFLAGS="--cfg hkdfguard_test_paths" CARGO_TARGET_DIR=target/test-paths \
+          cargo test --features tpm2 -- --ignored --test-threads=1
 
 volumes:
   swtpm-state:

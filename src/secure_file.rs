@@ -33,16 +33,18 @@ pub enum Owner {
 /// change: the policy file, the PKCS#11 PIN file, the TPM derivation
 /// secret, and the directories they live in.
 ///
-/// Release builds require root. Accepting the service's own uid would let
+/// Every build that ships requires root. Accepting the service's own uid would let
 /// any process running as that uid rewrite them -- and under Yama
 /// `ptrace_scope >= 1` or in a container without `CAP_SYS_PTRACE`, such a
 /// process can rewrite the service's files without being able to read its
 /// memory. Rewriting the policy redirects every future wrap to a KEK the
 /// writer controls; rewriting the PIN locks the HSM user out; rewriting the
-/// derivation secret changes every TPM KEK. Debug builds also accept this
-/// process's own uid, so tests can use temp files.
+/// derivation secret changes every TPM KEK. Test builds (`cfg(test)`, or
+/// the harnesses' `--cfg hkdfguard_test_paths`) also accept this process's
+/// own uid, so tests can use temp files; no ordinary build setting --
+/// debug profile included -- relaxes it.
 pub const fn config_owner() -> Owner {
-    if cfg!(debug_assertions) {
+    if cfg!(any(test, hkdfguard_test_paths)) {
         Owner::RootOrCurrentUser
     } else {
         Owner::Root

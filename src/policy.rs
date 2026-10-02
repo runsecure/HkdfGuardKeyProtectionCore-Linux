@@ -21,9 +21,9 @@
 //! Separation of concerns: this module owns policy *parsing and
 //! evaluation* only -- it has no knowledge of `KekProvider`/`KekHandle`
 //! (the actual provider implementations in `crate::provider`) and knows
-//! nothing about *how* a provider works (module paths, PINs, slots --
-//! those stay in each provider's own `HKDFGUARD_*` environment variables).
-//! It answers exactly one question: given the provider types compiled
+//! nothing about *how* a provider works -- it only carries the settings
+//! each provider reads from the policy (module path, PIN file, TCTI...).
+//! Its central question: given the provider types compiled
 //! into this build, which of them, in what order, does policy currently
 //! allow?
 
@@ -34,15 +34,62 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Location of the policy file. Release builds read only this path; debug
-/// builds (tests, development) may redirect it with `HKDFGUARD_POLICY_FILE`
-/// -- see [`crate::debug_only_env`] for why that is debug-only.
+/// Location of the policy file. Every build that ships reads only this
+/// path; every other piece of configuration (TPM, derivation secret,
+/// secret mount, PKCS#11 module, token and PIN file) is named inside it.
+#[cfg_attr(test, allow(dead_code))] // unit tests never read the real policy (see `policy_file_path`)
 const DEFAULT_POLICY_FILE: &str = "/etc/hkdfguard/policy.toml";
 
+/// Which policy file to read.
+///
+/// Builds that ship: always [`DEFAULT_POLICY_FILE`]. Nothing in the
+/// environment can redirect it -- the environment is often set by
+/// lower-trust configuration than the root-owned file, and whoever picks
+/// the policy file picks the TPM, the secrets, and the HSM module loaded
+/// into this process.
+///
+/// Test builds only:
+/// - this crate's unit tests (`cfg(test)`): the policy of the innermost
+///   live [`test_support::TestPolicy`]; else the harness's
+///   `HKDFGUARD_POLICY_FILE`; else *no* policy, so a real
+///   `/etc/hkdfguard` on a developer's machine never leaks into a test;
+/// - the harnesses' out-of-process builds (`--cfg hkdfguard_test_paths`,
+///   which no ordinary build setting can turn on, debug profile
+///   included): `HKDFGUARD_POLICY_FILE`, else the default. Such a build
+///   says so in its log.
 fn policy_file_path() -> PathBuf {
-    crate::debug_only_env("HKDFGUARD_POLICY_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_POLICY_FILE))
+    #[cfg(test)]
+    {
+        if let Some(path) = test_support::active_path() {
+            return path;
+        }
+        std::env::var_os("HKDFGUARD_POLICY_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/nonexistent-hkdfguard-policy-for-unit-tests"))
+    }
+    #[cfg(all(not(test), hkdfguard_test_paths))]
+    {
+        static ANNOUNCED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ANNOUNCED.get_or_init(|| {
+            log::warn!(
+                "hkdfguard: TEST BUILD (--cfg hkdfguard_test_paths): HKDFGUARD_POLICY_FILE is honored and \
+                 configuration owned by this user is accepted; never deploy this library"
+            );
+        });
+        std::env::var_os("HKDFGUARD_POLICY_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_POLICY_FILE))
+    }
+    #[cfg(not(any(test, hkdfguard_test_paths)))]
+    {
+        if std::env::var_os("HKDFGUARD_POLICY_FILE").is_some() {
+            static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            WARNED.get_or_init(|| {
+                log::warn!("hkdfguard: HKDFGUARD_POLICY_FILE is set but ignored: the policy is always {DEFAULT_POLICY_FILE}");
+            });
+        }
+        PathBuf::from(DEFAULT_POLICY_FILE)
+    }
 }
 
 /// Security assurance level a provider offers, independent of the specific
@@ -162,7 +209,7 @@ struct ExternalSecretPolicy {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Pkcs11Policy {
-    /// Absolute path of the PKCS#11 module to load. Release builds use
+    /// Absolute path of the PKCS#11 module to load. Every build uses
     /// PKCS#11 only when this is set: there is no default module search,
     /// since the commonly installed one (SoftHSM2) is a software token.
     module: Option<String>,
@@ -251,6 +298,9 @@ struct TpmPolicy {
     /// whose TPM derives the keys: a TCTI pointed at an attacker-run
     /// simulator hands them a TPM whose seed they know.
     tcti: Option<String>,
+    /// Absolute path of the derivation-secret file (default
+    /// `/etc/hkdfguard/tpm.derivation-secret`).
+    derivation_secret_file: Option<String>,
 }
 
 /// TCTI kinds tss-esapi can open; anything else is rejected at load time.
@@ -282,6 +332,7 @@ impl Default for TpmPolicy {
             session_encryption: SessionEncryption::default(),
             pinned_session_salt_key_name: None,
             tcti: None,
+            derivation_secret_file: None,
         }
     }
 }
@@ -463,6 +514,7 @@ pub struct Policy {
     tpm_session_encryption: SessionEncryption,
     pinned_session_salt_key_name: Option<Vec<u8>>,
     tpm_tcti: Option<String>,
+    tpm_derivation_secret_file: Option<PathBuf>,
     external_secret_dir: Option<PathBuf>,
     pkcs11: Pkcs11Settings,
 }
@@ -613,6 +665,12 @@ impl Policy {
         if let Some(tcti) = &raw.tpm.tcti {
             validate_tcti(tcti)?;
         }
+        let tpm_derivation_secret_file = raw
+            .tpm
+            .derivation_secret_file
+            .as_deref()
+            .map(|f| absolute_path("tpm.derivation_secret_file", f))
+            .transpose()?;
 
         let external_secret_dir = raw
             .external_secret
@@ -638,6 +696,7 @@ impl Policy {
             tpm_session_encryption: raw.tpm.session_encryption,
             pinned_session_salt_key_name,
             tpm_tcti: raw.tpm.tcti,
+            tpm_derivation_secret_file,
             external_secret_dir,
             pkcs11,
         })
@@ -661,6 +720,11 @@ impl Policy {
     /// The TCTI the TPM provider must use (`tpm.tcti`), if policy sets one.
     pub fn tpm_tcti(&self) -> Option<&str> {
         self.tpm_tcti.as_deref()
+    }
+
+    /// The derivation-secret file (`tpm.derivation_secret_file`), if policy sets one.
+    pub fn tpm_derivation_secret_file(&self) -> Option<&std::path::Path> {
+        self.tpm_derivation_secret_file.as_deref()
     }
 
     /// The administrator-pinned Name of the session salt key, if any.
@@ -926,6 +990,17 @@ pub(crate) fn tpm_tcti() -> Result<Option<String>> {
     }
 }
 
+/// The derivation-secret file policy names (`tpm.derivation_secret_file`),
+/// if any. `Err` on a policy file that exists but can't be trusted.
+#[cfg_attr(not(feature = "tpm2"), allow(dead_code))]
+pub(crate) fn tpm_derivation_secret_file() -> Result<Option<PathBuf>> {
+    match load() {
+        Some(Ok(policy)) => Ok(policy.tpm_derivation_secret_file().map(std::path::Path::to_path_buf)),
+        Some(Err(e)) => Err(e),
+        None => Ok(None),
+    }
+}
+
 /// The external-secret directory policy requires (`external_secret.dir`),
 /// if any. `Err` on a policy file that exists but can't be trusted, so the
 /// provider is unavailable rather than searching the default mounts.
@@ -960,30 +1035,21 @@ pub(crate) fn pinned_session_salt_key_name() -> Result<Option<Vec<u8>>> {
     }
 }
 
-/// Test-only: writes a policy that explicitly names Ephemeral in
-/// `preferred_order` (alongside `external-secret`, so tests that also
-/// need that provider to remain a candidate still get it) and points
-/// `HKDFGUARD_POLICY_FILE` at it -- the same explicit naming a real
-/// deployment now needs, since with no policy at all (or a policy that
-/// never names it) Ephemeral is excluded (see `provider::allowed_chain`
-/// and [`Policy::ephemeral_explicitly_listed`]). The returned `TempDir`
-/// owns the file; keep it alive for as long as the policy should apply.
+/// Test-only: a policy that explicitly names Ephemeral in
+/// `preferred_order` (alongside `external-secret`, so tests that also need
+/// that provider to remain a candidate still get it) -- the same explicit
+/// naming a real deployment needs, since with no policy at all (or one that
+/// never names it) Ephemeral is excluded (see `provider::allowed_chain` and
+/// [`Policy::ephemeral_explicitly_listed`]). In force while the returned
+/// guard lives.
 #[cfg(test)]
-pub(crate) fn allow_ephemeral_policy_for_tests() -> tempfile::TempDir {
-    let dir = crate::secure_file::private_tempdir();
-    let path = dir.path().join("policy.toml");
-    crate::secure_file::write_world_readable_for_tests(
-        &path,
-        "preferred_order = [\"external-secret\", \"ephemeral\"]\n[selection]\nmode = \"prefer\"\n",
-    );
-    std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
-    dir
+pub(crate) fn allow_ephemeral_policy_for_tests() -> test_support::TestPolicy {
+    test_support::TestPolicy::write("preferred_order = [\"external-secret\", \"ephemeral\"]\n[selection]\nmode = \"prefer\"\n")
 }
 
-/// Test-only: writes a policy pinning provider selection to `provider`
-/// (the policy vocabulary's name, e.g. `external-secret`) and points
-/// `HKDFGUARD_POLICY_FILE` at it. The returned `TempDir` owns the file;
-/// keep it alive for as long as the policy should apply.
+/// Test-only: a policy pinning provider selection to `provider` (the policy
+/// vocabulary's name, e.g. `external-secret`), in force while the returned
+/// guard lives.
 ///
 /// Any test whose subject is one *specific* provider must pin it this
 /// way rather than relying on stronger providers being absent. With the
@@ -994,20 +1060,142 @@ pub(crate) fn allow_ephemeral_policy_for_tests() -> tempfile::TempDir {
 /// is exactly what happened to the rotation and provider-identity tests
 /// the first time the suite ran under `--features tpm2` against swtpm.
 #[cfg(test)]
-pub(crate) fn require_provider_policy_for_tests(provider: &str) -> tempfile::TempDir {
-    let dir = crate::secure_file::private_tempdir();
-    let path = dir.path().join("policy.toml");
-    crate::secure_file::write_world_readable_for_tests(
-        &path,
-        format!("[selection]\nmode = \"require\"\nprovider = \"{provider}\"\n"),
-    );
-    std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
-    dir
+pub(crate) fn require_provider_policy_for_tests(provider: &str) -> test_support::TestPolicy {
+    test_support::TestPolicy::write(&format!("[selection]\nmode = \"require\"\nprovider = \"{provider}\"\n"))
+}
+
+/// Per-test policy files. See [`TestPolicy`].
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    /// Tables a layered policy merges key by key; every other top-level key
+    /// (`[selection]` above all) is replaced whole, so a test's selection is
+    /// never a blend of its own and the harness's.
+    const MERGED_TABLES: &[&str] = &["tpm", "pkcs11", "external_secret"];
+
+    struct Layer {
+        path: PathBuf,
+        /// `None`: this layer is "no policy file at all".
+        table: Option<toml::Table>,
+    }
+
+    /// Live `TestPolicy` layers, innermost last. Tests that touch policy
+    /// are `#[serial]`, so one stack serves the whole test binary.
+    static LAYERS: Mutex<Vec<Layer>> = Mutex::new(Vec::new());
+
+    fn layers() -> std::sync::MutexGuard<'static, Vec<Layer>> {
+        LAYERS.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub(super) fn active_path() -> Option<PathBuf> {
+        layers().last().map(|l| l.path.clone())
+    }
+
+    // What a new layer is merged onto: the innermost live layer, or with
+    // none, the harness's policy (HKDFGUARD_POLICY_FILE: which TPM, which
+    // derivation secret, which PKCS#11 token this machine's test run uses).
+    fn base() -> toml::Table {
+        if let Some(layer) = layers().last() {
+            return layer.table.clone().unwrap_or_default();
+        }
+        std::env::var_os("HKDFGUARD_POLICY_FILE")
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|text| text.parse::<toml::Table>().expect("the harness policy (HKDFGUARD_POLICY_FILE) is not valid TOML"))
+            .unwrap_or_default()
+    }
+
+    /// A real policy file for the duration of one test: written into a
+    /// private temp directory, read by the library through exactly the
+    /// production path (ownership, location, and parse checks included),
+    /// and removed -- with the library pointed back at whatever was in
+    /// force before -- when the guard drops. Guards nest; drop them in
+    /// reverse order of creation, as Rust does for locals.
+    pub(crate) struct TestPolicy {
+        _dir: tempfile::TempDir, // removed, with the policy file in it, when the guard drops
+        depth: usize,
+    }
+
+    impl TestPolicy {
+        /// `doc` layered over the policy already in force: the tables in
+        /// `MERGED_TABLES` merge key by key, `doc` winning; any other
+        /// top-level key `doc` sets replaces the old one whole. With no
+        /// `[selection]` anywhere, `mode = "prefer"` is added, which selects
+        /// exactly as having no policy file does.
+        pub(crate) fn write(doc: &str) -> Self {
+            let mut merged = base();
+            let layer: toml::Table = doc.parse().unwrap_or_else(|e| panic!("TestPolicy::write: invalid TOML ({e}); use TestPolicy::exact for a malformed policy:\n{doc}"));
+            for (key, value) in layer {
+                match (merged.get_mut(&key), value) {
+                    (Some(toml::Value::Table(old)), toml::Value::Table(new)) if MERGED_TABLES.contains(&key.as_str()) => old.extend(new),
+                    (_, value) => {
+                        merged.insert(key, value);
+                    }
+                }
+            }
+            if !merged.contains_key("selection") {
+                let mut selection = toml::Table::new();
+                selection.insert("mode".into(), toml::Value::String("prefer".into()));
+                merged.insert("selection".into(), toml::Value::Table(selection));
+            }
+            let text = toml::to_string(&merged).expect("a merged policy serializes");
+            Self::push(&text, Some(merged))
+        }
+
+        /// Exactly `contents`, merged with nothing -- for malformed,
+        /// oversized, or otherwise deliberately broken policies.
+        pub(crate) fn exact(contents: impl AsRef<[u8]>) -> Self {
+            Self::push(contents, None)
+        }
+
+        /// Whatever is at `path` -- for tests of how the loader treats a
+        /// directory, an unreadable file, or a file they manage themselves.
+        pub(crate) fn at(path: &Path) -> Self {
+            Self::stack(crate::secure_file::private_tempdir(), Layer { path: path.to_path_buf(), table: None })
+        }
+
+        /// No policy file at all.
+        pub(crate) fn absent() -> Self {
+            let dir = crate::secure_file::private_tempdir();
+            let path = dir.path().join("no-policy.toml");
+            Self::stack(dir, Layer { path, table: None })
+        }
+
+        fn push(contents: impl AsRef<[u8]>, table: Option<toml::Table>) -> Self {
+            let dir = crate::secure_file::private_tempdir();
+            let path = dir.path().join("policy.toml");
+            crate::secure_file::write_world_readable_for_tests(&path, contents);
+            Self::stack(dir, Layer { path, table: table.or(Some(toml::Table::new())) })
+        }
+
+        fn stack(dir: tempfile::TempDir, layer: Layer) -> Self {
+            let mut layers = layers();
+            layers.push(layer);
+            TestPolicy { _dir: dir, depth: layers.len() }
+        }
+    }
+
+    /// Points the external-secret provider at `dir` (`external_secret.dir`),
+    /// layered over the policy in force.
+    pub(crate) fn secret_mount(dir: &Path) -> TestPolicy {
+        TestPolicy::write(&format!("[external_secret]\ndir = \"{}\"\n", dir.display()))
+    }
+
+    impl Drop for TestPolicy {
+        fn drop(&mut self) {
+            let mut layers = layers();
+            // Out-of-order drops can only come from a guard kept beyond its
+            // scope; unwinding everything above it keeps the stack sane.
+            layers.truncate(self.depth - 1);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_support::TestPolicy;
 
     fn compiled(types: &[ProviderType]) -> Vec<ProviderType> {
         types.to_vec()
@@ -1352,21 +1540,16 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn setup_min_delay_helper_uses_the_default_without_a_policy_file() {
-        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
+        let _no_policy = TestPolicy::absent();
         let delay = setup_min_delay();
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
         assert_eq!(delay, Duration::from_millis(DEFAULT_SETUP_MIN_DELAY_MS));
     }
 
     #[test]
     #[serial_test::serial]
     fn setup_min_delay_helper_reads_the_configured_file() {
-        let dir = crate::secure_file::private_tempdir();
-        let path = dir.path().join("policy.toml");
-        crate::secure_file::write_world_readable_for_tests(&path, "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[startup_behavior]\nsetup_min_delay_ms = 42\n");
-        std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
+        let _policy = TestPolicy::write("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[startup_behavior]\nsetup_min_delay_ms = 42\n");
         let delay = setup_min_delay();
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
         assert_eq!(delay, Duration::from_millis(42));
     }
 
@@ -1375,12 +1558,8 @@ mod tests {
     fn setup_min_delay_helper_keeps_the_default_when_the_policy_is_broken() {
         // A malformed policy must not become a way to remove the floor
         // (the gated call fails closed on the same policy regardless).
-        let dir = crate::secure_file::private_tempdir();
-        let path = dir.path().join("policy.toml");
-        crate::secure_file::write_world_readable_for_tests(&path, "[selection]\nmode = \"require\"\n[startup_behavior]\nsetup_min_delay_ms = 0\n");
-        std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
+        let _policy = TestPolicy::exact("[selection]\nmode = \"require\"\n[startup_behavior]\nsetup_min_delay_ms = 0\n");
         let delay = setup_min_delay();
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
         assert_eq!(delay, Duration::from_millis(DEFAULT_SETUP_MIN_DELAY_MS));
     }
 
@@ -1553,11 +1732,10 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn tpm_helpers_without_a_policy_file() {
-        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
+        let _no_policy = TestPolicy::absent();
         let required = require_tpm_derivation_secret();
         let allowlist = require_tpm_pinned_names();
         let pinned = pinned_tpm_name("com.company.orders");
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
         assert!(required, "the derivation secret is required by default, policy or not");
         assert!(!allowlist, "no policy must not silently make the TPM refuse every service");
         assert_eq!(pinned.unwrap(), None);
@@ -1569,14 +1747,10 @@ mod tests {
         // A policy that can't be parsed must not be the reason a security
         // control is skipped: requiring becomes true, and pinning errors
         // rather than reporting "nothing pinned".
-        let dir = crate::secure_file::private_tempdir();
-        let path = dir.path().join("policy.toml");
-        crate::secure_file::write_world_readable_for_tests(&path, "[selection]\nmode = \"require\"\n"); // missing `provider`
-        std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
+        let _policy = TestPolicy::exact("[selection]\nmode = \"require\"\n"); // missing `provider`
         let required = require_tpm_derivation_secret();
         let allowlist = require_tpm_pinned_names();
         let pinned = pinned_tpm_name("com.company.orders");
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
         assert!(required, "a broken policy must fail closed to requiring the secret");
         assert!(allowlist, "a broken policy must fail closed to the allowlist");
         assert!(pinned.is_err(), "a broken policy must not report 'nothing pinned'");
@@ -1585,17 +1759,10 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn tpm_helpers_read_the_configured_file() {
-        let dir = crate::secure_file::private_tempdir();
-        let path = dir.path().join("policy.toml");
-        crate::secure_file::write_world_readable_for_tests(
-            &path,
-            format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nrequire_derivation_secret = true\n[tpm.pinned_names]\n\"com.company.orders\" = \"{A_NAME}\"\n"),
-        );
-        std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
+        let _policy = TestPolicy::write(&format!("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nrequire_derivation_secret = true\n[tpm.pinned_names]\n\"com.company.orders\" = \"{A_NAME}\"\n"));
         let required = require_tpm_derivation_secret();
         let pinned = pinned_tpm_name("com.company.orders");
         let unpinned = pinned_tpm_name("com.company.billing");
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
 
         assert!(required);
         assert_eq!(pinned.unwrap().unwrap().len(), SHA256_TPM_NAME_LEN);
@@ -1665,21 +1832,16 @@ mod tests {
     #[serial_test::serial]
     fn session_encryption_helpers_fail_closed() {
         // No policy: auto, nothing pinned.
-        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
+        let _no_policy = TestPolicy::absent();
         let mode = tpm_session_encryption();
         let pin = pinned_session_salt_key_name();
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
         assert_eq!(mode, SessionEncryption::Auto);
         assert_eq!(pin.unwrap(), None);
 
         // Broken policy: required (never "off"), and pinning errors.
-        let dir = crate::secure_file::private_tempdir();
-        let path = dir.path().join("policy.toml");
-        crate::secure_file::write_world_readable_for_tests(&path, "[selection]\nmode = \"require\"\n[tpm]\nsession_encryption = \"off\"\n");
-        std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
+        let _policy = TestPolicy::exact("[selection]\nmode = \"require\"\n[tpm]\nsession_encryption = \"off\"\n");
         let mode = tpm_session_encryption();
         let pin = pinned_session_salt_key_name();
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
         assert_eq!(mode, SessionEncryption::Required, "a broken policy must not turn bus protection off");
         assert!(pin.is_err());
     }
@@ -1689,18 +1851,14 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn load_returns_none_when_no_policy_file_is_configured() {
-        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
+        let _no_policy = TestPolicy::absent();
         assert!(load().is_none());
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
     }
 
     #[test]
     #[serial_test::serial]
     fn load_reads_and_validates_the_configured_file() {
-        let dir = crate::secure_file::private_tempdir();
-        let path = dir.path().join("policy.toml");
-        crate::secure_file::write_world_readable_for_tests(&path, "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n");
-        std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
+        let _policy = TestPolicy::write("[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n");
 
         match load() {
             Some(Ok(policy)) => {
@@ -1709,31 +1867,25 @@ mod tests {
             other => panic!("expected Some(Ok(_)), got {other:?}"),
         }
 
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
     }
 
     #[test]
     #[serial_test::serial]
     fn load_fails_closed_on_a_malformed_file() {
-        let dir = crate::secure_file::private_tempdir();
-        let path = dir.path().join("policy.toml");
-        crate::secure_file::write_world_readable_for_tests(&path, "[selection]\nmode = \"require\"\n"); // missing required `provider`
-        std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
+        let _policy = TestPolicy::exact("[selection]\nmode = \"require\"\n"); // missing required `provider`
 
         match load() {
             Some(Err(_)) => {}
             other => panic!("expected Some(Err(_)), got {other:?}"),
         }
 
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
     }
 
-    // Points HKDFGUARD_POLICY_FILE at `path` and asserts load() fails
-    // closed (Some(Err)) rather than treating the file as absent (None).
+    // Points the policy at `path` and asserts load() fails closed
+    // (Some(Err)) rather than treating the file as absent (None).
     fn assert_load_fails_closed(path: &std::path::Path, why: &str) {
-        std::env::set_var("HKDFGUARD_POLICY_FILE", path);
+        let _policy = TestPolicy::at(path);
         let result = load();
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
         match result {
             Some(Err(_)) => {}
             other => panic!("{why}: expected Some(Err(_)) (fail closed), got {other:?}"),
@@ -1792,9 +1944,8 @@ mod tests {
         assert_load_fails_closed(&path, "deleting the policy must not be a way to switch it off");
 
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
+        let _policy = TestPolicy::at(&path);
         let absent = load();
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
         assert!(absent.is_none(), "in a trusted directory, a missing policy is just no policy");
     }
 

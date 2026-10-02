@@ -47,6 +47,12 @@ serial_test = "3"
 # `SecretString`) in the PKCS#11 PIN-file tests; same version cryptoki
 # itself already pulls in, so this adds no new crate to the build.
 secrecy = "0.8"
+# Test builds only: lets the policy test helper (`policy::test_support`)
+# write a complete policy file -- a test's own settings layered over the
+# harness's -- rather than a fragment. Cargo enables dev-dependency
+# features only for targets that need them, so the shipped library still
+# parses TOML and never writes it.
+toml = { version = "1", default-features = false, features = ["std", "parse", "serde", "display"] }
 
 [features]
 # external-secret and ephemeral are pure-Rust / filesystem-only and always
@@ -65,3 +71,10 @@ pkcs11 = ["dep:cryptoki"]
 panic = "unwind"   # required: hkdfguard_* catches unwinds at the FFI boundary
 strip = true
 lto = true
+
+[lints.rust]
+# `--cfg hkdfguard_test_paths` builds the library for the test harnesses:
+# it reads HKDFGUARD_POLICY_FILE and accepts configuration owned by the
+# invoking user. Nothing that ships is ever built with it; see
+# `policy::policy_file_path`.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(hkdfguard_test_paths)"] }

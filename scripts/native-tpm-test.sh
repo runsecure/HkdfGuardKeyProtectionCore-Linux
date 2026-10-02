@@ -31,23 +31,26 @@
 #      on the real TPM.
 #   9. If SoftHSM2 is present: the pkcs11 conformance suite.
 #
-# Everything is built in the debug profile, including the .so and CLI the
-# C examples use: release builds deliberately ignore the TCTI, policy-file
-# and derivation-secret environment variables this script steers them with
-# (they take those settings only from root-owned configuration).
+# Everything is configured the way production is -- by a policy file --
+# except that the file lives in this script's temp dir. A library only reads
+# a policy other than /etc/hkdfguard/policy.toml when built with
+# `--cfg hkdfguard_test_paths`, so everything here (tests, the .so, and the
+# CLI the C examples use) is built that way, into its own target directory
+# (target/test-paths) so it never mixes with an ordinary build. Nothing that
+# ships is ever built with that flag.
 #
 # Nothing under /etc/hkdfguard is read or written: every policy and secret
 # file this script uses lives in a temp dir it removes on exit, and the
 # TPM is only ever asked to derive transient primaries (flushed after
 # use). It leaves no state on the TPM.
 #
-# Environment:
+# Options (read by this script; the library reads none of them):
 #   HKDFGUARD_TCTI               override the TCTI (default from preflight)
 #   HKDFGUARD_NATIVE_TEST_STATE  where `reboot capture` saves its state
 #                                (default: ${XDG_STATE_HOME:-~/.local/state}/hkdfguard-native-tpm-test)
 #   HKDFGUARD_TPM_DERIVATION_SECRET_FILE
-#                                the derivation secret to use throughout. If
-#                                unset, the script creates one: in its temp
+#                                the derivation secret to put in the policies.
+#                                If unset, the script creates one: in its temp
 #                                dir for a full run, and in the state dir for
 #                                `reboot`, where capture and verify must share it.
 set -euo pipefail
@@ -65,8 +68,8 @@ PHASE="${2:-}"
 section "preflight"
 # shellcheck source=scripts/native-tpm-preflight.sh
 source scripts/native-tpm-preflight.sh
-export TCTI="${HKDFGUARD_TCTI:-$HKDFGUARD_PREFLIGHT_TCTI}"
-export TPM2TOOLS_TCTI="$TCTI"
+TCTI="${HKDFGUARD_TCTI:-$HKDFGUARD_PREFLIGHT_TCTI}"
+export TPM2TOOLS_TCTI="$TCTI" # for tpm2-tools only; the library takes its TCTI from policy
 MANUFACTURER="$HKDFGUARD_PREFLIGHT_MANUFACTURER"
 
 case "$MANUFACTURER" in
@@ -87,26 +90,52 @@ fi
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-# Isolate from any real host configuration: no policy unless a section
-# writes one, and no external-secret mount.
-export HKDFGUARD_POLICY_FILE="$WORK/no-policy"
-export HKDFGUARD_EXTERNAL_SECRET_DIR="$WORK/no-external-secret"
+
+# Test builds only, in their own target dir; see the note at the top.
+export RUSTFLAGS="--cfg hkdfguard_test_paths"
+export CARGO_TARGET_DIR="$PWD/target/test-paths"
+BIN="$CARGO_TARGET_DIR/debug"
 
 # The TPM provider refuses to run without a derivation secret unless policy
 # says otherwise. Provision a throwaway one for a full run; `reboot` keeps
 # its own in the state dir (below) so it survives the reboot.
-if [ -z "${HKDFGUARD_TPM_DERIVATION_SECRET_FILE:-}" ] && [ "$MODE" != "reboot" ]; then
-    ( umask 077; head -c 32 /dev/urandom > "$WORK/tpm.derivation-secret" )
-    export HKDFGUARD_TPM_DERIVATION_SECRET_FILE="$WORK/tpm.derivation-secret"
+SECRET="${HKDFGUARD_TPM_DERIVATION_SECRET_FILE:-}"
+if [ -z "$SECRET" ] && [ "$MODE" != "reboot" ]; then
+    SECRET="$WORK/tpm.derivation-secret"
+    ( umask 077; head -c 32 /dev/urandom > "$SECRET" )
 fi
 
-# Writes $1 as the active policy file (root-or-self owned, 0600 -- the
-# library refuses anything looser).
+# SoftHSM2, if present: a throwaway token, named in every policy below so
+# the pkcs11 tests can reach it. Same label and PINs as
+# docker/entrypoint-test.sh; the tests select it by label
+# (SOFTHSM_TEST_TOKEN_LABEL in src/provider/pkcs11.rs).
+if [ "$HAVE_SOFTHSM" -eq 1 ]; then
+    export SOFTHSM2_CONF="$WORK/softhsm2.conf"
+    mkdir -p "$WORK/tokens"
+    printf 'directories.tokendir = %s\nobjectstore.backend = file\n' "$WORK/tokens" > "$SOFTHSM2_CONF"
+    softhsm2-util --init-token --free --label hkdfguard-test --pin 1234 --so-pin 5678 >/dev/null
+    ( umask 077; printf '1234\n' > "$WORK/pkcs11.pin" )
+fi
+
+# Prints a complete policy: $1 (the [selection] table and anything else
+# top-level), this machine's TPM settings plus any extra [tpm] keys in $2,
+# the SoftHSM2 token if there is one, then any further tables in $3.
+policy() { # policy <selection...> [extra [tpm] keys] [more tables]
+    printf '%s\n\n[tpm]\ntcti = "%s"\nderivation_secret_file = "%s"\n%s\n' "$1" "$TCTI" "$SECRET" "${2:-}"
+    if [ "$HAVE_SOFTHSM" -eq 1 ]; then
+        printf '\n[pkcs11]\nmodule = "%s"\npin_file = "%s"\ntoken_label = "hkdfguard-test"\n' "$SOFTHSM_MODULE" "$WORK/pkcs11.pin"
+    fi
+    printf '%s\n' "${3:-}"
+}
+
+# Makes `policy "$@"` the policy file every test build reads (tests layer
+# their own policies over it). Owner-only, as the library requires.
 use_policy() {
-    ( umask 077; printf '%s' "$1" > "$WORK/policy.toml" )
+    ( umask 077; policy "$@" > "$WORK/policy.toml" )
     export HKDFGUARD_POLICY_FILE="$WORK/policy.toml"
 }
-no_policy() { export HKDFGUARD_POLICY_FILE="$WORK/no-policy"; }
+# Selects as having no policy file would: the default order, no Ephemeral.
+use_base_policy() { use_policy $'[selection]\nmode = "prefer"'; }
 
 # Runs one #[ignore]d operator-helper test and extracts a KEY=value line.
 # `--exact` matches the *full* test path, so it is spelled out here.
@@ -114,9 +143,6 @@ learn() { # learn <test-name> <KEY>
     cargo test --features tpm2 --lib "provider::tpm2::tests::$1" -- --ignored --exact --nocapture 2>/dev/null \
         | awk -F= -v k="$2" '$1==k {print $2; exit}'
 }
-
-# Debug profile: see the note at the top on why not --release.
-BIN=target/debug
 
 # Builds a C example against the library.
 build_c() { # build_c <source.c> <out>
@@ -129,10 +155,10 @@ build_c() { # build_c <source.c> <out>
 if [ "$MODE" = "reboot" ]; then
     STATE="${HKDFGUARD_NATIVE_TEST_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/hkdfguard-native-tpm-test}"
     SERVICE="com.hkdfguard.nativetest.reboot"
-    use_policy $'[selection]\nmode = "require"\nprovider = "tpm2"\n'
     # The secret must be identical before and after the reboot, or the key
     # can't be re-derived: keep it with the rest of the captured state.
-    export HKDFGUARD_TPM_DERIVATION_SECRET_FILE="${HKDFGUARD_TPM_DERIVATION_SECRET_FILE:-$STATE/tpm.derivation-secret}"
+    SECRET="${SECRET:-$STATE/tpm.derivation-secret}"
+    use_policy $'[selection]\nmode = "require"\nprovider = "tpm2"'
 
     section "build (--features tpm2)"
     cargo build --features tpm2
@@ -142,8 +168,7 @@ if [ "$MODE" = "reboot" ]; then
         capture)
             section "reboot capture -> $STATE"
             mkdir -p "$STATE"; chmod 700 "$STATE"
-            [ -f "$HKDFGUARD_TPM_DERIVATION_SECRET_FILE" ] \
-                || ( umask 077; head -c 32 /dev/urandom > "$HKDFGUARD_TPM_DERIVATION_SECRET_FILE" )
+            [ -f "$SECRET" ] || ( umask 077; head -c 32 /dev/urandom > "$SECRET" )
             ( umask 077; head -c 32 /dev/urandom > "$STATE/dek.bin" )
             HKDFGUARD_PIN_SERVICE="$SERVICE" learn print_service_key_name_for_pinning SERVICE_KEY_NAME > "$STATE/service-name.hex"
             [ -s "$STATE/service-name.hex" ] || { echo "could not learn the service key Name" >&2; exit 1; }
@@ -155,14 +180,14 @@ if [ "$MODE" = "reboot" ]; then
                 --key-file-path "$STATE/wrapped.key" --service-name "$SERVICE" --dek-stdin --force
             note "service key Name: $(cat "$STATE/service-name.hex")"
             note "wrapped DEK saved. Now REBOOT this machine, then run: scripts/native-tpm-test.sh reboot verify"
-            note "derivation secret: $HKDFGUARD_TPM_DERIVATION_SECRET_FILE -- verify must use the same one"
+            note "derivation secret: $SECRET -- verify must use the same one"
             exit 0
             ;;
         verify)
             section "reboot verify <- $STATE"
             [ -f "$STATE/wrapped.key" ] || { echo "no captured state in $STATE; run 'reboot capture' first" >&2; exit 1; }
-            [ -f "$HKDFGUARD_TPM_DERIVATION_SECRET_FILE" ] \
-                || { echo "derivation secret $HKDFGUARD_TPM_DERIVATION_SECRET_FILE is missing; capture's secret is needed to re-derive the key" >&2; exit 1; }
+            [ -f "$SECRET" ] \
+                || { echo "derivation secret $SECRET is missing; capture's secret is needed to re-derive the key" >&2; exit 1; }
             before=$(cat "$STATE/service-name.hex")
             after=$(HKDFGUARD_PIN_SERVICE="$SERVICE" learn print_service_key_name_for_pinning SERVICE_KEY_NAME)
             if [ "$before" != "$after" ]; then
@@ -185,6 +210,8 @@ fi
 # ---------------------------------------------------------------------
 # 2-3. Build + unit tests
 # ---------------------------------------------------------------------
+use_base_policy
+
 section "cargo build --features $FEATURES (real link against libtss2-esys${HAVE_SOFTHSM:+ + cryptoki})"
 cargo build --features "$FEATURES"
 
@@ -213,10 +240,14 @@ cargo test --features tpm2 -- --ignored --test-threads=1 "${SKIP[@]}"
 # 5. Same suite with a derivation secret provisioned
 # ---------------------------------------------------------------------
 section "conformance suite again under a second, different derivation secret"
-( umask 077; head -c 32 /dev/urandom > "$WORK/tpm.derivation-secret.2" )
-HKDFGUARD_TPM_DERIVATION_SECRET_FILE="$WORK/tpm.derivation-secret.2" \
-    cargo test --features tpm2 -- --ignored --test-threads=1 "${SKIP[@]}"
+FIRST_SECRET="$SECRET"
+SECRET="$WORK/tpm.derivation-secret.2"
+( umask 077; head -c 32 /dev/urandom > "$SECRET" )
+use_base_policy
+cargo test --features tpm2 -- --ignored --test-threads=1 "${SKIP[@]}"
 note "a different secret changed every service key; the suite still passed"
+SECRET="$FIRST_SECRET"
+use_base_policy
 
 # ---------------------------------------------------------------------
 # 6. Learn pins from the TPM, write a `required` policy
@@ -227,36 +258,29 @@ SVC_NAME=$(HKDFGUARD_PIN_SERVICE=com.company.orders learn print_service_key_name
 [ -n "$SALT_NAME" ] && [ -n "$SVC_NAME" ] || { echo "could not learn the Names to pin" >&2; exit 1; }
 note "salt key Name:      $SALT_NAME"
 note "service key Name:   $SVC_NAME (com.company.orders)"
-REQUIRED_POLICY=$(cat <<EOF
-[selection]
-mode = "require"
-provider = "tpm2"
-
-[tpm]
-session_encryption = "required"
-pinned_session_salt_key_name = "$SALT_NAME"
-
-[tpm.pinned_names]
-"com.company.orders" = "$SVC_NAME"
-EOF
-)
-note "this policy is what a hardened deployment on THIS machine would install at /etc/hkdfguard/policy.toml"
-printf '%s\n' "$REQUIRED_POLICY" > "$WORK/required-policy.example.toml"
+REQUIRED_SELECTION=$'[selection]\nmode = "require"\nprovider = "tpm2"'
+REQUIRED_TPM_KEYS="session_encryption = \"required\"
+pinned_session_salt_key_name = \"$SALT_NAME\""
+REQUIRED_PINS="[tpm.pinned_names]
+\"com.company.orders\" = \"$SVC_NAME\""
+note "with this machine's real derivation-secret path in place of the scratch one, this is what a"
+note "hardened deployment on THIS machine would install at /etc/hkdfguard/policy.toml:"
+policy "$REQUIRED_SELECTION" "$REQUIRED_TPM_KEYS" "$REQUIRED_PINS" | sed 's/^/     /'
 
 # ---------------------------------------------------------------------
 # 7. C ABI round trip on the TPM, under both policies
 # ---------------------------------------------------------------------
-section "cargo build --features tpm2 (debug: the env overrides this script uses are debug-only)"
+section "cargo build --features tpm2 (the .so and CLI the C examples load)"
 cargo build --features tpm2
 build_c examples/wrap_unwrap.c "$WORK/wrap_unwrap"
 build_c examples/cli_unwrap_check.c "$WORK/cli_unwrap_check"
 
 section "C ABI round trip (examples/wrap_unwrap.c) -- KEK on the TPM, policy: require tpm2, session_encryption auto"
-use_policy $'[selection]\nmode = "require"\nprovider = "tpm2"\n'
+use_policy $'[selection]\nmode = "require"\nprovider = "tpm2"'
 LD_LIBRARY_PATH="$BIN" "$WORK/wrap_unwrap"
 
 section "C ABI round trip -- policy: session_encryption REQUIRED with both Names pinned"
-use_policy "$REQUIRED_POLICY"
+use_policy "$REQUIRED_SELECTION" "$REQUIRED_TPM_KEYS" "$REQUIRED_PINS"
 LD_LIBRARY_PATH="$BIN" "$WORK/wrap_unwrap"
 note "every ECDH in that run went through a salted, AES-128-CFB-encrypted session against a pinned salt key"
 
@@ -270,23 +294,14 @@ CLI_SERVICE=com.hkdfguard.nativetest.cli
 base64 -w0 < "$WORK/dek.bin" | "$BIN"/hkdfguard-v1-initialize wrap \
     --key-file-path "$WORK/wrapped.key" --service-name "$CLI_SERVICE" --dek-stdin --force
 LD_LIBRARY_PATH="$BIN" "$WORK/cli_unwrap_check" "$WORK/wrapped.key" "$CLI_SERVICE" "$WORK/dek.bin"
-no_policy
+use_base_policy
 
 # ---------------------------------------------------------------------
 # 9. Optional PKCS#11
 # ---------------------------------------------------------------------
 if [ "$HAVE_SOFTHSM" -eq 1 ]; then
-    section "SoftHSM2 token + cargo test --features pkcs11 -- --ignored"
-    export SOFTHSM2_CONF="$WORK/softhsm2.conf"
-    mkdir -p "$WORK/tokens"
-    printf 'directories.tokendir = %s\nobjectstore.backend = file\n' "$WORK/tokens" > "$SOFTHSM2_CONF"
-    # Same label and PINs as docker/entrypoint-test.sh; the pkcs11 tests
-    # select this token by label (SOFTHSM_TEST_TOKEN_LABEL in src/provider/pkcs11.rs).
-    softhsm2-util --init-token --free --label hkdfguard-test --pin 1234 --so-pin 5678 >/dev/null
-    ( umask 077; printf '1234\n' > "$WORK/pkcs11.pin" )
-    export HKDFGUARD_PKCS11_MODULE="$SOFTHSM_MODULE" HKDFGUARD_PKCS11_PIN_FILE="$WORK/pkcs11.pin"
+    section "cargo test --features pkcs11 -- --ignored (against the SoftHSM2 token in the policy)"
     cargo test --features pkcs11 -- --ignored --test-threads=1
-    unset HKDFGUARD_PKCS11_MODULE HKDFGUARD_PKCS11_PIN_FILE SOFTHSM2_CONF
 else
     section "pkcs11 suite skipped (SoftHSM2 not installed)"
 fi

@@ -12,13 +12,18 @@
 //! There is no software-backed (locally-generated, filesystem-encrypted-
 //! at-rest) provider on this platform, so the persistent provider used
 //! here is external-secret: each test pre-provisions its own service's
-//! secret file into an isolated temp directory before invoking the CLI,
+//! secret file into an isolated temp directory, and writes a policy pinning
+//! the chain to external-secret at that directory, before invoking the CLI,
 //! mimicking how a real deployment platform (Vault Agent, a Kubernetes
 //! Secret, ...) would have already dropped the file before the app starts
 //! -- external-secret never creates one itself. For that provider,
 //! `provision` therefore always reports "already provisioned": the mounted
 //! file *is* the provisioning. The create path is covered in-process by
 //! the binary's own unit tests against the ephemeral provider.
+//!
+//! Both the CLI and this process must read the test's own policy, which a
+//! library only does when built with `--cfg hkdfguard_test_paths` (never
+//! anything that ships). Without it, the tests that need one are ignored.
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use p256::SecretKey;
@@ -39,19 +44,44 @@ fn tempdir() -> std::io::Result<tempfile::TempDir> {
 }
 use HkdfGuardKeyProtectionLinux::{hkdfguard_unwrap_dek, status};
 
+// Runs `f` with `doc` as the policy -- read by this process's library and,
+// through the inherited environment, by every CLI process it spawns --
+// then restores whatever policy (if any) the harness had set.
+fn with_policy<F: FnOnce()>(doc: &str, f: F) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("policy.toml");
+    fs::write(&path, doc).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap(); // not the umask: a group-writable policy is refused
+    let saved = std::env::var_os("HKDFGUARD_POLICY_FILE");
+    std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
+    f();
+    match saved {
+        Some(v) => std::env::set_var("HKDFGUARD_POLICY_FILE", v),
+        None => std::env::remove_var("HKDFGUARD_POLICY_FILE"),
+    }
+}
+
+// A policy pinning the chain to external-secret, at `mount`.
+fn external_secret_policy(mount: &Path) -> String {
+    format!(
+        "[selection]\nmode = \"require\"\nprovider = \"external-secret\"\n[external_secret]\ndir = \"{}\"\n",
+        mount.display()
+    )
+}
+
 // Points the external-secret provider at a fresh temp directory, isolated
 // from any real host KEK storage, and pre-provisions a secret file for
 // `service` inside it -- external-secret never creates one itself, so
-// `wrap` only finds a KEK because this is already here.
+// `wrap` only finds a KEK because this is already here. The policy pins
+// the chain to it: with `tpm2` compiled in and a TPM reachable, the TPM
+// would otherwise serve the service and this would test the wrong thing.
 fn with_provisioned_external_secret<F: FnOnce()>(service: &str, f: F) {
     let dir = tempdir().unwrap();
-    std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", dir.path());
     let secret_key = SecretKey::random(&mut OsRng);
     let secret_path = dir.path().join(service);
     fs::write(&secret_path, secret_key.to_bytes()).unwrap();
     fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600)).unwrap(); // owner-only, as the provider requires of a KEK file
-    f();
-    std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
+    with_policy(&external_secret_policy(dir.path()), f);
 }
 
 fn cli() -> Command {
@@ -113,6 +143,7 @@ fn stderr_of(o: &Output) -> String {
 
 #[test]
 #[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
 fn cli_provision_then_wrap_unwraps_to_original_input() {
     with_provisioned_external_secret("com.example.orders", || {
         let original_dek: [u8; 32] = core::array::from_fn(|i| i as u8);
@@ -149,6 +180,7 @@ fn cli_provision_then_wrap_unwraps_to_original_input() {
 
 #[test]
 #[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
 fn cli_force_overwrite_secure_deletes_then_rewraps() {
     with_provisioned_external_secret("com.example.rotation", || {
         let out_dir = tempdir().unwrap();
@@ -181,9 +213,6 @@ fn cli_rejects_pre_existing_file_without_force() {
     // This scenario never reaches the KEK provider at all -- `wrap`'s own
     // pre-check refuses an existing output file before reading the DEK or
     // touching the library -- so no external secret needs to be provisioned.
-    let dir = tempdir().unwrap();
-    std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", dir.path());
-
     let out_dir = tempdir().unwrap();
     let key_path = out_dir.path().join("wrapped.key");
     fs::write(&key_path, b"pre-existing content").unwrap();
@@ -196,12 +225,11 @@ fn cli_rejects_pre_existing_file_without_force() {
         b"pre-existing content",
         "existing file must be left untouched without --force"
     );
-
-    std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
 }
 
 #[test]
 #[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
 fn cli_wrap_without_a_provisioned_kek_fails_and_preserves_the_existing_file() {
     // An external-secret mount that exists but holds nothing for this
     // service, and a policy that pins the chain to external-secret. The
@@ -212,13 +240,7 @@ fn cli_wrap_without_a_provisioned_kek_fails_and_preserves_the_existing_file() {
     // Relying on "no provider happens to be available" would make this
     // test track the host's hardware instead of the CLI's behavior.
     let empty_mount = tempdir().unwrap();
-    std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", empty_mount.path());
-    let policy_dir = tempdir().unwrap();
-    let policy = policy_dir.path().join("policy.toml");
-    fs::write(&policy, "[selection]\nmode = \"require\"\nprovider = \"external-secret\"\n").unwrap();
-    fs::set_permissions(&policy, fs::Permissions::from_mode(0o644)).unwrap(); // not the umask: some distros default to 002 (group-writable), which the policy loader correctly refuses
-    std::env::set_var("HKDFGUARD_POLICY_FILE", &policy);
-
+    with_policy(&external_secret_policy(empty_mount.path()), || {
     let out_dir = tempdir().unwrap();
     let key_path = out_dir.path().join("wrapped.key");
     fs::write(&key_path, b"the key file that was already here").unwrap();
@@ -243,13 +265,12 @@ fn cli_wrap_without_a_provisioned_kek_fails_and_preserves_the_existing_file() {
     // create a KEK, and nothing else is allowed to.
     let provisioned = run_provision("com.example.unprovisioned");
     assert!(!provisioned.status.success(), "provision must fail when no provider can create a KEK");
-
-    std::env::remove_var("HKDFGUARD_POLICY_FILE");
-    std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
+    });
 }
 
 #[test]
 #[serial]
+#[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
 fn cli_accepts_the_dek_from_a_file_and_refuses_it_on_the_command_line() {
     with_provisioned_external_secret("com.example.fileinput", || {
         let original_dek = [0x7Bu8; 32];

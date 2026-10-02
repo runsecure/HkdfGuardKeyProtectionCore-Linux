@@ -10,8 +10,16 @@ section() { printf '\n\033[1;36m== %s ==\033[0m\n' "$1"; }
 section "cargo build (default features: external-secret, ephemeral)"
 cargo build
 
-section "cargo test (default features)"
+section "cargo test (default features; tests that need their own policy are ignored without --cfg hkdfguard_test_paths)"
 cargo test
+
+# Everything below that steers the library at scratch files does it the way
+# production does -- with a policy file -- in builds made with
+# `--cfg hkdfguard_test_paths`, the only builds that read a policy other
+# than /etc/hkdfguard/policy.toml. They go in their own target dir, so they
+# never mix with the release and plain builds checked further down.
+test_cargo() { RUSTFLAGS="--cfg hkdfguard_test_paths" CARGO_TARGET_DIR=target/test-paths cargo "$@"; }
+TEST_BIN=target/test-paths/debug
 
 section "cargo build --features tpm2,pkcs11 (real link against libtss2-esys + cryptoki)"
 cargo build --features tpm2,pkcs11
@@ -29,28 +37,10 @@ SWTPM_PID=$!
 trap 'kill "$SWTPM_PID" 2>/dev/null || true' EXIT
 sleep 1
 
-export TCTI="swtpm:host=127.0.0.1,port=2321"
-export TPM2TOOLS_TCTI="$TCTI"
-tpm2_startup -c -T "$TCTI"
-echo "swtpm is up and started (TCTI=$TCTI)."
-
-# The TPM provider requires a derivation secret by default. Debug builds
-# (the test suites below) take its path from this variable; tests that
-# exercise running without one set tpm.require_derivation_secret = false
-# in their own policy.
-TPM_SECRET_DIR=$(mktemp -d)
-( umask 077; head -c 32 /dev/urandom > "$TPM_SECRET_DIR/tpm.derivation-secret" )
-export HKDFGUARD_TPM_DERIVATION_SECRET_FILE="$TPM_SECRET_DIR/tpm.derivation-secret"
-
-# The tpm2 feature's non-hardware tests -- derivation-secret file
-# handling, template attributes, client-side Name computation -- need the
-# feature to compile but no TPM, and are therefore not #[ignore]d. They
-# only ever get compiled and run on Linux, so run them explicitly here.
-section "cargo test --features tpm2 (tpm2 unit tests: derivation secret, Name computation)"
-cargo test --features tpm2
-
-section "cargo test --features tpm2 -- --ignored (against swtpm)"
-cargo test --features tpm2 -- --ignored --test-threads=1
+SWTPM_TCTI="swtpm:host=127.0.0.1,port=2321"
+export TPM2TOOLS_TCTI="$SWTPM_TCTI" # tpm2-tools only; the library takes its TCTI from policy
+tpm2_startup -c -T "$SWTPM_TCTI"
+echo "swtpm is up and started (TCTI=$SWTPM_TCTI)."
 
 section "initializing a SoftHSM2 token"
 SOFTHSM_MODULE=$(find /usr/lib -iname "libsofthsm2.so" 2>/dev/null | head -n1)
@@ -61,25 +51,46 @@ fi
 # Same label and PINs as scripts/native-tpm-test.sh; the pkcs11 tests select
 # this token by label (SOFTHSM_TEST_TOKEN_LABEL in src/provider/pkcs11.rs).
 softhsm2-util --init-token --free --label hkdfguard-test --pin 1234 --so-pin 5678
-export HKDFGUARD_PKCS11_MODULE="$SOFTHSM_MODULE"
-# The PIN is read from an owner-only file, never an environment variable
-# (see src/provider/pkcs11.rs); the module must be root-owned, which the
-# apt-installed libsofthsm2.so is.
-PIN_DIR=$(mktemp -d)
-( umask 077; printf '1234\n' > "$PIN_DIR/pkcs11.pin" )
-export HKDFGUARD_PKCS11_PIN_FILE="$PIN_DIR/pkcs11.pin"
-echo "SoftHSM2 token ready (module=$HKDFGUARD_PKCS11_MODULE, PIN file=$HKDFGUARD_PKCS11_PIN_FILE)."
+echo "SoftHSM2 token ready (module=$SOFTHSM_MODULE)."
+
+# The harness policy every test build reads: the default selection, plus
+# this container's machine facts -- swtpm, a scratch derivation secret (the
+# TPM provider requires one by default), and the SoftHSM2 token with an
+# owner-only PIN file. Tests layer their own policies over it.
+HARNESS=$(mktemp -d)
+( umask 077; head -c 32 /dev/urandom > "$HARNESS/tpm.derivation-secret" )
+( umask 077; printf '1234\n' > "$HARNESS/pkcs11.pin" )
+cat > "$HARNESS/policy.toml" <<TOML
+[selection]
+mode = "prefer"
+
+[tpm]
+tcti = "$SWTPM_TCTI"
+derivation_secret_file = "$HARNESS/tpm.derivation-secret"
+
+[pkcs11]
+module = "$SOFTHSM_MODULE"
+pin_file = "$HARNESS/pkcs11.pin"
+token_label = "hkdfguard-test"
+TOML
+chmod 0644 "$HARNESS/policy.toml"
+export HKDFGUARD_POLICY_FILE="$HARNESS/policy.toml"
+
+section "cargo test --features tpm2 (test build: unit tests, plus the CLI and integration tests that need their own policy)"
+test_cargo test --features tpm2
+
+section "cargo test --features tpm2 -- --ignored (against swtpm)"
+test_cargo test --features tpm2 -- --ignored --test-threads=1
 
 section "cargo test --features pkcs11 -- --ignored (against SoftHSM2)"
-cargo test --features pkcs11 -- --ignored --test-threads=1
+test_cargo test --features pkcs11 -- --ignored --test-threads=1
+
+unset HKDFGUARD_POLICY_FILE TPM2TOOLS_TCTI
 
 section "C ABI round trip via examples/wrap_unwrap.c (default providers)"
-unset HKDFGUARD_PKCS11_MODULE HKDFGUARD_PKCS11_PIN_FILE TCTI TPM2TOOLS_TCTI
-rm -rf "$PIN_DIR"
 # With no policy file, Ephemeral is never used, so the example needs a
 # real KEK: provision an external secret for its service, as a
-# deployment platform would. Release builds ignore
-# HKDFGUARD_EXTERNAL_SECRET_DIR, so it goes in a standard secret mount.
+# deployment platform would, in a standard secret mount.
 SECRET_MOUNT=/run/secrets/hkdfguard
 mkdir -p "$SECRET_MOUNT"
 ( umask 077; head -c 32 /dev/urandom > "$SECRET_MOUNT/com.company.orders" ) # owner-only, as the provider requires of a KEK file
@@ -160,25 +171,29 @@ echo "--dek correctly rejected; unprovisioned wrap correctly refused; stdin and 
 rm -f "$DEK_FILE" "$WRAPPED_FILE" "$WRAPPED_FILE2" "$DEK_B64_FILE"
 rm -rf "$SECRET_MOUNT"
 
-section "release builds take security settings only from root-owned config, not the environment"
-# Debug builds (everything above) honor HKDFGUARD_POLICY_FILE, the TCTI
-# variables and HKDFGUARD_TPM_DERIVATION_SECRET_FILE so tests can redirect
-# them. Release builds must not. Install a real root policy that reaches
-# swtpm through `tpm.tcti`, then set all three variables to values that
-# would break anything that read them. The release binaries must ignore
-# them and work; the debug CLI, as a control, must read the bad policy and
-# fail -- proving this check would catch a release build that honored it.
+section "builds that ship take configuration only from /etc/hkdfguard/policy.toml"
+# Release builds, and plain debug builds -- anything not made with
+# `--cfg hkdfguard_test_paths` -- must take every security setting from the
+# root-owned policy, never the environment. Install a real policy reaching
+# swtpm through `tpm.tcti`, then set every variable that ever redirected
+# configuration (HKDFGUARD_POLICY_FILE, and the retired TCTI, derivation-
+# secret, secret-mount and PKCS#11 ones) to values that would break anything
+# that read them. Both shipped-style builds must ignore them and work; the
+# test build's CLI, as a control, must follow HKDFGUARD_POLICY_FILE to the
+# malformed policy and fail -- proving this check would catch a build that
+# honored it.
 cargo build --release --features tpm2,pkcs11
-cargo build --features tpm2,pkcs11   # the debug CLI used as the control below
+cargo build --features tpm2,pkcs11            # plain debug: must behave like release here
+test_cargo build --features tpm2,pkcs11       # the control
 mkdir -p /etc/hkdfguard
 ( umask 077; head -c 32 /dev/urandom > /etc/hkdfguard/tpm.derivation-secret )  # required by default
-cat > /etc/hkdfguard/policy.toml <<'TOML'
+cat > /etc/hkdfguard/policy.toml <<TOML
 [selection]
 mode = "require"
 provider = "tpm2"
 
 [tpm]
-tcti = "swtpm:host=127.0.0.1,port=2321"
+tcti = "$SWTPM_TCTI"
 TOML
 chmod 0644 /etc/hkdfguard/policy.toml
 
@@ -186,28 +201,26 @@ BAD_DIR=$(mktemp -d)
 printf 'this is not = valid [toml' > "$BAD_DIR/policy.toml"
 printf 'group-readable, so refused if read' > "$BAD_DIR/secret"; chmod 0640 "$BAD_DIR/secret"
 export HKDFGUARD_POLICY_FILE="$BAD_DIR/policy.toml"
-export TCTI="device:/dev/nonexistent-tpm" TPM2TOOLS_TCTI="device:/dev/nonexistent-tpm"
+export TCTI="device:/dev/nonexistent-tpm" TPM2TOOLS_TCTI="device:/dev/nonexistent-tpm" TEST_TCTI="device:/dev/nonexistent-tpm"
 export HKDFGUARD_TPM_DERIVATION_SECRET_FILE="$BAD_DIR/secret"
+export HKDFGUARD_EXTERNAL_SECRET_DIR=/nonexistent-secret-mount
+export HKDFGUARD_PKCS11_MODULE="$SOFTHSM_MODULE" HKDFGUARD_PKCS11_PIN_FILE="$HARNESS/pkcs11.pin" HKDFGUARD_PKCS11_SLOT=0
 
 LD_LIBRARY_PATH=target/release /tmp/wrap_unwrap
-RELEASE_STDERR=$(target/release/hkdfguard-v1-initialize provision --service-name com.hkdfguard.dockertest.release 2>&1 >/dev/null) \
-    || { echo "FAIL: release CLI did not ignore the debug-only overrides: $RELEASE_STDERR" >&2; exit 1; }
-for var in HKDFGUARD_POLICY_FILE TPM2TOOLS_TCTI HKDFGUARD_TPM_DERIVATION_SECRET_FILE; do
-    grep -q "$var is set but ignored" <<<"$RELEASE_STDERR" \
-        || { echo "FAIL: release CLI did not warn that $var was ignored: $RELEASE_STDERR" >&2; exit 1; }
+for build in release debug; do
+    OUT=$(target/$build/hkdfguard-v1-initialize provision --service-name com.hkdfguard.dockertest.shipped 2>&1) \
+        || { echo "FAIL: the $build CLI did not take its configuration from /etc/hkdfguard: $OUT" >&2; exit 1; }
+    grep -q "HKDFGUARD_POLICY_FILE is set but ignored" <<<"$OUT" \
+        || { echo "FAIL: the $build CLI did not warn that HKDFGUARD_POLICY_FILE was ignored: $OUT" >&2; exit 1; }
+    echo "$build: provisioned on the TPM named by /etc/hkdfguard/policy.toml; every override ignored."
 done
-echo "release: wrap/unwrap on the TPM named by /etc/hkdfguard/policy.toml; all three overrides ignored, with warnings."
-
-if target/debug/hkdfguard-v1-initialize provision --service-name com.hkdfguard.dockertest.release >/dev/null 2>&1; then
-    echo "FAIL: control: the debug CLI should have read the malformed HKDFGUARD_POLICY_FILE and failed" >&2; exit 1
+if "$TEST_BIN"/hkdfguard-v1-initialize provision --service-name com.hkdfguard.dockertest.shipped >/dev/null 2>&1; then
+    echo "FAIL: control: the test-build CLI should have read the malformed HKDFGUARD_POLICY_FILE and failed" >&2; exit 1
 fi
-echo "control: the debug CLI honored the malformed override and failed, as designed."
+echo "control: the test-build CLI honored the malformed HKDFGUARD_POLICY_FILE and failed, as designed."
 
-unset HKDFGUARD_POLICY_FILE TCTI TPM2TOOLS_TCTI HKDFGUARD_TPM_DERIVATION_SECRET_FILE
-
-# External secret: the variable points nowhere; release must ignore it and
-# find the KEK in the standard mount, while the debug control follows it
-# and finds nothing.
+# External secret: the policy names no directory, so the standard mount is
+# used; the retired variable pointing nowhere changes nothing.
 cat > /etc/hkdfguard/policy.toml <<'TOML'
 [selection]
 mode = "require"
@@ -215,48 +228,37 @@ provider = "external-secret"
 TOML
 mkdir -p /run/secrets/hkdfguard
 ( umask 077; head -c 32 /dev/urandom > /run/secrets/hkdfguard/com.hkdfguard.dockertest.extsecret )
-export HKDFGUARD_EXTERNAL_SECRET_DIR=/nonexistent-secret-mount
-RELEASE_OUT=$(target/release/hkdfguard-v1-initialize provision --service-name com.hkdfguard.dockertest.extsecret 2>&1) \
-    || { echo "FAIL: release CLI did not ignore HKDFGUARD_EXTERNAL_SECRET_DIR: $RELEASE_OUT" >&2; exit 1; }
-grep -q 'already provisioned' <<<"$RELEASE_OUT" && grep -q 'HKDFGUARD_EXTERNAL_SECRET_DIR is set but ignored' <<<"$RELEASE_OUT" \
-    || { echo "FAIL: release CLI should have used the standard mount and warned: $RELEASE_OUT" >&2; exit 1; }
-if HKDFGUARD_POLICY_FILE=/etc/hkdfguard/policy.toml target/debug/hkdfguard-v1-initialize provision \
-        --service-name com.hkdfguard.dockertest.extsecret >/dev/null 2>&1; then
-    echo "FAIL: control: the debug CLI should have followed HKDFGUARD_EXTERNAL_SECRET_DIR and found nothing" >&2; exit 1
-fi
-echo "release: external-secret ignored HKDFGUARD_EXTERNAL_SECRET_DIR and used the standard mount; debug control followed it."
-unset HKDFGUARD_EXTERNAL_SECRET_DIR
+for build in release debug; do
+    OUT=$(target/$build/hkdfguard-v1-initialize provision --service-name com.hkdfguard.dockertest.extsecret 2>&1) \
+        || { echo "FAIL: the $build CLI did not use the standard secret mount: $OUT" >&2; exit 1; }
+    grep -q 'already provisioned' <<<"$OUT" \
+        || { echo "FAIL: the $build CLI should have found the KEK in the standard mount: $OUT" >&2; exit 1; }
+done
+echo "release, debug: external-secret used the standard mount; HKDFGUARD_EXTERNAL_SECRET_DIR ignored."
 rm -rf /run/secrets/hkdfguard
 
 # PKCS#11: SoftHSM2 is installed, with an initialized token and a valid PIN
-# at the default PIN path, and the variables point at all of it -- but the
-# policy names no module. Release must not use PKCS#11 at all (no default
-# module search, variables ignored); the debug control uses it.
+# at the default PIN path, and the retired variables point at all of it --
+# but the policy names no module. Neither build may use PKCS#11 (no default
+# module search, variables ignored).
 cat > /etc/hkdfguard/policy.toml <<'TOML'
 [selection]
 mode = "require"
 provider = "pkcs11"
 TOML
 ( umask 077; printf '1234\n' > /etc/hkdfguard/pkcs11.pin )
-PIN_DIR=$(mktemp -d)
-( umask 077; printf '1234\n' > "$PIN_DIR/pkcs11.pin" )
-export HKDFGUARD_PKCS11_MODULE="$SOFTHSM_MODULE" HKDFGUARD_PKCS11_PIN_FILE="$PIN_DIR/pkcs11.pin" HKDFGUARD_PKCS11_SLOT=0
-if RELEASE_OUT=$(target/release/hkdfguard-v1-initialize provision --service-name com.hkdfguard.dockertest.pkcs11 2>&1); then
-    echo "FAIL: release CLI used PKCS#11 with no pkcs11.module in policy: $RELEASE_OUT" >&2; exit 1
-fi
-grep -q 'no KEK provider is available' <<<"$RELEASE_OUT" \
-    || { echo "FAIL: release CLI should have found no provider: $RELEASE_OUT" >&2; exit 1; }
-for var in HKDFGUARD_PKCS11_MODULE HKDFGUARD_PKCS11_PIN_FILE HKDFGUARD_PKCS11_SLOT; do
-    grep -q "$var is set but ignored" <<<"$RELEASE_OUT" \
-        || { echo "FAIL: release CLI did not warn that $var was ignored: $RELEASE_OUT" >&2; exit 1; }
+for build in release debug; do
+    if OUT=$(target/$build/hkdfguard-v1-initialize provision --service-name com.hkdfguard.dockertest.pkcs11 2>&1); then
+        echo "FAIL: the $build CLI used PKCS#11 with no pkcs11.module in policy: $OUT" >&2; exit 1
+    fi
+    grep -q 'no KEK provider is available' <<<"$OUT" \
+        || { echo "FAIL: the $build CLI should have found no provider: $OUT" >&2; exit 1; }
 done
-HKDFGUARD_POLICY_FILE=/etc/hkdfguard/policy.toml target/debug/hkdfguard-v1-initialize provision \
-    --service-name com.hkdfguard.dockertest.pkcs11 >/dev/null 2>&1 \
-    || { echo "FAIL: control: the debug CLI should have reached SoftHSM2 through the variables" >&2; exit 1; }
-echo "release: PKCS#11 unused without pkcs11.module (no SoftHSM2 search, variables ignored); debug control used it."
-unset HKDFGUARD_PKCS11_MODULE HKDFGUARD_PKCS11_PIN_FILE HKDFGUARD_PKCS11_SLOT
+echo "release, debug: PKCS#11 unused without pkcs11.module (no SoftHSM2 search, variables ignored)."
 
-rm -rf /etc/hkdfguard "$BAD_DIR" "$PIN_DIR"
+unset HKDFGUARD_POLICY_FILE TCTI TPM2TOOLS_TCTI TEST_TCTI HKDFGUARD_TPM_DERIVATION_SECRET_FILE \
+      HKDFGUARD_EXTERNAL_SECRET_DIR HKDFGUARD_PKCS11_MODULE HKDFGUARD_PKCS11_PIN_FILE HKDFGUARD_PKCS11_SLOT
+rm -rf /etc/hkdfguard "$BAD_DIR" "$HARNESS"
 
 section "hkdfguard-v1-initialize locks its memory when it can"
 # docker/run-tests.sh and CI grant CAP_IPC_LOCK, so the CLI must take the

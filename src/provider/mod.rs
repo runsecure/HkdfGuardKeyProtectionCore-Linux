@@ -408,7 +408,7 @@ mod tests {
     // tests that don't care about policy behavior aren't accidentally
     // affected by a real /etc/hkdfguard/policy.conf on the test host.
     fn clear_policy_env() {
-        std::env::set_var("HKDFGUARD_POLICY_FILE", "/nonexistent-hkdfguard-policy-for-tests");
+        let _no_policy = crate::policy::test_support::TestPolicy::absent();
     }
 
     // Stand-in for `.unwrap_err()`: the `Ok` type here is
@@ -493,7 +493,6 @@ mod tests {
             let p = get_by_type(ProviderType::Ephemeral).unwrap();
             assert_eq!(p.provider_type(), ProviderType::Ephemeral);
         }
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
     }
 
     #[test]
@@ -507,7 +506,7 @@ mod tests {
             let _policy = crate::policy::allow_ephemeral_policy_for_tests(); // the billing fall-through below needs Ephemeral opted in
 
             let ext_dir = crate::secure_file::private_tempdir();
-            std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", ext_dir.path());
+            let _secret_mount = crate::policy::test_support::secret_mount(ext_dir.path());
 
             // Write an external secret for "com.company.orders", owner-only
             // as the provider requires of a KEK file.
@@ -526,8 +525,6 @@ mod tests {
             assert_eq!(provider2.provider_type(), ProviderType::Ephemeral);
             assert_eq!(handle2.key_id(), b"ephemeral:com.company.billing");
 
-            std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
-            std::env::remove_var("HKDFGUARD_POLICY_FILE");
         }
     }
 
@@ -545,12 +542,9 @@ mod tests {
             // *no-policy default*, so the policy deliberately isn't
             // pinned; see `assert_never_ephemeral` for why the outcome is
             // asserted as an invariant rather than one fixed result.
-            std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-dir-for-tests");
 
             assert_never_ephemeral(create_kek("com.company.orders.nopolicy"));
 
-            std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
-            std::env::remove_var("HKDFGUARD_POLICY_FILE");
         }
     }
 
@@ -560,14 +554,11 @@ mod tests {
         #[cfg(feature = "ephemeral")]
         {
             let _policy = crate::policy::allow_ephemeral_policy_for_tests();
-            std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-dir-for-tests");
 
             let (provider, handle) = create_kek("com.company.orders").unwrap();
             assert_eq!(provider.provider_type(), ProviderType::Ephemeral);
             assert_eq!(handle.key_id(), b"ephemeral:com.company.orders");
 
-            std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
-            std::env::remove_var("HKDFGUARD_POLICY_FILE");
         }
     }
 
@@ -586,7 +577,7 @@ mod tests {
             // provider.
             let _policy = crate::policy::require_provider_policy_for_tests("external-secret");
             let ext_dir = crate::secure_file::private_tempdir();
-            std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", ext_dir.path());
+            let _secret_mount = crate::policy::test_support::secret_mount(ext_dir.path());
 
             // external-secret never creates a key itself, so both
             // services need to be pre-provisioned.
@@ -611,8 +602,6 @@ mod tests {
                 "each call must construct its own provider; no instance may be retained between calls"
             );
 
-            std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
-            std::env::remove_var("HKDFGUARD_POLICY_FILE");
         }
     }
 
@@ -627,7 +616,6 @@ mod tests {
             // it already "created" here.
             let service = "com.company.nevercreated.selectexisting";
             let _policy = crate::policy::allow_ephemeral_policy_for_tests();
-            std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-dir-for-tests");
 
             let err = expect_err(select_existing(service));
             assert!(matches!(err, Error::KekNotFound));
@@ -639,21 +627,13 @@ mod tests {
             let (provider, _handle) = select_existing(service).unwrap();
             assert_eq!(provider.provider_type(), ProviderType::Ephemeral);
 
-            std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
-            std::env::remove_var("HKDFGUARD_POLICY_FILE");
         }
     }
 
-    // Writes `doc` to a fresh temp file and points HKDFGUARD_POLICY_FILE
-    // at it, returning the owning `TempDir` -- callers must keep that
-    // binding alive for as long as the policy file needs to exist (an
-    // unbound `crate::secure_file::private_tempdir().path().join(...)` drops the directory,
-    // and everything in it, at the end of that statement).
-    fn write_policy(doc: &str) -> tempfile::TempDir {
-        let dir = crate::secure_file::private_tempdir();
-        crate::secure_file::write_world_readable_for_tests(&dir.path().join("policy.toml"), doc);
-        std::env::set_var("HKDFGUARD_POLICY_FILE", dir.path().join("policy.toml"));
-        dir
+    // `doc` as the policy while the returned guard lives -- bind it
+    // (`let _policy = ...`), or it is gone at the end of the statement.
+    fn write_policy(doc: &str) -> crate::policy::test_support::TestPolicy {
+        crate::policy::test_support::TestPolicy::write(doc)
     }
 
     #[test]
@@ -661,7 +641,6 @@ mod tests {
     fn policy_prefer_mode_restricts_to_named_providers_in_order() {
         #[cfg(all(feature = "external-secret", feature = "ephemeral"))]
         {
-            std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-dir-for-tests");
 
             // Deliberately excludes external-secret; naming Ephemeral in
             // preferred_order is what makes it reachable at all.
@@ -674,8 +653,6 @@ mod tests {
                 "policy names only Ephemeral, so it must be used"
             );
 
-            std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
-            std::env::remove_var("HKDFGUARD_POLICY_FILE");
         }
     }
 
@@ -684,8 +661,10 @@ mod tests {
     fn policy_require_provider_fails_closed_when_unreachable() {
         #[cfg(feature = "pkcs11")]
         {
-            // PKCS#11 is compiled in but never reachable in this test
-            // environment (no HKDFGUARD_PKCS11_PIN set), and the policy
+            // Nothing from the harness: no PKCS#11 module or PIN file.
+            let _isolated = crate::policy::test_support::TestPolicy::absent();
+            // PKCS#11 is compiled in but not reachable here (the policy
+            // names no module), and the policy
             // requires exactly it -- so there must be no fallback to
             // Ephemeral/external-secret, unlike the unrestricted default
             // chain (this is the Linux equivalent of "Require TPM
@@ -695,7 +674,6 @@ mod tests {
             let err = expect_err(create_kek("com.company.orders"));
             assert!(matches!(err, Error::NoProviderAvailable | Error::Provider(_)));
 
-            std::env::remove_var("HKDFGUARD_POLICY_FILE");
         }
     }
 
@@ -704,8 +682,10 @@ mod tests {
     fn policy_prefer_mode_falls_through_unreachable_providers_to_a_reachable_one() {
         #[cfg(all(feature = "pkcs11", feature = "external-secret"))]
         {
+            // Nothing from the harness: no PKCS#11 module or PIN file.
+            let _isolated = crate::policy::test_support::TestPolicy::absent();
             let ext_dir = crate::secure_file::private_tempdir();
-            std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", ext_dir.path()); // reachable
+            let _secret_mount = crate::policy::test_support::secret_mount(ext_dir.path());
 
             // Pre-provision the external secret so it's actually usable
             // once the chain reaches it (this provider never creates one
@@ -724,8 +704,6 @@ mod tests {
             let (provider, _handle) = create_kek("com.company.orders").unwrap();
             assert_eq!(provider.provider_type(), ProviderType::ExternalSecret);
 
-            std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
-            std::env::remove_var("HKDFGUARD_POLICY_FILE");
         }
     }
 
@@ -734,7 +712,6 @@ mod tests {
     fn policy_ephemeral_disallowed_by_default_end_to_end() {
         #[cfg(feature = "ephemeral")]
         {
-            std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-dir-for-tests"); // unreachable
 
             // No preferred_order at all -- ephemeral must default to
             // disallowed (never named), even where it would otherwise be
@@ -743,8 +720,6 @@ mod tests {
 
             assert_never_ephemeral(create_kek("com.company.orders"));
 
-            std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
-            std::env::remove_var("HKDFGUARD_POLICY_FILE");
         }
     }
 
@@ -753,15 +728,12 @@ mod tests {
     fn policy_ephemeral_allowed_end_to_end_when_policy_permits() {
         #[cfg(feature = "ephemeral")]
         {
-            std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-dir-for-tests");
 
             let _policy_dir = write_policy("preferred_order = [\"ephemeral\"]\n[selection]\nmode = \"prefer\"\n");
 
             let (provider, _handle) = create_kek("com.company.orders").unwrap();
             assert_eq!(provider.provider_type(), ProviderType::Ephemeral);
 
-            std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
-            std::env::remove_var("HKDFGUARD_POLICY_FILE");
         }
     }
 
@@ -770,7 +742,6 @@ mod tests {
     fn policy_minimum_protection_enforced_end_to_end() {
         #[cfg(feature = "ephemeral")]
         {
-            std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-dir-for-tests"); // no external secret provisioned
 
             // Ephemeral is explicitly named (clearing that gate), so
             // minimum_protection: external is the *only* thing standing
@@ -783,8 +754,6 @@ mod tests {
             let err = expect_err(create_kek("com.company.orders"));
             assert!(matches!(err, Error::NoProviderAvailable | Error::Provider(_)));
 
-            std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
-            std::env::remove_var("HKDFGUARD_POLICY_FILE");
         }
     }
 
@@ -819,14 +788,16 @@ mod tests {
 
     // An external-secret mount holding a group-readable key for `service`:
     // a hard provider failure ("permissions too broad"), not a soft decline.
-    fn mount_with_untrusted_secret(service: &str) -> tempfile::TempDir {
+    // Both halves must stay bound for the test's duration: the mount
+    // directory, and the policy layer pointing the provider at it.
+    fn mount_with_untrusted_secret(service: &str) -> (tempfile::TempDir, crate::policy::test_support::TestPolicy) {
         use std::os::unix::fs::PermissionsExt;
         let dir = crate::secure_file::private_tempdir();
         let path = dir.path().join(service);
         std::fs::write(&path, p256::SecretKey::random(&mut rand_core::OsRng).to_bytes()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-        std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", dir.path());
-        dir
+        let mount = crate::policy::test_support::secret_mount(dir.path());
+        (dir, mount)
     }
 
     #[test]
@@ -843,8 +814,6 @@ mod tests {
                 assert_ne!(crate::hkdfguard_create_kek(c.as_ptr()), crate::status::OK);
             });
 
-            std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
-            std::env::remove_var("HKDFGUARD_POLICY_FILE");
             assert_eq!(lines.len(), 1, "the failure must be logged exactly once, got: {lines:#?}");
             assert!(lines[0].contains("EXTERNAL_SECRET"), "the one line must still name the provider: {}", lines[0]);
         }
@@ -884,8 +853,6 @@ mod tests {
                 Ok(false)
             ));
 
-            std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
-            std::env::remove_var("HKDFGUARD_POLICY_FILE");
         }
     }
 
@@ -897,32 +864,26 @@ mod tests {
             let _policy = crate::policy::allow_ephemeral_policy_for_tests();
 
             // No mount at all: absent.
-            std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-dir-for-tests");
             let (provider, _) = create_kek("com.company.absentmount").unwrap();
             assert_eq!(provider.provider_type(), ProviderType::Ephemeral);
 
             // A trusted mount with nothing for this service: declined.
             let mount = crate::secure_file::private_tempdir();
-            std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", mount.path());
+            let _secret_mount = crate::policy::test_support::secret_mount(mount.path());
             let (provider, _) = create_kek("com.company.notinmount").unwrap();
             assert_eq!(provider.provider_type(), ProviderType::Ephemeral);
 
-            std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
-            std::env::remove_var("HKDFGUARD_POLICY_FILE");
         }
     }
 
     #[test]
     #[serial]
     fn malformed_policy_fails_closed_even_when_providers_are_available() {
-        std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-dir-for-tests");
 
         let _policy_dir = write_policy("[selection]\nmode = \"require\"\nprovider = \"quantum-vault\"\n");
 
         let err = expect_err(create_kek("com.company.orders"));
         assert!(matches!(err, Error::Provider(_)), "a malformed policy must fail closed, not fall back to the default chain");
 
-        std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
     }
 }

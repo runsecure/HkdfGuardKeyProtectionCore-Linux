@@ -7,8 +7,7 @@
 //! mounted-file secret mechanism -- rather than generating one itself.
 //!
 //! Lookup pattern: `<dir>/<service>`. `<dir>` is `external_secret.dir` from
-//! the root-owned policy when set; otherwise (debug builds only)
-//! `HKDFGUARD_EXTERNAL_SECRET_DIR`; otherwise the first of a list of
+//! the root-owned policy when set; otherwise the first of a list of
 //! conventional secret mount points that exists.
 //!
 //! The secret file's contents must be either a PKCS#8 DER-encoded P-256
@@ -362,28 +361,21 @@ fn parse_secret_key(bytes: &[u8]) -> Result<SecretKey> {
         .map_err(|e| Error::Provider(format!("external secret is not a valid P-256 key: {e}")))
 }
 
-// Picks the secret mount directory: `external_secret.dir` from policy;
-// else, in debug builds only, HKDFGUARD_EXTERNAL_SECRET_DIR (see
-// crate::debug_only_env); else the first conventional mount that exists.
+// Picks the secret mount directory: `external_secret.dir` from the policy,
+// else the first conventional mount that exists.
 //
 // A policy that can't be trusted, or a policy-configured directory that
 // isn't there, is `Refused`: the administrator said KEKs live there, so
 // its absence is an outage (a mount not ready yet), not a reason to hand
-// the call to a weaker provider. The debug-only environment override
-// pointing nowhere is `Absent` -- that is how tests switch this provider
-// off. No conventional mount existing is `Absent`.
+// the call to a weaker provider. No conventional mount existing is
+// `Absent`.
 fn resolve_dir() -> Backend<PathBuf> {
-    let from_env = crate::debug_only_env("HKDFGUARD_EXTERNAL_SECRET_DIR").map(PathBuf::from);
     match crate::policy::external_secret_dir() {
         Ok(Some(dir)) if dir.is_dir() => return Backend::Ready(dir),
         Ok(Some(dir)) => return Backend::Refused(format!("external_secret.dir {} is not a directory", dir.display())),
         Ok(None) => {}
         Err(e) => return Backend::Refused(e.to_string()),
     }
-    if let Some(dir) = from_env {
-        return if dir.is_dir() { Backend::Ready(dir) } else { Backend::Absent };
-    }
-
     CANDIDATE_MOUNTS
         .iter()
         .map(Path::new)
@@ -403,10 +395,9 @@ mod tests {
     // as the "mounted secret" location.
     fn with_dir<F: FnOnce(&ExternalSecretProvider, &Path)>(f: F) {
         let dir = crate::secure_file::private_tempdir();
-        std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", dir.path()); // redirect this provider at the temp dir
+        let _secret_mount = crate::policy::test_support::secret_mount(dir.path());
         let provider = ExternalSecretProvider::new();
         f(&provider, dir.path());
-        std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR"); // don't leak the override into other tests
     }
 
     // Writes a secret file the way a correctly configured platform would:
@@ -696,41 +687,34 @@ mod tests {
 
     #[test]
     #[serial]
-    fn policy_dir_wins_over_the_environment_and_has_no_fallback() {
-        let policy_mount = crate::secure_file::private_tempdir();
-        let env_mount = crate::secure_file::private_tempdir();
-        let policy_dir = crate::secure_file::private_tempdir();
-        let policy = policy_dir.path().join("policy.toml");
-        crate::secure_file::write_world_readable_for_tests(
-            &policy,
-            format!("[selection]\nmode = \"prefer\"\n[external_secret]\ndir = \"{}\"\n", policy_mount.path().display()),
-        );
-        std::env::set_var("HKDFGUARD_POLICY_FILE", &policy);
-        std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", env_mount.path());
-        assert_eq!(resolve_dir(), Backend::Ready(policy_mount.path().to_path_buf()), "policy must win over the environment");
+    fn the_policy_dir_is_used_with_no_fallback() {
+        use crate::policy::test_support::{secret_mount, TestPolicy};
+        let mount = crate::secure_file::private_tempdir();
+        {
+            let _policy = secret_mount(mount.path());
+            assert_eq!(resolve_dir(), Backend::Ready(mount.path().to_path_buf()));
+        }
 
         // A configured directory that doesn't exist: refused -- an outage of
         // the provider the administrator chose, never a fallback to the
-        // environment, the conventional mounts, or the next provider.
-        crate::secure_file::write_world_readable_for_tests(
-            &policy,
-            "[selection]\nmode = \"prefer\"\n[external_secret]\ndir = \"/nonexistent-hkdfguard-mount\"\n",
-        );
-        assert!(matches!(resolve_dir(), Backend::Refused(_)));
+        // conventional mounts or the next provider.
+        {
+            let _policy = secret_mount(Path::new("/nonexistent-hkdfguard-mount"));
+            assert!(matches!(resolve_dir(), Backend::Refused(_)));
+        }
 
         // A broken policy: refused, not a fallback to the search.
-        crate::secure_file::write_world_readable_for_tests(&policy, "[selection]\nmode = \"require\"\n");
-        assert!(matches!(resolve_dir(), Backend::Refused(_)));
+        {
+            let _policy = TestPolicy::exact("[selection]\nmode = \"require\"\n");
+            assert!(matches!(resolve_dir(), Backend::Refused(_)));
+        }
 
-        // Only the debug-only override pointing nowhere means "not here".
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
-        std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-hkdfguard-mount");
+        // Only no mount configured, and none of the conventional ones
+        // present, means "not here".
+        let _policy = TestPolicy::absent();
         if !CANDIDATE_MOUNTS.iter().any(|m| Path::new(m).is_dir()) {
             assert_eq!(resolve_dir(), Backend::Absent);
         }
-
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
-        std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
     }
 
     #[test]
@@ -741,10 +725,8 @@ mod tests {
             assert_eq!(provider.provider_type(), ProviderType::ExternalSecret);
         });
 
-        std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-dir-12345");
         let provider = ExternalSecretProvider::new();
         assert!(!provider.probe());
-        std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
     }
 
     #[test]

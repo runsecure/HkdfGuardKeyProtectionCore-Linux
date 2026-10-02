@@ -39,29 +39,6 @@ use zeroize::Zeroize; // scrub sensitive stack buffers before returning
 
 const MAX_SERVICE_LEN: usize = 128; // spec-mandated maximum service-name length in bytes
 
-/// Reads an environment variable that redirects security configuration
-/// (which policy file, TPM, derivation secret, secret mount, PKCS#11
-/// module, token or PIN file). Honored only in
-/// debug builds -- `cargo test`, `cargo build` -- so tests and development
-/// can point at scratch files and simulators. Release builds never read
-/// it: the environment is often set by lower-trust configuration than the
-/// root-owned files these settings otherwise come from, and must not be
-/// able to redirect them. A release build that finds one set logs a
-/// warning once per variable and carries on as if it were unset.
-pub(crate) fn debug_only_env(name: &'static str) -> Option<std::ffi::OsString> {
-    let value = std::env::var_os(name)?;
-    if cfg!(debug_assertions) {
-        return Some(value);
-    }
-    static WARNED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
-    let mut warned = WARNED.lock().unwrap_or_else(|p| p.into_inner());
-    if !warned.contains(&name) {
-        warned.push(name);
-        log::warn!("hkdfguard: {name} is set but ignored: release builds take this setting only from root-owned configuration");
-    }
-    None
-}
-
 /// Serializes every setup call (`hkdfguard_create_kek`,
 /// `hkdfguard_kek_exists`) so that, combined with the latency floor in
 /// `gated_setup`, their aggregate rate is capped at one per
@@ -691,13 +668,10 @@ mod ffi_tests {
     // external-secret is unavailable, with no persisted-to-disk
     // software-backed fallback in between.
     fn with_isolated_ephemeral_provider<F: FnOnce()>(f: F) {
-        std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-for-tests");
         // Ephemeral is only reachable through an explicit policy opt-in
         // (see provider::allowed_chain), so write one.
         let _policy = policy::allow_ephemeral_policy_for_tests();
         f();
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
-        std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
     }
 
     // Calls the real hkdfguard_create_kek FFI entry point and asserts it
@@ -770,7 +744,6 @@ mod ffi_tests {
         // instead on "no provider happens to be available" would make
         // this pass only on hosts without a reachable TPM or PKCS#11
         // token.
-        std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-for-tests");
         let _policy = policy::require_provider_policy_for_tests("external-secret");
         with_setup_delay(Some(Duration::from_millis(50)), || {
             let service = CString::new("com.company.orders.setupfloorfail").unwrap();
@@ -778,8 +751,6 @@ mod ffi_tests {
             assert_ne!(hkdfguard_create_kek(service.as_ptr()), status::OK);
             assert!(started.elapsed() >= Duration::from_millis(50));
         });
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
-        std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
     }
 
     #[test]
@@ -830,14 +801,9 @@ mod ffi_tests {
     fn setup_floor_is_taken_from_the_policy_file() {
         // With the test override cleared, the floor comes from the same
         // policy file that names the providers -- exactly as in production.
-        std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-for-tests");
-        let dir = crate::secure_file::private_tempdir();
-        let path = dir.path().join("policy.toml");
-        crate::secure_file::write_world_readable_for_tests(
-            &path,
+        let _policy = crate::policy::test_support::TestPolicy::write(
             "preferred_order = [\"ephemeral\"]\n[selection]\nmode = \"prefer\"\n[startup_behavior]\nsetup_min_delay_ms = 80\n",
         );
-        std::env::set_var("HKDFGUARD_POLICY_FILE", &path);
 
         with_setup_delay(None, || {
             let service = CString::new("com.company.orders.policyfloor").unwrap();
@@ -849,8 +815,6 @@ mod ffi_tests {
             assert!(elapsed < Duration::from_millis(1000), "took {elapsed:?}; default floor used instead of policy");
         });
 
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
-        std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
     }
 
     #[test]
@@ -1596,7 +1560,7 @@ mod ffi_tests {
         // nothing for the rotation below to rotate.
         let _policy = policy::require_provider_policy_for_tests("external-secret");
         let ext_dir = crate::secure_file::private_tempdir();
-        std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", ext_dir.path());
+        let _secret_mount = crate::policy::test_support::secret_mount(ext_dir.path());
         let service_str = "com.company.rotated";
         let secret_path = ext_dir.path().join(service_str);
         let service = CString::new(service_str).unwrap();
@@ -1635,8 +1599,6 @@ mod ffi_tests {
         assert_eq!(rc, -16, "must match macOS's HKDFGuardStatus.fingerprintMismatch");
         assert_eq!(out, [0u8; 32], "output buffer must still be zeroed on failure");
 
-        std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
     }
 
     #[test]

@@ -329,11 +329,8 @@ mod tests {
     // deterministically exercises the Ephemeral provider. Without that
     // policy Ephemeral is never used (see `provider::allowed_chain`).
     fn with_isolated_ephemeral_provider<F: FnOnce()>(f: F) {
-        std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-for-tests"); // guarantee this provider is unavailable
         let _policy = crate::policy::allow_ephemeral_policy_for_tests();
         f();
-        std::env::remove_var("HKDFGUARD_POLICY_FILE");
-        std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
     }
 
     #[test]
@@ -837,7 +834,7 @@ mod tests {
             // would be nothing for the rotation below to rotate.
             let _policy = crate::policy::require_provider_policy_for_tests("external-secret");
             let ext_dir = crate::secure_file::private_tempdir();
-            std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", ext_dir.path());
+            let _secret_mount = crate::policy::test_support::secret_mount(ext_dir.path());
             let service = "com.company.rotated";
             let secret_path = ext_dir.path().join(service);
 
@@ -864,8 +861,6 @@ mod tests {
             // this would have looked like before this check existed.
             assert!(matches!(err, Error::FingerprintMismatch));
 
-            std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
-            std::env::remove_var("HKDFGUARD_POLICY_FILE");
         }
     }
 

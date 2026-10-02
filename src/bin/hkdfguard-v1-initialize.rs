@@ -1090,14 +1090,13 @@ mod tests {
         fs::write(&policy, "preferred_order = [\"external-secret\", \"ephemeral\"]\n[selection]\nmode = \"prefer\"\n").unwrap();
         fs::set_permissions(&policy, fs::Permissions::from_mode(0o644)).unwrap(); // not the umask: some distros default to 002 (group-writable), which the policy loader correctly refuses
         std::env::set_var("HKDFGUARD_POLICY_FILE", &policy);
-        std::env::set_var("HKDFGUARD_EXTERNAL_SECRET_DIR", "/nonexistent-hkdfguard-cli-test");
         f();
-        std::env::remove_var("HKDFGUARD_EXTERNAL_SECRET_DIR");
         std::env::remove_var("HKDFGUARD_POLICY_FILE");
     }
 
     #[test]
     #[serial]
+    #[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
     fn provision_creates_then_reports_already_provisioned() {
         // Pays the library's real setup-call floor (this binary links the
         // library without cfg(test)): kek_exists + create_kek, then
@@ -1111,6 +1110,7 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
     fn wrap_without_a_provisioned_kek_fails_with_the_provision_hint_and_touches_nothing() {
         with_ephemeral_policy(|| {
             let dir = private_tempdir();
@@ -1137,6 +1137,7 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg_attr(not(hkdfguard_test_paths), ignore = "needs a library that reads its own policy: RUSTFLAGS=\"--cfg hkdfguard_test_paths\" (the test scripts set it)")]
     fn provision_then_wrap_round_trip_in_process() {
         with_ephemeral_policy(|| {
             let service = "com.hkdfguard.clitest.roundtrip".to_string();
