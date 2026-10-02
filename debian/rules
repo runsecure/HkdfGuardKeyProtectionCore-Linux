@@ -1,0 +1,47 @@
+#!/usr/bin/make -f
+# Builds with the rustup toolchain on PATH (see debian/control), offline,
+# against dependency sources fetched beforehand with `cargo fetch --locked`
+# (packaging/build-deb.sh does both).
+
+include /usr/share/dpkg/architecture.mk
+include /usr/share/dpkg/pkg-info.mk
+
+LIBDIR := usr/lib/$(DEB_HOST_MULTIARCH)
+CARGO := cargo --locked --offline
+
+# Keep debug info for dh_strip to split into -dbgsym packages; Cargo.toml's
+# release profile strips it, which suits the tarball release.
+export CARGO_PROFILE_RELEASE_STRIP := false
+export CARGO_PROFILE_RELEASE_DEBUG := line-tables-only
+
+%:
+	dh $@
+
+override_dh_auto_clean:
+	rm -rf target
+
+override_dh_auto_build:
+	$(CARGO) build --release --all-features
+	python3 packaging/third-party-licenses.py target/THIRD-PARTY-LICENSES.txt
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	$(CARGO) test
+	$(CARGO) test --all-features
+endif
+
+# The library goes in under its SONAME (see build.rs), not Cargo's name.
+override_dh_auto_install:
+	install -D -m 0644 target/release/libHkdfGuardKeyProtectionLinux.so debian/tmp/$(LIBDIR)/libhkdfguard.so.1
+	ln -s libhkdfguard.so.1 debian/tmp/$(LIBDIR)/libhkdfguard.so
+	ln -s libhkdfguard.so.1 debian/tmp/$(LIBDIR)/HkdfGuard.Kms.Linux.v1.so
+	install -D -m 0644 target/release/libHkdfGuardKeyProtectionLinux.a debian/tmp/$(LIBDIR)/libhkdfguard.a
+	install -D -m 0644 include/hkdfguard.h debian/tmp/usr/include/hkdfguard.h
+	install -d debian/tmp/$(LIBDIR)/pkgconfig
+	sed -e 's|@LIBDIR@|/$(LIBDIR)|' -e 's|@VERSION@|$(DEB_VERSION_UPSTREAM)|' \
+		packaging/hkdfguard.pc.in > debian/tmp/$(LIBDIR)/pkgconfig/hkdfguard.pc
+	install -D -m 0755 target/release/hkdfguard-v1-initialize debian/tmp/usr/bin/hkdfguard-v1-initialize
+
+# dwz rejects some of the DWARF rustc emits; the -dbgsym packages are
+# still produced without it.
+override_dh_dwz:

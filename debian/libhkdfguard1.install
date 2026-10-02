@@ -1,0 +1,2 @@
+usr/lib/${DEB_HOST_MULTIARCH}/libhkdfguard.so.1
+usr/lib/${DEB_HOST_MULTIARCH}/HkdfGuard.Kms.Linux.v1.so

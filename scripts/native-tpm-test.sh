@@ -153,6 +153,8 @@ learn() { # learn <test-name> <KEY>
 
 # Builds a C example against the library.
 build_c() { # build_c <source.c> <out>
+    # The .so's SONAME (build.rs), which the program looks for at run time.
+    ln -sf libHkdfGuardKeyProtectionLinux.so "$BIN/libhkdfguard.so.1"
     cc -I include "$1" -L "$BIN" -lHkdfGuardKeyProtectionLinux -o "$2"
 }
 

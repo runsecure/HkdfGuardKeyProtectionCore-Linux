@@ -1,0 +1,54 @@
+# Builds the Enterprise Linux 10 (RHEL 10, AlmaLinux 10, Rocky Linux 10)
+# .rpm packages: see packaging/build-packages.sh. AlmaLinux stands in for
+# RHEL here because its repositories need no subscription; the packages
+# are built against the same EL10 libraries.
+#
+# Pinned by digest, like docker/Dockerfile. To take an update, re-resolve
+# deliberately:
+#   docker pull almalinux:10
+#   docker inspect --format='{{index .RepoDigests 0}}' almalinux:10
+FROM almalinux:10@sha256:957738702313e6ee452cdb17bc1431542c467be9a4e2f4da3b8e551b0ebb9677
+
+ENV CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    PATH=/usr/local/cargo/bin:$PATH
+
+# BuildRequires come from the spec itself, so the two can't drift. CRB
+# carries some EL10 -devel packages.
+COPY packaging/rpm/hkdfguard.spec /tmp/hkdfguard.spec
+RUN dnf -y install dnf-plugins-core \
+    && dnf config-manager --set-enabled crb \
+    && dnf -y install rpm-build util-linux tar gzip \
+    && dnf -y builddep /tmp/hkdfguard.spec \
+    && dnf clean all \
+    && rm /tmp/hkdfguard.spec
+
+# The toolchain pinned in rust-toolchain.toml, installed exactly as in
+# docker/Dockerfile (see there for how to update the version and hashes;
+# keep all three Dockerfiles in step). clippy is installed only because
+# rust-toolchain.toml lists it: rustup would otherwise try to download it
+# during the offline package build.
+ARG RUSTUP_VERSION=1.29.1
+RUN set -eu; \
+    case "$(uname -m)" in \
+        x86_64)  target=x86_64-unknown-linux-gnu;  sha256=dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71 ;; \
+        aarch64) target=aarch64-unknown-linux-gnu; sha256=15f6e4ce9f583b929c996c91562bad6d4454f3281de858b02cdfdef615fac433 ;; \
+        *) echo "no pinned rustup-init for $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    curl --proto '=https' --tlsv1.2 -sSfo /tmp/rustup-init \
+        "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${target}/rustup-init"; \
+    echo "${sha256}  /tmp/rustup-init" | sha256sum --check --strict -; \
+    chmod 0755 /tmp/rustup-init; \
+    /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain 1.98.1; \
+    rm /tmp/rustup-init; \
+    rustup component add clippy
+
+# Packages are built as `builder`, not root.
+RUN useradd --create-home builder \
+    && chown -R builder:builder "$CARGO_HOME" \
+    && install -d -o builder -g builder /build
+
+WORKDIR /build/hkdfguard
+COPY --chown=builder:builder . /build/hkdfguard
+
+ENTRYPOINT ["packaging/build-rpm.sh"]

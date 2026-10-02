@@ -50,7 +50,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # and check them against a download of the binary itself. (rustup then
 # verifies each toolchain component against the release manifest's own
 # SHA-256 sums.) The toolchain version must match rust-toolchain.toml at
-# the repo root.
+# the repo root. packaging/Dockerfile.debian and packaging/Dockerfile.el10
+# repeat this block: update all three together.
 ARG RUSTUP_VERSION=1.29.1
 RUN set -eu; \
     case "$(dpkg --print-architecture)" in \

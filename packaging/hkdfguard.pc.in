@@ -1,0 +1,16 @@
+prefix=/usr
+libdir=@LIBDIR@
+includedir=/usr/include
+
+Name: hkdfguard
+Description: DEK wrapping under a per-service KEK held by a TPM2, PKCS#11 token or external secret
+Version: @VERSION@
+URL: https://github.com/torinblair/KeyProtectionCore-Linux
+# The tss2 libraries and system libraries the static archive needs: the
+# output of `cargo rustc --release --all-features --lib --crate-type
+# staticlib -- --print native-static-libs`. Re-check it when dependencies
+# change. The shared library records its own dependencies.
+Requires.private: tss2-esys tss2-tctildr tss2-mu tss2-sys
+Libs: -L${libdir} -lhkdfguard
+Libs.private: -ldl -lgcc_s -lutil -lrt -lpthread -lm
+Cflags: -I${includedir}

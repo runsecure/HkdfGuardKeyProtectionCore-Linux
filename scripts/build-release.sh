@@ -43,3 +43,10 @@ if [ ! -f "$src" ]; then
 fi
 cp "$src" "$dst"
 echo "-> $dst"
+
+# On Linux the library's SONAME is libhkdfguard.so.1 (build.rs), so a
+# program linked against target/release looks for that name at run time.
+if [ "$ext" = so ]; then
+    ln -sf "libHkdfGuardKeyProtectionLinux.so" "target/release/libhkdfguard.so.1"
+    echo "-> target/release/libhkdfguard.so.1 (symlink)"
+fi

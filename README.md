@@ -49,7 +49,12 @@ this project's actual release artifact name, matching the
 `HkdfGuard.Kms.<platform>.v1` convention its Windows (CMake `OUTPUT_NAME`)
 and macOS (Xcode `PRODUCT_NAME`) builds apply natively. A plain
 `cargo build --release` still works for local iteration; just link against
-`libHkdfGuardKeyProtectionLinux` directly in that case. The C header
+`libHkdfGuardKeyProtectionLinux` directly in that case. On Linux the
+library's SONAME is `libhkdfguard.so.1` ([`build.rs`](build.rs)), so a
+program linked that way looks for that name at run time: the script also
+creates it as a symlink in `target/release`. Installed from the packages
+(see "Packages"), the library is simply `-lhkdfguard`, via
+`pkg-config --cflags --libs hkdfguard`. The C header
 (`include/hkdfguard.h`) and exported C symbols (`hkdfguard_create_kek`,
 `hkdfguard_kek_exists`, `hkdfguard_wrap_dek`, `hkdfguard_unwrap_dek`,
 `hkdfguard_generate_and_wrap_dek`) are unaffected either way and keep
@@ -509,6 +514,44 @@ retired `--dek` and an unprovisioned `wrap` both asserted to be refused)
 unwrapped by a separate C consumer. Every change in this repo is expected
 to pass it. See [`docker/README.md`](docker/README.md).
 
+## Packages (.deb / .rpm)
+
+```sh
+packaging/build-packages.sh     # needs Docker; DISTROS=debian ARCHES=amd64 for a subset
+```
+
+Builds packages for **Debian 13** (`.deb`) and **EL10** -- RHEL 10,
+AlmaLinux 10, Rocky Linux 10 (`.rpm`) -- on amd64/x86_64 and
+arm64/aarch64, into `dist/packages/<distro>-<arch>/`. Each build runs on
+its own distribution (built against that distribution's glibc and
+tpm2-tss), runs the default and all-features test suites, and is then
+installed into a clean container of that distribution and exercised by
+[`packaging/smoke-test.sh`](packaging/smoke-test.sh). CI does the same in
+the `packages` job and attaches the packages to tagged releases. Debian 12
+and RHEL 9 are not targets: both ship tpm2-tss 3.x.
+
+| Debian | RPM | Contents |
+|---|---|---|
+| `libhkdfguard1` | `hkdfguard-libs` | `libhkdfguard.so.1`, the `HkdfGuard.Kms.Linux.v1.so` name, an empty `/etc/hkdfguard` (root, `0755`), README, third-party licenses |
+| `libhkdfguard-dev` | `hkdfguard-devel` | `hkdfguard.h`, `libhkdfguard.so`, `hkdfguard.pc` |
+| (in `libhkdfguard-dev`) | `hkdfguard-static` | `libhkdfguard.a` |
+| `hkdfguard` | `hkdfguard` | `hkdfguard-v1-initialize` and its man page |
+
+All are built with every provider enabled, so the library depends on
+tpm2-tss's libraries even on hosts without a TPM. The PKCS#11 module is
+only ever loaded at run time, from the policy file. The packages install
+no policy file, derivation secret or PIN: those are per-host decisions
+(see "Configuration"), and with no policy file the library uses its
+defaults.
+
+The version lives in three places -- `Cargo.toml`, `debian/changelog` and
+`packaging/rpm/hkdfguard.spec` (`Version` and `%changelog`) -- and
+[`packaging/check-version.sh`](packaging/check-version.sh) fails every
+package build, and any release tag, where they disagree. The library's
+SONAME major (`.1`, in `build.rs`) is separate: it changes only with an
+incompatible C ABI change, together with the Debian package name
+`libhkdfguard1`.
+
 ## External-secret file requirements
 
 For the external-secret provider the mounted file *is* the KEK private
@@ -878,4 +921,16 @@ scripts/
   tpm-reboot-test.sh         swtpm-restart approximation of reboot persistence
 docker/                      Dockerfile + entrypoint running the full matrix
                               against swtpm and SoftHSM2 (run-tests.sh)
+build.rs                     Sets the shared library's SONAME (libhkdfguard.so.1)
+debian/                      Debian packaging (dpkg-buildpackage)
+packaging/
+  build-packages.sh          Builds and smoke-tests the .deb and .rpm packages
+  Dockerfile.debian, .el10   Package build images (Debian 13, AlmaLinux 10)
+  build-deb.sh, build-rpm.sh In-container package builds
+  smoke-test.sh              Installs packages into a clean container and uses them
+  check-version.sh           Cargo.toml / debian/changelog / spec version agreement
+  rpm/hkdfguard.spec         RPM packaging
+  hkdfguard.pc.in            pkg-config template
+  hkdfguard-v1-initialize.1  Man page
+  third-party-licenses.py    License notices of the statically linked crates
 ```

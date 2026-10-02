@@ -18,8 +18,15 @@
 # A separate, independent job runs `cargo deny check advisories bans
 # sources` against Cargo.lock (see deny.toml) as a supply-chain gate.
 #
-# On a `v*` tag, a release job attaches both archives (and their checksums)
-# to a GitHub Release.
+# A `packages` job builds the .deb (Debian 13) and .rpm (EL10) packages per
+# architecture in packaging/Dockerfile.<distro>, running the test suites
+# on that distribution, then installs them into a clean container of it
+# and runs packaging/smoke-test.sh. See packaging/build-packages.sh, which
+# does the same locally.
+#
+# On a `v*` tag, a release job attaches both archives, the packages, and
+# their checksums to a GitHub Release -- only if every job passed and the
+# tag matches the version in Cargo.toml and the packaging.
 #
 # Every action below is pinned to a commit SHA, not a floating tag, so a
 # compromised or re-tagged action can't silently change what this workflow
@@ -126,6 +133,8 @@ jobs:
           cp dist/libHkdfGuardKeyProtectionLinux.so dist/libHkdfGuardKeyProtectionLinux.a "pkg/$name/lib/"
           # The project's release artifact name (see scripts/build-release.sh).
           cp dist/libHkdfGuardKeyProtectionLinux.so "pkg/$name/lib/HkdfGuard.Kms.Linux.v1.so"
+          # The SONAME (build.rs): what programs linked against the .so look for.
+          ln -s libHkdfGuardKeyProtectionLinux.so "pkg/$name/lib/libhkdfguard.so.1"
           cp dist/hkdfguard-v1-initialize "pkg/$name/bin/"
           cp dist/hkdfguard.h "pkg/$name/include/"
           cp README.md "pkg/$name/"
@@ -157,10 +166,96 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  packages:
+    name: packages (${{ matrix.distro }}, ${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [debian, el10]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write      # for attest-build-provenance's Sigstore signing
+      attestations: write  # to publish the attestation to this repo
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Version consistency
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            packaging/check-version.sh "$GITHUB_REF_NAME"
+          else
+            packaging/check-version.sh
+          fi
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Build the packaging image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: packaging/Dockerfile.${{ matrix.distro }}
+          platforms: linux/${{ matrix.arch }}
+          tags: hkdfguard-pkg:${{ matrix.distro }}-${{ matrix.arch }}
+          load: true
+          cache-from: type=gha,scope=hkdfguard-pkg-${{ matrix.distro }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=hkdfguard-pkg-${{ matrix.distro }}-${{ matrix.arch }}
+
+      - name: Build, test, and package
+        run: |
+          mkdir -p dist
+          docker run --rm -v "$PWD/dist:/dist" hkdfguard-pkg:${{ matrix.distro }}-${{ matrix.arch }}
+          sudo chown -R "$(id -u):$(id -g)" dist
+
+      - name: Smoke test in a clean ${{ matrix.distro }} container
+        run: |
+          base_image=$(sed -n 's/^FROM[[:space:]]\{1,\}//p' packaging/Dockerfile.${{ matrix.distro }} | head -n 1)
+          docker run --rm \
+            -v "$PWD/dist:/packages:ro" \
+            -v "$PWD/examples:/examples:ro" \
+            -v "$PWD/packaging/smoke-test.sh:/smoke-test.sh:ro" \
+            "$base_image" bash /smoke-test.sh /packages /examples
+
+      - name: Checksums
+        id: checksums
+        run: |
+          name="SHA256SUMS-${{ matrix.distro }}-${{ matrix.arch }}"
+          cd dist
+          shopt -s nullglob
+          packages=(*.deb *.rpm)
+          [ ${#packages[@]} -gt 0 ] || { echo "::error::no packages were produced"; exit 1; }
+          sha256sum "${packages[@]}" > "$name"
+          cat "$name"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-checksums: dist/${{ steps.checksums.outputs.name }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: packages-${{ matrix.distro }}-${{ matrix.arch }}
+          path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/${{ steps.checksums.outputs.name }}
+          if-no-files-found: error
+          retention-days: 30
+
   release:
     name: publish release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, supply-chain]
+    needs: [build, supply-chain, packages]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -175,4 +270,7 @@ jobs:
           files: |
             artifacts/*.tar.gz
             artifacts/*.tar.gz.sha256
+            artifacts/*.deb
+            artifacts/*.rpm
+            artifacts/SHA256SUMS-*
           generate_release_notes: true

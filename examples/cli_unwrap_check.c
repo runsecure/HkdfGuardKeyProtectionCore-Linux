@@ -11,7 +11,10 @@
  *   <expected-dek-file>  the original 32 raw DEK bytes given to the CLI
  *                         (before base64-encoding for --dek)
  *
- * Build (after `cargo build --release`):
+ * Build (after `cargo build --release` and
+ *   `ln -sf libHkdfGuardKeyProtectionLinux.so ../target/release/libhkdfguard.so.1`,
+ *   the library's SONAME; with the packages installed, use
+ *   `pkg-config --cflags --libs hkdfguard` instead):
  *   cc -I../include cli_unwrap_check.c -L../target/release \
  *       -lHkdfGuardKeyProtectionLinux -o cli_unwrap_check
  *   LD_LIBRARY_PATH=../target/release ./cli_unwrap_check \

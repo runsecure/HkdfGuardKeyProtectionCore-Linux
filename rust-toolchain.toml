@@ -1,6 +1,6 @@
 # Pinned so local, Docker, and CI builds use the same compiler rather than
 # whatever "stable" is on the day. Bump deliberately, together with
-# --default-toolchain in docker/Dockerfile.
+# --default-toolchain in docker/Dockerfile and packaging/Dockerfile.*.
 [toolchain]
 channel = "1.98.1"
 profile = "minimal"

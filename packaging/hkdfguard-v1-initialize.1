@@ -1,0 +1,112 @@
+.\" Keep in step with print_usage() and the header comment in
+.\" src/bin/hkdfguard-v1-initialize.rs.
+.TH HKDFGUARD-V1-INITIALIZE 1 2026-10-02 "hkdfguard" "User Commands"
+.SH NAME
+hkdfguard-v1-initialize \- provision a service's HKDFGuard KEK and wrap DEKs under it
+.SH SYNOPSIS
+.B hkdfguard-v1-initialize provision
+.BR \-\-service\-name | \-sn
+.I name
+.PP
+.B hkdfguard-v1-initialize wrap
+.BR \-\-key\-file\-path | \-kf
+.I path
+.BR \-\-service\-name | \-sn
+.I name
+.RB ( \-\-dek\-stdin " | " \-\-dek\-file
+.IR path )
+.RB [ \-\-force | \-f ]
+.SH DESCRIPTION
+.B hkdfguard-v1-initialize
+sets up and uses the persistent, per-service Key Encryption Key (KEK) of
+the HKDFGuard library. The KEK lives on the strongest provider that the
+host has and that policy allows: a TPM 2.0, a PKCS#11 token, or an
+external secret file.
+.TP
+.B provision
+Ensures a KEK exists for the service, creating one if it does not.
+Run it once, at deployment time. It is the only command that makes the
+library's setup calls, which are deliberately slow.
+.TP
+.B wrap
+Wraps a 32-byte Data Encryption Key (DEK) under the service's existing
+KEK and writes the wrapped payload to
+.IR \-\-key\-file\-path ,
+mode 0600. It never creates a KEK: if none has been provisioned, it fails
+and says to run
+.BR provision .
+.SH OPTIONS
+.TP
+.BR \-\-service\-name ", " \-sn " \fIname\fR"
+The service whose KEK is used. At most 128 bytes of ASCII letters,
+digits and dots; it must not start with a dot or contain "..".
+.TP
+.BR \-\-key\-file\-path ", " \-kf " \fIpath\fR"
+Where
+.B wrap
+writes the wrapped payload.
+.TP
+.B \-\-dek\-stdin
+Read the DEK, base64 of exactly 32 bytes, from standard input.
+.TP
+.BI \-\-dek\-file " path"
+Read the DEK, base64 of exactly 32 bytes, from a file. The file must be a
+regular file, not a symlink, owned by root or by the invoking user, with
+no group or other access (mode 0400 or 0600).
+.TP
+.BR \-\-force ", " \-f
+Replace an existing
+.IR \-\-key\-file\-path .
+The new payload is produced first; only then is the old file overwritten
+in place and removed, so a failed wrap never destroys it. The overwrite
+cannot guarantee erasure on copy-on-write filesystems or flash storage.
+.TP
+.BR \-\-help ", " \-h
+Print usage and exit.
+.PP
+The DEK is never accepted as a command-line argument or from an
+environment variable: other processes of the same user can read both
+through
+.IR /proc .
+A single trailing newline on the DEK input is ignored.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+The operation failed, or the process could not be hardened (core dumps,
+ptrace, memory locking) and refused to handle key material.
+.TP
+.B 2
+Invalid command line.
+.SH FILES
+.TP
+.I /etc/hkdfguard/policy.toml
+Administrative policy: which providers may be used, and their
+configuration. Optional. When present it must be owned by root and not
+writable by group or others.
+.TP
+.I /etc/hkdfguard/tpm.derivation\-secret
+Per-host secret mixed into TPM-derived KEKs.
+.TP
+.I /etc/hkdfguard/pkcs11.pin
+Default PKCS#11 user PIN file.
+.SH EXAMPLES
+.nf
+hkdfguard-v1-initialize provision \-sn com.company.orders
+printf '%s' "$DEK_B64" | hkdfguard-v1-initialize wrap \e
+    \-kf /var/lib/app/key.bin \-sn com.company.orders \-\-dek\-stdin
+hkdfguard-v1-initialize wrap \-kf /var/lib/app/key.bin \e
+    \-sn com.company.orders \-\-dek\-file "$CREDENTIALS_DIRECTORY/dek"
+.fi
+.PP
+.B printf
+is a shell builtin, so the DEK never appears in a process's argument
+list; an external
+.B echo
+would put it there.
+.SH SEE ALSO
+The HKDFGuard README, installed under
+.IR /usr/share/doc/ ,
+documents providers, the policy file and deployment.

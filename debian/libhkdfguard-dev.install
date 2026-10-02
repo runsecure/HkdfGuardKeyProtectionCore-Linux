@@ -1,0 +1,4 @@
+usr/include/hkdfguard.h
+usr/lib/${DEB_HOST_MULTIARCH}/libhkdfguard.so
+usr/lib/${DEB_HOST_MULTIARCH}/libhkdfguard.a
+usr/lib/${DEB_HOST_MULTIARCH}/pkgconfig/hkdfguard.pc

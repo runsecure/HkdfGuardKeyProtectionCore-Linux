@@ -1,0 +1,59 @@
+Source: hkdfguard
+Section: libs
+Priority: optional
+Maintainer: runsecure <torin@torinblair.com>
+# The Rust toolchain is not a Build-Depends: packaging/Dockerfile.debian
+# installs the version pinned in rust-toolchain.toml with rustup, as
+# docker/Dockerfile does. Debian's own rustc is older than that pin.
+Build-Depends: debhelper-compat (= 13),
+               libtss2-dev (>= 4.0),
+               pkgconf,
+               python3,
+Standards-Version: 4.7.2
+Homepage: https://github.com/torinblair/KeyProtectionCore-Linux
+Rules-Requires-Root: no
+
+Package: libhkdfguard1
+# tss-esapi-sys ships pregenerated bindings for these Linux targets only.
+Architecture: amd64 arm64
+Multi-Arch: same
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: DEK wrapping under a TPM2, PKCS#11 or external-secret KEK
+ HKDFGuard wraps 32-byte Data Encryption Keys (DEKs) under a persistent,
+ per-service Key Encryption Key (KEK) held by the strongest provider the
+ host offers: a TPM 2.0, a PKCS#11 token, or an administrator-provisioned
+ secret file. Wrapping is ECDH (P-256) against a per-payload point,
+ HKDF-SHA512 and AES-256-GCM.
+ .
+ Provider selection is controlled by the root-owned policy file
+ /etc/hkdfguard/policy.toml, which this package does not create.
+ .
+ This package contains the shared library.
+
+Package: libhkdfguard-dev
+Section: libdevel
+Architecture: amd64 arm64
+Multi-Arch: same
+# libtss2-dev: the .pc file's Requires.private names its tss2 modules.
+Depends: libhkdfguard1 (= ${binary:Version}), libtss2-dev, ${misc:Depends}
+Description: DEK wrapping under a TPM2, PKCS#11 or external-secret KEK - development files
+ HKDFGuard wraps 32-byte Data Encryption Keys (DEKs) under a persistent,
+ per-service Key Encryption Key (KEK) held by a TPM 2.0, a PKCS#11 token,
+ or an administrator-provisioned secret file.
+ .
+ This package contains the C header, the pkg-config file, and the
+ static library.
+
+Package: hkdfguard
+Section: admin
+Architecture: amd64 arm64
+# The CLI links the library code statically, but reads the same policy:
+# keep the two at the same version.
+Depends: libhkdfguard1 (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}
+Description: DEK wrapping under a TPM2, PKCS#11 or external-secret KEK - command-line tool
+ HKDFGuard wraps 32-byte Data Encryption Keys (DEKs) under a persistent,
+ per-service Key Encryption Key (KEK) held by a TPM 2.0, a PKCS#11 token,
+ or an administrator-provisioned secret file.
+ .
+ This package contains hkdfguard-v1-initialize, which provisions a
+ service's KEK and wraps DEKs under it at deployment time.

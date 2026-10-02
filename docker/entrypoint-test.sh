@@ -116,6 +116,9 @@ SECRET_MOUNT=/run/secrets/hkdfguard
 mkdir -p "$SECRET_MOUNT"
 ci_file "$SECRET_MOUNT/com.company.orders"; head -c 32 /dev/urandom > "$SECRET_MOUNT/com.company.orders"
 as_ci cargo build --release
+# The .so's SONAME is libhkdfguard.so.1 (build.rs): what programs linked
+# against it look for at run time.
+as_ci ln -sf libHkdfGuardKeyProtectionLinux.so target/release/libhkdfguard.so.1
 as_ci cc -I include examples/wrap_unwrap.c -L target/release -lHkdfGuardKeyProtectionLinux -o /tmp/wrap_unwrap
 as_ci env LD_LIBRARY_PATH=target/release /tmp/wrap_unwrap
 

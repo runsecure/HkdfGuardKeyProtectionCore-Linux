@@ -1,0 +1,7 @@
+libhkdfguard.so.1 libhkdfguard1 #MINVER#
+ hkdfguard_create_kek@Base 0.1.0
+ hkdfguard_generate_and_wrap_dek@Base 0.1.0
+ hkdfguard_harden_process@Base 0.1.0
+ hkdfguard_kek_exists@Base 0.1.0
+ hkdfguard_unwrap_dek@Base 0.1.0
+ hkdfguard_wrap_dek@Base 0.1.0
