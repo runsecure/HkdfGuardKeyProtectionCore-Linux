@@ -81,7 +81,7 @@ use std::os::raw::c_int;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::ExitCode;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 use HkdfGuardKeyProtectionLinux::{
     hkdfguard_create_kek, hkdfguard_harden_process, hkdfguard_kek_exists, hkdfguard_wrap_dek, status,
 };
@@ -113,6 +113,9 @@ const INITIAL_WRAPPED_CAPACITY: usize = 512;
 // CRLF) and nothing more, so a wrong file fails fast instead of being
 // slurped into memory.
 const MAX_DEK_INPUT_LEN: usize = 64;
+// Room to base64-decode any accepted input: base64 decodes 4 characters
+// to at most 3 bytes, and `decode_slice` checks against that estimate.
+const MAX_DECODED_LEN: usize = MAX_DEK_INPUT_LEN / 4 * 3;
 // Mode bits that must be clear on a --dek-file: no access at all for
 // group or others.
 const FORBID_GROUP_OTHER_ACCESS: u32 = 0o077;
@@ -290,8 +293,10 @@ fn parse_wrap(args: &mut impl Iterator<Item = String>) -> Result<ParseOutcome, S
 // its own secret-file reads. Input longer than the limit is rejected
 // rather than truncated, so a wrong file can't silently decode to a
 // plausible-looking key.
-fn read_bounded(src: &mut dyn Read, what: &str) -> Result<Zeroizing<Vec<u8>>, String> {
-    let mut buf = Zeroizing::new(vec![0u8; MAX_DEK_INPUT_LEN + 1]);
+//
+// Reads into `buf` (the caller's `DekScratch`) and returns how many bytes
+// it filled.
+fn read_bounded(src: &mut dyn Read, what: &str, buf: &mut [u8; MAX_DEK_INPUT_LEN + 1]) -> Result<usize, String> {
     let mut filled = 0;
     while filled < buf.len() {
         match src.read(&mut buf[filled..]) {
@@ -306,15 +311,14 @@ fn read_bounded(src: &mut dyn Read, what: &str) -> Result<Zeroizing<Vec<u8>>, St
             "{what} is longer than {MAX_DEK_INPUT_LEN} bytes; expected base64 of a {DEK_LEN}-byte DEK"
         ));
     }
-    buf.truncate(filled); // shrinks the length only; the full allocation is still zeroed on drop
-    Ok(buf)
+    Ok(filled)
 }
 
 // Opens a --dek-file with the same hardening the library applies to its
 // own secret files: O_NOFOLLOW so a symlink fails the open outright, and
 // ownership/permission checks made against the *opened descriptor* rather
 // than the path, so nothing can be swapped between the check and the read.
-fn read_dek_file(path: &str) -> Result<Zeroizing<Vec<u8>>, String> {
+fn read_dek_file(path: &str, buf: &mut [u8; MAX_DEK_INPUT_LEN + 1]) -> Result<usize, String> {
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY) // a FIFO must fail the regular-file check below, not block the open
@@ -351,14 +355,17 @@ fn read_dek_file(path: &str) -> Result<Zeroizing<Vec<u8>>, String> {
         ));
     }
 
-    read_bounded(&mut file, "--dek-file")
+    read_bounded(&mut file, "--dek-file", buf)
 }
 
 // Decodes the base64 DEK text, tolerating exactly one trailing newline
 // (optionally CRLF) so a file written by `printf '%s\n'` or an editor
 // still works. Only base64 is accepted: raw 32-byte input fails to decode
 // with a clear error rather than being silently misinterpreted.
-fn decode_dek(text: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
+//
+// Decodes into `out` (the caller's `DekScratch`), never into a fresh
+// allocation, and returns the DEK as a slice of it.
+fn decode_dek<'a>(text: &[u8], out: &'a mut [u8; MAX_DECODED_LEN]) -> Result<&'a [u8], String> {
     let trimmed = match text.strip_suffix(b"\n") {
         Some(t) => t.strip_suffix(b"\r").unwrap_or(t),
         None => text,
@@ -367,32 +374,80 @@ fn decode_dek(text: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
         return Err("the DEK input is empty".to_string());
     }
 
-    let dek = Zeroizing::new(
-        STANDARD
-            .decode(trimmed)
-            .map_err(|e| format!("the DEK input is not valid base64: {e}"))?,
-    );
-    if dek.len() != DEK_LEN {
-        return Err(format!(
-            "the DEK must decode to exactly {DEK_LEN} bytes, got {}",
-            dek.len()
-        ));
+    let len = STANDARD
+        .decode_slice(trimmed, out)
+        .map_err(|e| format!("the DEK input is not valid base64: {e}"))?;
+    if len != DEK_LEN {
+        return Err(format!("the DEK must decode to exactly {DEK_LEN} bytes, got {len}"));
     }
-    Ok(dek)
+    Ok(&out[..DEK_LEN])
 }
 
-// Reads and decodes the DEK from wherever the caller pointed us.
-fn load_dek(source: &DekSource) -> Result<Zeroizing<Vec<u8>>, String> {
-    let mut text = match source {
+// Every copy of the DEK this program makes -- the base64 text it reads,
+// and the bytes that decodes to -- in one fixed allocation, never grown or
+// moved, zeroed before it's freed. When the whole process isn't already
+// locked into RAM (`lock_memory`), this allocation is, by itself, with
+// mlock(2): it is a page or two, well inside even a 64 KiB RLIMIT_MEMLOCK.
+// One allocation, not one per buffer, because mlock works on whole pages
+// and locks don't nest: unlocking one of two buffers that shared a page
+// would unlock the other.
+//
+// This covers the CLI's own copies. The library's transient copies (on
+// its stack, while it wraps) are covered only by `lock_memory`'s
+// mlockall.
+struct DekScratch {
+    text: [u8; MAX_DEK_INPUT_LEN + 1],
+    decoded: [u8; MAX_DECODED_LEN],
+    locked: bool,
+}
+
+impl DekScratch {
+    fn new() -> Box<Self> {
+        let mut scratch = Box::new(DekScratch {
+            text: [0; MAX_DEK_INPUT_LEN + 1],
+            decoded: [0; MAX_DECODED_LEN],
+            locked: false,
+        });
+        if !PROCESS_MEMORY_LOCKED.load(std::sync::atomic::Ordering::Relaxed) {
+            // SAFETY: the range is this live, heap-pinned allocation.
+            let rc = unsafe { libc::mlock((&raw const *scratch).cast(), std::mem::size_of::<DekScratch>()) };
+            if rc == 0 {
+                scratch.locked = true;
+            } else {
+                eprintln!(
+                    "warning: could not lock the DEK's buffer into memory (mlock: {}); it could be written to swap",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        scratch
+    }
+}
+
+impl Drop for DekScratch {
+    fn drop(&mut self) {
+        self.text.zeroize();
+        self.decoded.zeroize();
+        if self.locked {
+            // SAFETY: the same range `new` locked; still allocated here.
+            unsafe { libc::munlock((&raw const *self).cast(), std::mem::size_of::<DekScratch>()) };
+        }
+    }
+}
+
+// Reads and decodes the DEK from wherever the caller pointed us, into
+// `scratch`, and returns it as a slice of `scratch.decoded`.
+fn load_dek<'a>(source: &DekSource, scratch: &'a mut DekScratch) -> Result<&'a [u8], String> {
+    let len = match source {
         DekSource::Stdin => {
             let stdin = std::io::stdin();
             let mut locked = stdin.lock();
-            read_bounded(&mut locked, "the DEK on stdin")?
+            read_bounded(&mut locked, "the DEK on stdin", &mut scratch.text)?
         }
-        DekSource::File(path) => read_dek_file(path)?,
+        DekSource::File(path) => read_dek_file(path, &mut scratch.text)?,
     };
-    let dek = decode_dek(&text);
-    text.zeroize(); // the base64 text has served its only purpose; don't wait for scope exit
+    let dek = decode_dek(&scratch.text[..len], &mut scratch.decoded);
+    scratch.text.zeroize(); // the base64 text has served its only purpose; don't wait for scope exit
     dek
 }
 
@@ -631,15 +686,17 @@ fn run_wrap(key_file_path: String, mut service_name: String, dek_source: DekSour
 
     let wrapped = {
         // The plaintext DEK is scoped as tightly as possible: read and
-        // decode it, wrap it, and let `Zeroizing`'s `Drop` scrub it the
-        // instant this block ends -- immediately after wrap_dek is done
-        // with it, rather than at the end of this function, which would
-        // leave it sitting in memory, unused but unwiped, through the file
-        // write below. `load_dek` wipes the base64 text it read on the way
-        // out, so no copy of that survives this line either.
-        let dek = load_dek(&dek_source)?;
-        wrap_dek(&service_c, &service_name, &dek)?
-        // `dek`'s `Zeroizing` wrapper zeroes it here, as this block ends --
+        // decode it into a locked scratch buffer, wrap it, and let
+        // `DekScratch`'s `Drop` scrub it the instant this block ends --
+        // immediately after wrap_dek is done with it, rather than at the
+        // end of this function, which would leave it sitting in memory,
+        // unused but unwiped, through the file write below. `load_dek`
+        // wipes the base64 text it read on the way out, so no copy of that
+        // survives this line either.
+        let mut scratch = DekScratch::new();
+        let dek = load_dek(&dek_source, &mut scratch)?;
+        wrap_dek(&service_c, &service_name, dek)?
+        // `scratch` is zeroed (and unlocked) here, as this block ends --
         // immediately after wrap_dek returns the wrapped (encrypted, no
         // longer secret) form, which is the only thing that survives past
         // this point.
@@ -726,12 +783,17 @@ fn parse_cap_eff(status: &str) -> Option<u64> {
         .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
 }
 
+// Set once `lock_memory` has locked the whole process; `DekScratch` then
+// doesn't lock (or, worse, later unlock) its own pages.
+static PROCESS_MEMORY_LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 // Keeps this process's memory -- the plaintext DEK included -- out of swap.
 // Applied only when it can't later abort an allocation (see
 // `memory_lock_is_unbounded`); otherwise skipped with a warning, since
 // default limits for unprivileged users would make it fail or, worse,
-// succeed and then kill the process. If it should work and doesn't, that
-// is an error.
+// succeed and then kill the process -- and the DEK's own buffer is locked
+// by itself instead (`DekScratch`). If it should work and doesn't, that is
+// an error.
 #[cfg(target_os = "linux")]
 fn lock_memory() -> Result<(), String> {
     let cap_eff = fs::read_to_string("/proc/self/status").ok().as_deref().and_then(parse_cap_eff);
@@ -743,9 +805,10 @@ fn lock_memory() -> Result<(), String> {
 
     if !memory_lock_is_unbounded(cap_eff, memlock.rlim_cur, memlock.rlim_max, libc::RLIM_INFINITY) {
         eprintln!(
-            "warning: memory not locked: needs CAP_IPC_LOCK or an unlimited RLIMIT_MEMLOCK \
-             (e.g. run as root, or LimitMEMLOCK=infinity for a systemd unit); key material in \
-             this process could be written to swap"
+            "warning: memory not locked as a whole: needs CAP_IPC_LOCK or an unlimited \
+             RLIMIT_MEMLOCK (e.g. run as root, or LimitMEMLOCK=infinity for a systemd unit); \
+             the DEK's own buffer is locked instead, but the library's transient copies \
+             could be written to swap"
         );
         return Ok(());
     }
@@ -757,6 +820,7 @@ fn lock_memory() -> Result<(), String> {
             std::io::Error::last_os_error()
         ));
     }
+    PROCESS_MEMORY_LOCKED.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -1172,13 +1236,16 @@ mod tests {
     #[test]
     fn decode_dek_accepts_base64_with_an_optional_trailing_newline() {
         let b64 = valid_b64();
-        assert_eq!(*decode_dek(b64.as_bytes()).unwrap(), vec![0x5au8; DEK_LEN]);
-        assert_eq!(*decode_dek(format!("{b64}\n").as_bytes()).unwrap(), vec![0x5au8; DEK_LEN]);
-        assert_eq!(*decode_dek(format!("{b64}\r\n").as_bytes()).unwrap(), vec![0x5au8; DEK_LEN]);
+        let mut out = [0u8; MAX_DECODED_LEN];
+        assert_eq!(decode_dek(b64.as_bytes(), &mut out).unwrap(), [0x5au8; DEK_LEN]);
+        assert_eq!(decode_dek(format!("{b64}\n").as_bytes(), &mut out).unwrap(), [0x5au8; DEK_LEN]);
+        assert_eq!(decode_dek(format!("{b64}\r\n").as_bytes(), &mut out).unwrap(), [0x5au8; DEK_LEN]);
     }
 
     #[test]
     fn decode_dek_rejects_bad_input() {
+        let mut out = [0u8; MAX_DECODED_LEN];
+        let mut decode_dek = |text: &[u8]| decode_dek(text, &mut out).map(<[u8]>::to_vec);
         assert!(decode_dek(b"").is_err(), "empty");
         assert!(decode_dek(b"\n").is_err(), "newline only");
         assert!(decode_dek(b"not base64!!").is_err(), "not base64");
@@ -1194,10 +1261,11 @@ mod tests {
     #[test]
     fn read_bounded_rejects_input_over_the_limit() {
         let too_long = vec![b'A'; MAX_DEK_INPUT_LEN + 1];
-        assert!(read_bounded(&mut too_long.as_slice(), "test").is_err());
+        let mut buf = [0u8; MAX_DEK_INPUT_LEN + 1];
+        assert!(read_bounded(&mut too_long.as_slice(), "test", &mut buf).is_err());
 
         let at_limit = vec![b'A'; MAX_DEK_INPUT_LEN];
-        assert_eq!(read_bounded(&mut at_limit.as_slice(), "test").unwrap().len(), MAX_DEK_INPUT_LEN);
+        assert_eq!(read_bounded(&mut at_limit.as_slice(), "test", &mut buf).unwrap(), MAX_DEK_INPUT_LEN);
     }
 
     // ---- memory locking decision ----
@@ -1241,8 +1309,10 @@ mod tests {
     fn dek_file_accepts_an_owner_only_regular_file() {
         let dir = private_tempdir();
         let path = write_mode(dir.path(), "dek", valid_b64().as_bytes(), 0o600);
-        let text = read_dek_file(path.to_str().unwrap()).unwrap();
-        assert_eq!(*decode_dek(&text).unwrap(), vec![0x5au8; DEK_LEN]);
+        let mut scratch = DekScratch::new();
+        let len = read_dek_file(path.to_str().unwrap(), &mut scratch.text).unwrap();
+        let text = scratch.text[..len].to_vec();
+        assert_eq!(decode_dek(&text, &mut scratch.decoded).unwrap(), [0x5au8; DEK_LEN]);
     }
 
     #[test]
@@ -1251,7 +1321,7 @@ mod tests {
         for mode in [0o640, 0o604, 0o644, 0o660] {
             let path = write_mode(dir.path(), &format!("dek{mode:o}"), valid_b64().as_bytes(), mode);
             assert!(
-                read_dek_file(path.to_str().unwrap()).is_err(),
+                read_dek_file(path.to_str().unwrap(), &mut [0u8; MAX_DEK_INPUT_LEN + 1]).is_err(),
                 "mode {mode:o} must be rejected"
             );
         }
@@ -1264,29 +1334,54 @@ mod tests {
         let link = dir.path().join("link-dek");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let err = read_dek_file(link.to_str().unwrap()).unwrap_err();
+        let err = read_dek_file(link.to_str().unwrap(), &mut [0u8; MAX_DEK_INPUT_LEN + 1]).unwrap_err();
         assert!(err.contains("symlink"), "got: {err}");
     }
 
     #[test]
     fn dek_file_rejects_a_directory_and_a_missing_path() {
         let dir = private_tempdir();
-        assert!(read_dek_file(dir.path().to_str().unwrap()).is_err());
-        assert!(read_dek_file("/nonexistent-hkdfguard-dek-for-tests").is_err());
+        assert!(read_dek_file(dir.path().to_str().unwrap(), &mut [0u8; MAX_DEK_INPUT_LEN + 1]).is_err());
+        assert!(read_dek_file("/nonexistent-hkdfguard-dek-for-tests", &mut [0u8; MAX_DEK_INPUT_LEN + 1]).is_err());
     }
 
     #[test]
     fn dek_file_rejects_an_oversized_file() {
         let dir = private_tempdir();
         let path = write_mode(dir.path(), "big", &[b'A'; MAX_DEK_INPUT_LEN + 1], 0o600);
-        assert!(read_dek_file(path.to_str().unwrap()).is_err());
+        assert!(read_dek_file(path.to_str().unwrap(), &mut [0u8; MAX_DEK_INPUT_LEN + 1]).is_err());
     }
 
     #[test]
     fn load_dek_reads_from_a_file_end_to_end() {
         let dir = private_tempdir();
         let path = write_mode(dir.path(), "dek", format!("{}\n", valid_b64()).as_bytes(), 0o400);
-        let dek = load_dek(&DekSource::File(path.to_str().unwrap().to_string())).unwrap();
-        assert_eq!(*dek, vec![0x5au8; DEK_LEN]);
+        let mut scratch = DekScratch::new();
+        let dek = load_dek(&DekSource::File(path.to_str().unwrap().to_string()), &mut scratch).unwrap();
+        assert_eq!(dek, [0x5au8; DEK_LEN]);
+        assert!(scratch.text.iter().all(|&b| b == 0), "the base64 text must be wiped once decoded");
+    }
+
+    #[test]
+    fn the_dek_scratch_buffer_is_locked_into_memory() {
+        // The default RLIMIT_MEMLOCK (64 KiB on older systems, 8 MiB on
+        // current ones) is far more than this one or two pages; only a
+        // limit set below that excuses it.
+        let mut memlock = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: getrlimit writes into a valid rlimit.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut memlock) }, 0);
+        if memlock.rlim_cur < 64 * 1024 {
+            eprintln!("skipping: RLIMIT_MEMLOCK is {} bytes", memlock.rlim_cur);
+            return;
+        }
+        let scratch = DekScratch::new();
+        assert!(scratch.locked, "mlock of the DEK scratch buffer failed under a {}-byte limit", memlock.rlim_cur);
+        let vm_lck_kb = fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("VmLck:"))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            .unwrap();
+        assert!(vm_lck_kb > 0, "the kernel reports no locked memory while the scratch buffer is held");
     }
 }

@@ -115,8 +115,11 @@ host settings -- no swap or encrypted swap, `kernel.yama.ptrace_scope` of
 The CLI also locks its memory out of swap with `mlockall`, but only when
 the process has `CAP_IPC_LOCK` or an unlimited `RLIMIT_MEMLOCK` (root, or
 `LimitMEMLOCK=infinity`). Under a finite limit, locking future
-allocations could make one fail and abort the CLI mid-operation, so it
-skips the lock and prints a warning instead.
+allocations could make one fail and abort the CLI mid-operation. In that
+case it locks only the one small buffer that holds its copies of the DEK
+(the base64 text it reads and the bytes that decodes to) with `mlock`, which
+fits even a 64 KiB limit, and warns that the library's own transient
+copies while it wraps are not locked.
 
 See [`examples/wrap_unwrap.c`](examples/wrap_unwrap.c) for a complete,
 buildable example, and [`include/hkdfguard.h`](include/hkdfguard.h) for the
