@@ -189,7 +189,16 @@ pub fn wrap(service: &str, dek: &[u8; DEK_LEN]) -> Result<Vec<u8>> {
     wrapping_key.zeroize(); // the derived AES key is no longer needed either way; scrub it immediately
     salt.zeroize(); // already copied into the payload; don't leave a second copy on the stack
 
-    let tag: Tag = tag_result.map_err(|_| Error::Crypto("AES-256-GCM encryption failed"))?; // propagate any encryption error only after cleanup above
+    let tag: Tag = match tag_result {
+        Ok(tag) => tag,
+        Err(_) => {
+            // A failed in-place encryption leaves `ct_buf` in no known
+            // state -- possibly still the plaintext DEK. Scrub it before
+            // returning, like every other copy of key material here.
+            ct_buf.zeroize();
+            return Err(Error::Crypto("AES-256-GCM encryption failed"));
+        }
+    };
     // `ct_buf` now holds ciphertext, not plaintext -- safe to copy into the
     // (necessarily heap-backed, since it's variable-length) wire payload.
     payload.ciphertext.clear();

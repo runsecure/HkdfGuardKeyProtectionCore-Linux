@@ -752,7 +752,7 @@ fn manufacturer_id_bytes(id: u32) -> Vec<u8> {
 
 fn manufacturer_has_no_external_bus(id: u32) -> bool {
     let trimmed = manufacturer_id_bytes(id);
-    NO_EXTERNAL_BUS_MANUFACTURERS.iter().any(|m| *m == trimmed.as_slice())
+    NO_EXTERNAL_BUS_MANUFACTURERS.contains(&trimmed.as_slice())
 }
 
 /// Once-per-process `auto`-mode verdict: does this TPM lack an external

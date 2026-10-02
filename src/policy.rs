@@ -186,8 +186,6 @@ struct PolicyFile {
     #[serde(default)]
     startup_behavior: StartupBehavior,
     #[serde(default)]
-    container_policy: ContainerPolicy,
-    #[serde(default)]
     tpm: TpmPolicy,
     #[serde(default)]
     external_secret: ExternalSecretPolicy,
@@ -384,14 +382,17 @@ fn parse_tpm_name(field: &str, hex: &str) -> Result<Vec<u8>> {
 // Decodes an even-length hex string. Returns `None` on any non-hex
 // character or odd length.
 fn parse_hex(s: &str) -> Option<Vec<u8>> {
-    let s = s.trim();
+    // Works on bytes, never on `&str` slices: slicing at an odd byte
+    // offset panics if a multi-byte character straddles it, and a policy
+    // file is not trusted to be ASCII. Digits are decoded one by one,
+    // because `u8::from_str_radix` would also accept a leading `+`.
+    let digit = |b: u8| (b as char).to_digit(16);
+    let s = s.trim().as_bytes();
     if s.is_empty() || !s.len().is_multiple_of(2) {
         return None;
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
+    let (pairs, _) = s.as_chunks::<2>(); // even length, so nothing is left over
+    pairs.iter().map(|&[hi, lo]| Some((digit(hi)? << 4 | digit(lo)?) as u8)).collect()
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -459,19 +460,6 @@ pub const DEFAULT_SETUP_MIN_DELAY_MS: u64 = 1_000;
 /// anything above this is rejected as a validation error rather than
 /// honored.
 pub const MAX_SETUP_MIN_DELAY_MS: u64 = 60_000;
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ContainerPolicy {
-    // Accepted and validated (must be positive if present), but not
-    // enforced by an internal expiry timer: this crate's ephemeral
-    // provider already ties key lifetime to the process lifetime, which
-    // for a container *is* the natural bound this field is asking for.
-    // Surfaced here (rather than rejected as an unknown field) so it can
-    // be read by orchestration tooling and so a real timer-based rotation
-    // has a validated place to read from later, without a schema change.
-    max_ephemeral_lifetime_seconds: Option<u64>,
-}
 
 // ---------------------------------------------------------------------
 // Validated policy.
@@ -598,13 +586,6 @@ impl Policy {
                     min.as_str()
                 )));
             }
-        }
-
-        if let Some(0) = raw.container_policy.max_ephemeral_lifetime_seconds {
-            return Err(Error::Provider(
-                "hkdfguard policy: container_policy.max_ephemeral_lifetime_seconds must be positive"
-                    .to_string(),
-            ));
         }
 
         let mut seen = Vec::new();
@@ -1392,26 +1373,21 @@ mod tests {
     }
 
     #[test]
-    fn container_policy_accepts_a_positive_max_lifetime() {
-        let doc = "[selection]\nmode = \"prefer\"\n[container_policy]\nmax_ephemeral_lifetime_seconds = 3600\n";
-        assert!(Policy::from_toml_str(doc).is_ok());
-    }
-
-    #[test]
-    fn container_policy_rejects_zero_max_lifetime() {
-        let doc = "[selection]\nmode = \"prefer\"\n[container_policy]\nmax_ephemeral_lifetime_seconds = 0\n";
-        assert!(Policy::from_toml_str(doc).is_err());
-    }
-
-    #[test]
-    fn container_policy_rejects_the_removed_allow_ephemeral_field() {
-        // Confirms the tightened schema: `allow_ephemeral` is no longer a
-        // recognized field (Ephemeral's gate is now `preferred_order`
-        // naming it explicitly -- see `Policy::ephemeral_explicitly_listed`),
-        // so a policy still written in the old style fails closed instead
-        // of silently doing nothing.
-        let doc = "[selection]\nmode = \"prefer\"\n[container_policy]\nallow_ephemeral = true\n";
-        assert!(Policy::from_toml_str(doc).is_err());
+    fn container_policy_is_not_a_policy_table() {
+        // `max_ephemeral_lifetime_seconds` was once accepted and validated
+        // but never enforced -- a setting that read as a limit and did
+        // nothing. The table is gone, so a policy that sets it fails to
+        // load instead of implying a control that doesn't exist.
+        // (Ephemeral keys already live only as long as the process; its
+        // gate is `preferred_order` naming it, see
+        // `Policy::ephemeral_explicitly_listed`.)
+        for doc in [
+            "[selection]\nmode = \"prefer\"\n[container_policy]\nmax_ephemeral_lifetime_seconds = 3600\n",
+            "[selection]\nmode = \"prefer\"\n[container_policy]\nallow_ephemeral = true\n",
+        ] {
+            let err = Policy::from_toml_str(doc).expect_err(doc);
+            assert!(err.to_string().contains("container_policy"), "unexpected error: {err}");
+        }
     }
 
     // ---- Invalid configuration rejection ----
@@ -1435,9 +1411,9 @@ mod tests {
             "preferred_ordr = [\"tpm2\"]\n[selection]\nmode = \"prefer\"\n",
             // duplicate entries in preferred_order
             "preferred_order = [\"tpm2\", \"tpm2\"]\n[selection]\nmode = \"prefer\"\n",
-            // the removed allow_ephemeral field (see
-            // container_policy_rejects_the_removed_allow_ephemeral_field)
-            "[selection]\nmode = \"prefer\"\n[container_policy]\nallow_ephemeral = true\n",
+            // the removed [container_policy] table (see
+            // container_policy_is_not_a_policy_table)
+            "[selection]\nmode = \"prefer\"\n[container_policy]\nmax_ephemeral_lifetime_seconds = 3600\n",
             // require a provider below the stated minimum protection
             "[key_requirements]\nminimum_protection = \"hardware\"\n[selection]\nmode = \"require\"\nprovider = \"external-secret\"\n",
             // not valid TOML at all
@@ -1773,6 +1749,20 @@ mod tests {
     }
 
     #[test]
+    fn a_non_ascii_pinned_name_is_a_policy_error_not_a_panic() {
+        // 68 bytes, even, with a two-byte character straddling the first
+        // two-byte step: the old `&str`-slicing decoder panicked here.
+        let name = format!("a{}0", "é".repeat(33));
+        for doc in [
+            format!("[selection]\nmode = \"prefer\"\n[tpm]\npinned_session_salt_key_name = \"{name}\"\n"),
+            format!("[selection]\nmode = \"prefer\"\n[tpm.pinned_names]\n\"com.company.orders\" = \"{name}\"\n"),
+        ] {
+            let err = Policy::from_toml_str(&doc).expect_err("a non-hex Name must be refused");
+            assert!(err.to_string().contains("not valid hex"), "unexpected error: {err}");
+        }
+    }
+
+    #[test]
     fn parse_hex_round_trips_and_rejects_malformed_input() {
         assert_eq!(parse_hex("00ff10").unwrap(), vec![0x00, 0xff, 0x10]);
         assert_eq!(parse_hex("00FF10").unwrap(), vec![0x00, 0xff, 0x10], "uppercase hex must decode");
@@ -1781,6 +1771,12 @@ mod tests {
         assert!(parse_hex("0").is_none());
         assert!(parse_hex("0g").is_none());
         assert!(parse_hex("00 ff").is_none(), "interior whitespace is not hex");
+        assert!(parse_hex("+f").is_none(), "a sign is not a hex digit");
+        // Non-ASCII must be refused, not panic: "aé0" is four bytes, and
+        // a two-byte step lands inside the "é".
+        for non_ascii in ["aé0", "é0", "€0", "00ｆｆ"] {
+            assert!(parse_hex(non_ascii).is_none(), "{non_ascii:?}");
+        }
     }
 
     // ---- tpm.session_encryption / tpm.pinned_session_salt_key_name ----

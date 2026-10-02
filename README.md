@@ -692,9 +692,6 @@ level = "hardware"                  # with `require-level`: any provider at this
 setup_min_delay_ms = 1000           # floor on create_kek/kek_exists latency; 0 disables, max 60000
 fail_if_requirement_unmet = true    # accepted for schema parity; the library always fails closed regardless
 
-[container_policy]
-max_ephemeral_lifetime_seconds = 3600   # accepted and validated (> 0); not enforced by an internal timer
-
 [tpm]
 require_derivation_secret = true    # refuse the TPM without /etc/hkdfguard/tpm.derivation-secret; false warns instead
 require_pinned_names = false        # true: only services in pinned_names exist on the TPM (provisioning allowlist)
