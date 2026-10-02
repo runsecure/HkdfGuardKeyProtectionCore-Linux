@@ -355,6 +355,9 @@ pub enum SessionEncryption {
     /// Encrypt unless the TPM reports a manufacturer known to have no
     /// external bus (fTPM/vTPM vendors). Unknown vendors are encrypted --
     /// the decision only ever *skips* encryption for a known-internal TPM.
+    /// The manufacturer is read over the bus being protected, so an active
+    /// interposer can forge it: this defeats passive sniffing only. With
+    /// `pinned_session_salt_key_name` set, `auto` always encrypts.
     #[default]
     Auto,
     /// Never encrypt. For test harnesses; not for production.

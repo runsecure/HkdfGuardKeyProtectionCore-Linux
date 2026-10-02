@@ -255,7 +255,20 @@ KEK, so DEKs wrapped before the change fail their fingerprint check
 > **This changes the KEK.** Adding, removing, or altering the secret
 > derives a different key, so DEKs wrapped beforehand will fail their
 > fingerprint check (`-16`) rather than decrypt. Provision it before
-> wrapping anything you need to keep. There is currently no rewrap API.
+> wrapping anything you need to keep.
+
+> **Back up the derivation secret.** It is the one thing on a TPM host
+> that can be lost and is needed to recover anything: without the exact
+> bytes, no TPM — this one included — derives the same KEKs again, and
+> every DEK wrapped on that host is unrecoverable. Copy it, at the time
+> you create it, to wherever you keep other root-of-trust material
+> (offline, or a secrets manager with tighter access than the host), and
+> restore it byte-for-byte. A backup recovers from losing the *file*; it
+> does not recover from losing the *TPM* — a replaced motherboard or
+> discrete TPM, or `TPM2_Clear` (which a firmware reset or OS reinstall
+> can trigger), resets the seed, and the old KEKs are gone with it. If
+> DEKs must survive the hardware, keep a copy of each one somewhere other
+> than this host, wrapped under a key that isn't tied to it.
 
 The secret is folded into the `TPM2_CreatePrimary` template's `unique`
 field, which is the TPM's designed channel for influencing primary
@@ -363,11 +376,23 @@ vendors are encrypted. `required` always encrypts and **refuses to load
 without a pinned salt-key Name**: an unsalted session's key is derivable
 from bus-visible nonces, and even a salted one can be man-in-the-middled
 if the attacker substitutes their own salt key at `TPM2_ReadPublic`, so
-the pin is what makes `required` mean something. Under `auto` the pin is
-optional (passive sniffing is still defeated) and its absence is logged
-once. The salt key is a deterministic primary with a fixed label, so its
-Name is stable and pinnable; it carries no derivation secret and protects
-nothing by itself.
+the pin is what makes `required` mean something. The salt key is a
+deterministic primary with a fixed label, so its Name is stable and
+pinnable; it carries no derivation secret and protects nothing by itself.
+
+> **`auto` only defeats a passive listener.** The manufacturer it
+> decides from is read over the same bus it is protecting. On a discrete
+> TPM, an interposer that can *rewrite* traffic can answer `INTC`, and
+> `auto` then sends `Z` in the clear. Without a pin, `auto` also accepts
+> whatever salt key the bus delivers (and logs that once). So:
+>
+> - **Discrete TPM, or one you can't vouch for:** use `required` with a
+>   pinned salt-key Name.
+> - **Any `auto` policy with `pinned_session_salt_key_name` set always
+>   encrypts**, whatever manufacturer the TPM reports — pinning is taken
+>   as the statement that the bus is worth defending.
+> - **Firmware TPM or vTPM you know is one:** `auto` without a pin is fine;
+>   there is no bus to defend.
 
 > **Known limitation on discrete TPMs:** parameter encryption covers only
 > a command's *first* parameter, and `TPM2_CreatePrimary`'s first

@@ -684,6 +684,10 @@ fn validate_derivation_secret_is_honored(ctx: &mut Context) -> Result<Option<boo
 // firmware TPM (Intel PTT, AMD fTPM) or a virtual TPM has
 // no external bus, so this is pure overhead there -- hence the `auto`
 // policy mode, which skips it only for known-internal manufacturers.
+// That decision rests on `TPM_PT_MANUFACTURER`, read over the very bus in
+// question, so an active interposer can forge it: `auto` defeats passive
+// sniffing only. Once a salt key is pinned, `auto` stops asking and always
+// encrypts (see `session_encryption_enabled`).
 //
 // The mechanism is the TPM 2.0 specification's own (Part 1 §19.6): an
 // HMAC session started with `tpmKey` set to a TPM-resident decrypt key,
@@ -768,6 +772,14 @@ fn session_encryption_enabled(ctx: &mut Context) -> Result<bool> {
         SessionEncryption::Required => Ok(true),
         SessionEncryption::Off => Ok(false),
         SessionEncryption::Auto => {
+            // A pinned salt key is the operator's statement that this TPM
+            // may have a bus worth defending, and it is what makes the
+            // encryption hold against an active interposer. Don't let a
+            // manufacturer string read over that same bus -- which such an
+            // interposer can rewrite to "INTC" -- switch it back off.
+            if crate::policy::pinned_session_salt_key_name()?.is_some() {
+                return Ok(true);
+            }
             if let Some(internal) = TPM_NO_EXTERNAL_BUS.get() {
                 return Ok(!internal);
             }
@@ -2141,7 +2153,7 @@ mod tests {
     #[test]
     #[ignore = "requires a real or simulated (swtpm) TPM2 device"]
     #[serial]
-    fn auto_mode_skips_encryption_on_swtpm_and_required_forces_it() {
+    fn auto_mode_skips_encryption_on_swtpm_unless_pinned_and_required_forces_it() {
         // swtpm reports manufacturer "IBM ", a known no-bus TPM, so `auto`
         // (the default, no policy file) skips encryption; `required` still
         // encrypts. Both paths must still produce a working ECDH.
@@ -2172,6 +2184,22 @@ mod tests {
             "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"required\"\npinned_session_salt_key_name = \"{real}\"\n"
         ));
         let required = with_tpm_context(session_encryption_enabled).unwrap();
+        drop(_policy);
+
+        // `auto` with a pinned salt key encrypts too, even on a TPM whose
+        // manufacturer it would otherwise skip: the manufacturer is read
+        // over the bus, so an interposer could have written it.
+        let pinned_auto = {
+            let _policy = TestPolicy::write(&format!(
+                "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"auto\"\npinned_session_salt_key_name = \"{real}\"\n"
+            ));
+            with_tpm_context(session_encryption_enabled).unwrap()
+        };
+        assert!(pinned_auto, "auto with a pinned salt key must encrypt, whatever the manufacturer");
+
+        let _policy = TestPolicy::write(&format!(
+            "[selection]\nmode = \"require\"\nprovider = \"tpm2\"\n[tpm]\nsession_encryption = \"required\"\npinned_session_salt_key_name = \"{real}\"\n"
+        ));
         // And the full production path -- load_kek + ecdh -- works under it.
         let h = crate::crypto::payload_ecdh_point(&[0x42u8; 32]).unwrap();
         let z = create_ecdh_secret("com.company.orders", &h);

@@ -263,7 +263,7 @@ if [ "$NO_EXTERNAL_BUS" -eq 0 ]; then
     # fTPM/vTPM. On a discrete chip `auto` correctly encrypts, so the
     # assertion would fail for the right reason. Skip it, not the mechanism:
     # encrypted_session_ecdh_yields_the_same_z_as_a_plain_session still runs.
-    SKIP=(--skip auto_mode_skips_encryption_on_swtpm_and_required_forces_it)
+    SKIP=(--skip auto_mode_skips_encryption_on_swtpm_unless_pinned_and_required_forces_it)
     note "discrete TPM ($MANUFACTURER): skipping the fTPM-only auto-mode assertion"
 fi
 # The two operator helpers only print; keep them out of the pass/fail run.
