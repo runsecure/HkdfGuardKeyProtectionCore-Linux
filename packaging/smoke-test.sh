@@ -56,7 +56,14 @@ done
 section "dynamic link via pkg-config"
 # shellcheck disable=SC2046 # pkg-config output is a list of flags
 cc -o "$work/wrap_unwrap" "$examples/wrap_unwrap.c" $(pkg-config --cflags --libs hkdfguard)
-ldd "$work/wrap_unwrap" | grep -F "libhkdfguard.so.1 => $libdir/libhkdfguard.so.1"
+# Compared as real paths: EL's linker cache reports /lib64, a symlink to
+# /usr/lib64.
+resolved=$(ldd "$work/wrap_unwrap" | awk '$1 == "libhkdfguard.so.1" { print $3 }')
+if [ -z "$resolved" ] || [ "$(readlink -f "$resolved")" != "$(readlink -f "$libdir/libhkdfguard.so.1")" ]; then
+    echo "libhkdfguard.so.1 resolves to '${resolved:-nothing}', not the installed $libdir/libhkdfguard.so.1" >&2
+    exit 1
+fi
+echo "libhkdfguard.so.1 => $resolved"
 "$work/wrap_unwrap"
 
 section "static link via pkg-config --static"

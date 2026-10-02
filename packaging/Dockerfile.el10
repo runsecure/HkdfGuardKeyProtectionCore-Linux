@@ -46,7 +46,7 @@ RUN set -eu; \
 # Packages are built as `builder`, not root.
 RUN useradd --create-home builder \
     && chown -R builder:builder "$CARGO_HOME" \
-    && install -d -o builder -g builder /build
+    && install -d -o builder -g builder /build /build/hkdfguard
 
 WORKDIR /build/hkdfguard
 COPY --chown=builder:builder . /build/hkdfguard

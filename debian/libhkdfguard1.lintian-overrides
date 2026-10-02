@@ -1,4 +1,0 @@
-# HkdfGuard.Kms.<platform>.v1 is the library's name on every platform
-# (the Windows and macOS builds too). Consumers that load it by that name
-# at run time need it beside the real library, not in -dev.
-libhkdfguard1: non-dev-pkg-with-shlib-symlink [*HkdfGuard.Kms.Linux.v1.so*]

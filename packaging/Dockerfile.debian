@@ -43,7 +43,7 @@ RUN set -eu; \
 # output next to the source directory, so builder owns /build as well.
 RUN useradd --create-home builder \
     && chown -R builder:builder "$CARGO_HOME" \
-    && install -d -o builder -g builder /build
+    && install -d -o builder -g builder /build /build/hkdfguard
 
 WORKDIR /build/hkdfguard
 COPY --chown=builder:builder . /build/hkdfguard
