@@ -22,6 +22,10 @@ as_ci() { setpriv --reuid=ci --regid=ci --init-groups env HOME=/home/ci USER=ci 
 # Creates an empty owner-only file belonging to `ci` (a secret, a DEK);
 # writing into it afterwards, as root, keeps that owner and mode.
 ci_file() { install -o ci -g ci -m 0600 /dev/null "$1"; }
+# Writes stdin into a file `ci` owns in /tmp, as ci. Root can't: with
+# fs.protected_regular=2 (a host kernel setting, which containers share)
+# even root may not open another user's file in a sticky directory.
+ci_write() { as_ci sh -c 'cat > "$1"' sh "$1"; }
 
 section "cargo build (default features: external-secret, ephemeral)"
 as_ci cargo build
@@ -137,7 +141,7 @@ CLISO_SERVICE=com.hkdfguard.dockertest.cliso
 ci_file "$SECRET_MOUNT/$CLISO_SERVICE"; head -c 32 /dev/urandom > "$SECRET_MOUNT/$CLISO_SERVICE"
 
 DEK_FILE=$(as_ci mktemp)
-head -c 32 /dev/urandom > "$DEK_FILE"
+head -c 32 /dev/urandom | ci_write "$DEK_FILE"
 WRAPPED_FILE=$(as_ci mktemp)
 
 # `provision` is the only command that makes the (deliberately slow) setup
@@ -164,7 +168,7 @@ as_ci env LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$WRAPPED_FILE" "
 # credential provides. Mode 0600 or the CLI refuses it.
 WRAPPED_FILE2=$(as_ci mktemp)
 DEK_B64_FILE=$(as_ci mktemp)
-base64 -w0 < "$DEK_FILE" > "$DEK_B64_FILE"
+base64 -w0 < "$DEK_FILE" | ci_write "$DEK_B64_FILE"
 as_ci target/release/hkdfguard-v1-initialize wrap \
     --key-file-path "$WRAPPED_FILE2" \
     --service-name "$CLISO_SERVICE" \

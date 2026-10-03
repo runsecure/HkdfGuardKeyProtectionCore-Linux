@@ -78,11 +78,14 @@ RUN set -eu; \
 # installs root-owned configuration under /etc/hkdfguard, exactly as a
 # deployment would, and runs everything else as `ci` (setpriv). `ci` owns
 # the source tree, the cargo registry cache, and its own SoftHSM2 token
-# store.
+# store, and /work itself: `COPY --chown` below changes only what it copies,
+# not a directory that already exists, so without this `ci` can't create
+# target/ there.
 RUN groupadd --force tss \
     && useradd --create-home --groups tss ci \
     && chown -R ci:ci "$CARGO_HOME" \
     && install -d -o ci -g ci -m 0700 /home/ci/softhsm-tokens \
+    && install -d -o ci -g ci /work \
     && printf 'directories.tokendir = /home/ci/softhsm-tokens\nobjectstore.backend = file\n' > /etc/softhsm2-ci.conf \
     && chmod 0644 /etc/softhsm2-ci.conf
 ENV SOFTHSM2_CONF=/etc/softhsm2-ci.conf \
