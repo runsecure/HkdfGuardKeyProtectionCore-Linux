@@ -2,7 +2,7 @@
 //! dumpable flag), so it gets its own test binary -- its own process --
 //! rather than running inside the shared unit-test process.
 
-use HkdfGuardKeyProtectionLinux::{hkdfguard_harden_process, status};
+use hkdfguard_v1::{hkdfguard_harden_process, status};
 
 // Only this user can write to it, whatever the umask: the library refuses
 // to trust a policy or secret mount in a group-writable directory.
@@ -37,7 +37,7 @@ fn hardening_takes_effect_and_the_library_still_works_afterwards() {
         use std::ffi::CString;
         use std::os::raw::c_int;
         use std::os::unix::fs::PermissionsExt;
-        use HkdfGuardKeyProtectionLinux::{hkdfguard_unwrap_dek, hkdfguard_wrap_dek};
+        use hkdfguard_v1::{hkdfguard_unwrap_dek, hkdfguard_wrap_dek};
 
         // A non-dumpable process loses some /proc/<pid> access. The
         // external-secret provider re-checks an opened descriptor through

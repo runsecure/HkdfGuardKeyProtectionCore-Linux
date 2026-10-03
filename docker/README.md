@@ -34,12 +34,12 @@ skip if they ever run as root. The script:
    test against it.
 4. Initializes a `SoftHSM2` token and runs the `#[ignore]`d PKCS#11 test
    against it.
-5. Builds `libHkdfGuardKeyProtectionLinux.so` in release mode and runs
+5. Builds `libhkdfguard_v1.so` in release mode and runs
    [`examples/wrap_unwrap.c`](../examples/wrap_unwrap.c) against it.
 6. Runs `hkdfguard-v1-initialize` (release build) to wrap a fresh random
    DEK to a file, then runs
    [`examples/cli_unwrap_check.c`](../examples/cli_unwrap_check.c), which
-   loads `libHkdfGuardKeyProtectionLinux.so` dynamically and confirms it
+   loads `libhkdfguard_v1.so` dynamically and confirms it
    unwraps that file back to the exact same DEK -- proving the CLI's
    output isn't tied to being read back by the same (statically-linked)
    binary that wrote it.
@@ -66,8 +66,8 @@ runs [`entrypoint-build.sh`](entrypoint-build.sh) inside each, which:
 2. Runs `cargo build --release --all-features`, so the distributed library
    supports every KEK provider (TPM2, PKCS#11, external secret, ephemeral),
    not just the ones enabled by default.
-3. Copies `libHkdfGuardKeyProtectionLinux.so`,
-   `libHkdfGuardKeyProtectionLinux.a`, the `hkdfguard-v1-initialize` CLI
+3. Copies `libhkdfguard_v1.so`,
+   `libhkdfguard_v1.a`, the `hkdfguard-v1-initialize` CLI
    binary, and `include/hkdfguard.h` into `/dist` inside the container,
    which `build-dist.sh` bind-mounts to `dist/linux-amd64` or
    `dist/linux-arm64` on the host respectively -- so each architecture's
@@ -78,13 +78,13 @@ runs [`entrypoint-build.sh`](entrypoint-build.sh) inside each, which:
      linux-amd64/
        hkdfguard-v1-initialize
        hkdfguard.h
-       libHkdfGuardKeyProtectionLinux.a
-       libHkdfGuardKeyProtectionLinux.so
+       libhkdfguard_v1.a
+       libhkdfguard_v1.so
      linux-arm64/
        hkdfguard-v1-initialize
        hkdfguard.h
-       libHkdfGuardKeyProtectionLinux.a
-       libHkdfGuardKeyProtectionLinux.so
+       libhkdfguard_v1.a
+       libhkdfguard_v1.so
    ```
 
 ## Interactive use

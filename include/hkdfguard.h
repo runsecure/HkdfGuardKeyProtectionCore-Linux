@@ -1,5 +1,5 @@
 /*
- * hkdfguard.h -- Stable C ABI for HKDFGuard (Linux).
+ * hkdfguard.h -- Stable C ABI for hkdfguard-native-linux.
  *
  * Wraps and unwraps 32-byte Data Encryption Keys (DEKs) under a persistent,
  * per-service Key Encryption Key (KEK), using the strongest available

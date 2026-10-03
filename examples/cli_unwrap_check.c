@@ -1,7 +1,7 @@
 /*
  * Verifies that a wrapped-key file produced by the hkdfguard-v1-initialize
  * CLI tool (which links this crate's Rust code statically, as an rlib)
- * unwraps cleanly through libHkdfGuardKeyProtectionLinux.so loaded
+ * unwraps cleanly through libhkdfguard_v1.so loaded
  * dynamically here -- proving the wrapped payload's wire format is truly
  * consumer-independent, not an artifact of both sides sharing one binary.
  *
@@ -12,11 +12,11 @@
  *                         (before base64-encoding for --dek)
  *
  * Build (after `cargo build --release` and
- *   `ln -sf libHkdfGuardKeyProtectionLinux.so ../target/release/libhkdfguard.so.1`,
+ *   `ln -sf libhkdfguard_v1.so ../target/release/libhkdfguard.so.1`,
  *   the library's SONAME; with the packages installed, use
  *   `pkg-config --cflags --libs hkdfguard` instead):
  *   cc -I../include cli_unwrap_check.c -L../target/release \
- *       -lHkdfGuardKeyProtectionLinux -o cli_unwrap_check
+ *       -lhkdfguard_v1 -o cli_unwrap_check
  *   LD_LIBRARY_PATH=../target/release ./cli_unwrap_check \
  *       <wrapped-file> <service> <expected-dek-file>
  */
@@ -72,6 +72,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    printf("CLI-wrapped key unwraps cleanly via libHkdfGuardKeyProtectionLinux.so (service \"%s\")\n", service);
+    printf("CLI-wrapped key unwraps cleanly via libhkdfguard_v1.so (service \"%s\")\n", service);
     return 0;
 }

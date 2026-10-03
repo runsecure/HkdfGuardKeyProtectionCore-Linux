@@ -122,11 +122,11 @@ ci_file "$SECRET_MOUNT/com.company.orders"; head -c 32 /dev/urandom > "$SECRET_M
 as_ci cargo build --release
 # The .so's SONAME is libhkdfguard.so.1 (build.rs): what programs linked
 # against it look for at run time.
-as_ci ln -sf libHkdfGuardKeyProtectionLinux.so target/release/libhkdfguard.so.1
-as_ci cc -I include examples/wrap_unwrap.c -L target/release -lHkdfGuardKeyProtectionLinux -o /tmp/wrap_unwrap
+as_ci ln -sf libhkdfguard_v1.so target/release/libhkdfguard.so.1
+as_ci cc -I include examples/wrap_unwrap.c -L target/release -lhkdfguard_v1 -o /tmp/wrap_unwrap
 as_ci env LD_LIBRARY_PATH=target/release /tmp/wrap_unwrap
 
-section "hkdfguard-v1-initialize CLI output unwraps via libHkdfGuardKeyProtectionLinux.so"
+section "hkdfguard-v1-initialize CLI output unwraps via libhkdfguard_v1.so"
 # The CLI links this crate's Rust code statically (an rlib), so this proves
 # the wrapped payload it writes is genuinely consumer-independent -- a
 # *different*, dynamically-linked consumer (this C program, against the
@@ -161,7 +161,7 @@ printf '%s' "$DEK_B64" | as_ci target/release/hkdfguard-v1-initialize wrap \
     --force
 unset DEK_B64
 
-as_ci cc -I include examples/cli_unwrap_check.c -L target/release -lHkdfGuardKeyProtectionLinux -o /tmp/cli_unwrap_check
+as_ci cc -I include examples/cli_unwrap_check.c -L target/release -lhkdfguard_v1 -o /tmp/cli_unwrap_check
 as_ci env LD_LIBRARY_PATH=target/release /tmp/cli_unwrap_check "$WRAPPED_FILE" "$CLISO_SERVICE" "$DEK_FILE"
 
 # And the --dek-file path, which is what a secret mount or a systemd

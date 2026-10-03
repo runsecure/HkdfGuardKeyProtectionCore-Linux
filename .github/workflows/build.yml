@@ -115,7 +115,7 @@ jobs:
             x86_64)  want='x86-64' ;;
             aarch64) want='ARM aarch64' ;;
           esac
-          for f in dist/libHkdfGuardKeyProtectionLinux.so dist/hkdfguard-v1-initialize; do
+          for f in dist/libhkdfguard_v1.so dist/hkdfguard-v1-initialize; do
             file "$f"
             file "$f" | grep -q "$want" || { echo "::error::$f is not $want"; exit 1; }
           done
@@ -130,11 +130,11 @@ jobs:
           fi
           name="hkdfguard-${version}-linux-${{ matrix.arch }}"
           mkdir -p "pkg/$name/lib" "pkg/$name/bin" "pkg/$name/include"
-          cp dist/libHkdfGuardKeyProtectionLinux.so dist/libHkdfGuardKeyProtectionLinux.a "pkg/$name/lib/"
+          cp dist/libhkdfguard_v1.so dist/libhkdfguard_v1.a "pkg/$name/lib/"
           # The project's release artifact name (see scripts/build-release.sh).
-          cp dist/libHkdfGuardKeyProtectionLinux.so "pkg/$name/lib/HkdfGuard.Kms.Linux.v1.so"
+          cp dist/libhkdfguard_v1.so "pkg/$name/lib/HkdfGuard.Kms.Linux.v1.so"
           # The SONAME (build.rs): what programs linked against the .so look for.
-          ln -s libHkdfGuardKeyProtectionLinux.so "pkg/$name/lib/libhkdfguard.so.1"
+          ln -s libhkdfguard_v1.so "pkg/$name/lib/libhkdfguard.so.1"
           cp dist/hkdfguard-v1-initialize "pkg/$name/bin/"
           cp dist/hkdfguard.h "pkg/$name/include/"
           cp README.md "pkg/$name/"

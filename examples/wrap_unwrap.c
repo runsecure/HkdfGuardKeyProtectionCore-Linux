@@ -2,10 +2,10 @@
  * Minimal C consumer of the HKDFGuard C ABI.
  *
  * Build (after `cargo build --release` and
- *   `ln -sf libHkdfGuardKeyProtectionLinux.so ../target/release/libhkdfguard.so.1`,
+ *   `ln -sf libhkdfguard_v1.so ../target/release/libhkdfguard.so.1`,
  *   the library's SONAME; with the packages installed, use
  *   `pkg-config --cflags --libs hkdfguard` instead):
- *   cc -I../include wrap_unwrap.c -L../target/release -lHkdfGuardKeyProtectionLinux -o wrap_unwrap
+ *   cc -I../include wrap_unwrap.c -L../target/release -lhkdfguard_v1 -o wrap_unwrap
  *   LD_LIBRARY_PATH=../target/release ./wrap_unwrap
  */
 

@@ -6,12 +6,12 @@
 #
 # Cargo can't produce this name directly: crate names (and therefore [lib]
 # name in Cargo.toml) can't contain dots, so `cargo build` always produces
-# libHkdfGuardKeyProtectionLinux.{so,dylib,a} regardless. This script does
+# libhkdfguard_v1.{so,dylib,a} regardless. This script does
 # the one thing those other two platforms' build systems do natively - a
 # copy to the project's actual release name - right after the real build,
 # so that name is a repeatable build output rather than a one-off manual
 # command. Only the dynamic library is renamed; the static archive
-# (libHkdfGuardKeyProtectionLinux.a) keeps its Cargo-derived name, since
+# (libhkdfguard_v1.a) keeps its Cargo-derived name, since
 # nothing in this project links against it by the HkdfGuard.Kms.* name.
 #
 # Usage: scripts/build-release.sh
@@ -35,7 +35,7 @@ case "$(uname -s)" in
     *) echo "error: unsupported host platform $(uname -s)" >&2; exit 1 ;;
 esac
 
-src="target/release/libHkdfGuardKeyProtectionLinux.$ext"
+src="target/release/libhkdfguard_v1.$ext"
 dst="target/release/HkdfGuard.Kms.Linux.v1.$ext"
 if [ ! -f "$src" ]; then
     echo "error: expected build output missing: $src" >&2
@@ -47,6 +47,6 @@ echo "-> $dst"
 # On Linux the library's SONAME is libhkdfguard.so.1 (build.rs), so a
 # program linked against target/release looks for that name at run time.
 if [ "$ext" = so ]; then
-    ln -sf "libHkdfGuardKeyProtectionLinux.so" "target/release/libhkdfguard.so.1"
+    ln -sf "libhkdfguard_v1.so" "target/release/libhkdfguard.so.1"
     echo "-> target/release/libhkdfguard.so.1 (symlink)"
 fi

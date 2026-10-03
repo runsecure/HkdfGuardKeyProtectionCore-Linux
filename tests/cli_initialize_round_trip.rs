@@ -42,7 +42,7 @@ use std::process::{Command, Output, Stdio};
 fn tempdir() -> std::io::Result<tempfile::TempDir> {
     tempfile::Builder::new().permissions(fs::Permissions::from_mode(0o700)).tempdir()
 }
-use HkdfGuardKeyProtectionLinux::{hkdfguard_unwrap_dek, status};
+use hkdfguard_v1::{hkdfguard_unwrap_dek, status};
 
 // Runs `f` with `doc` as the policy -- read by this process's library and,
 // through the inherited environment, by every CLI process it spawns --

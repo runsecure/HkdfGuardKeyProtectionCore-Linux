@@ -1,6 +1,6 @@
 // Gives the Linux shared library an ELF SONAME, so programs linked against
 // it record `libhkdfguard.so.1` as their dependency rather than whatever
-// file name they happened to link (Cargo's libHkdfGuardKeyProtectionLinux.so).
+// file name they happened to link (Cargo's libhkdfguard_v1.so).
 // The packages install the library under exactly that name, and dpkg/rpm
 // derive the library's dependency metadata from it.
 //

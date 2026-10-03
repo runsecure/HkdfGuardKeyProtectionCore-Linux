@@ -1,4 +1,4 @@
-# KeyProtectionCore-Linux (HKDFGuard)
+# hkdfguard-native-linux
 
 Linux implementation of HKDFGuard: a stable C ABI for wrapping/unwrapping
 32-byte Data Encryption Keys (DEKs) under a persistent, per-service Key
@@ -40,8 +40,8 @@ scripts/build-release.sh
 ```
 
 Runs `cargo build --release`, which produces
-`target/release/libHkdfGuardKeyProtectionLinux.{so,dylib}` (dynamic) and
-`libHkdfGuardKeyProtectionLinux.a` (static) -- the `[lib] name` in
+`target/release/libhkdfguard_v1.{so,dylib}` (dynamic) and
+`libhkdfguard_v1.a` (static) -- the `[lib] name` in
 `Cargo.toml` controls that output name directly, and Cargo has no way to
 produce a name containing dots. The script's one additional step copies the
 dynamic library to `target/release/HkdfGuard.Kms.Linux.v1.{so,dylib}` --
@@ -49,7 +49,7 @@ this project's actual release artifact name, matching the
 `HkdfGuard.Kms.<platform>.v1` convention its Windows (CMake `OUTPUT_NAME`)
 and macOS (Xcode `PRODUCT_NAME`) builds apply natively. A plain
 `cargo build --release` still works for local iteration; just link against
-`libHkdfGuardKeyProtectionLinux` directly in that case. On Linux the
+`libhkdfguard_v1` directly in that case. On Linux the
 library's SONAME is `libhkdfguard.so.1` ([`build.rs`](build.rs)), so a
 program linked that way looks for that name at run time: the script also
 creates it as a symlink in `target/release`. Installed from the packages
@@ -790,7 +790,7 @@ its default.
   dependency bump. 
 - **Pure-Rust crypto (`p256`/`hkdf`/`aes-gcm`), not OpenSSL**, for the
   protocol itself. No system OpenSSL version skew across distros, trivial
-  static linking (`libHkdfGuardKeyProtectionLinux.a`), and RustCrypto's P-256/HKDF-SHA512/
+  static linking (`libhkdfguard_v1.a`), and RustCrypto's P-256/HKDF-SHA512/
   AES-256-GCM implementations satisfy the mandated algorithm list exactly.
   TPM2 and PKCS#11 still, necessarily, link against their respective
   native libraries.
